@@ -2219,9 +2219,7 @@ Choose your enumeration strategy:"""
             return  # User cancelled
 
         # Start the bulk rename workflow with selected enumeration mode
-        self._run_bulk_rename_workflow(
-            "Rename All Functions", enumeration_mode=selected_mode, skip_analyzed=selected_skip
-        )
+        self._run_bulk_rename_workflow("Rename All Functions", enumeration_mode=selected_mode, skip_analyzed=selected_skip)
 
     def _analyze_imports(self):
         """Analyze imports using hardcoded workflow."""
