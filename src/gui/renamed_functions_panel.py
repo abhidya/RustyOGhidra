@@ -443,132 +443,117 @@ class RenamedFunctionsPanel:
         else:
             raise Exception("CAG manager not available - cannot add to vector store")
 
+    @staticmethod
+    def _addr_iid(address: str) -> str:
+        """Stable Treeview row id for an address-keyed function."""
+        return f"addr::{address}"
+
+    @staticmethod
+    def _name_iid(identifier: str) -> str:
+        """Stable Treeview row id for a function only known by name."""
+        return f"name::{identifier}"
+
+    def _compute_desired_rows(self):
+        """Compute the ordered (iid, values) rows that should be displayed.
+
+        Pure computation: reads bridge state but never mutates the Treeview.
+        Uses precomputed lookup sets so deduplication is O(n) rather than the
+        old O(n^2) nested scans.
+        """
+        rows = []
+        seen_iids = set()
+
+        if not hasattr(self.bridge, "analysis_state"):
+            return rows
+
+        renamed_functions = self.bridge.analysis_state.get("functions_renamed", {})
+        function_address_mapping = getattr(self.bridge, "function_address_mapping", {})
+        bridge_summaries = getattr(self.bridge, "function_summaries", {})
+
+        # Precompute (identifier, new_name) pairs already covered by the address
+        # mapping so the renamed_functions pass can skip duplicates in O(1).
+        covered_pairs = set()
+        for addr, info in function_address_mapping.items():
+            nn = info.get("new_name")
+            covered_pairs.add((addr, nn))
+            covered_pairs.add((info.get("old_name"), nn))
+
+        # Primary source: the address mapping (most complete data).
+        for address, info in function_address_mapping.items():
+            iid = self._addr_iid(address)
+            if iid in seen_iids:
+                continue
+            seen_iids.add(iid)
+
+            old_name = info.get("old_name", "Unknown")
+            new_name = info.get("new_name", "Unknown")
+
+            display_address = address.replace("name_", "") if address.startswith("name_") else address
+            summary_key = f"{address}_{new_name}"
+            summary = (
+                bridge_summaries.get(address, "")
+                or bridge_summaries.get(old_name, "")
+                or bridge_summaries.get(new_name, "")
+                or self.function_summaries.get(summary_key, "No summary available")
+            )
+            rows.append((iid, (display_address, old_name, new_name, summary, summary_key)))
+
+        # Secondary source: renamed_functions not represented in the mapping.
+        for identifier, new_name in renamed_functions.items():
+            if (identifier, new_name) in covered_pairs:
+                continue
+
+            iid = self._name_iid(identifier)
+            if iid in seen_iids:
+                continue
+            seen_iids.add(iid)
+
+            is_address = self._looks_like_address(identifier)
+            address = identifier if is_address else "Unknown"
+            old_name = "Unknown" if is_address else identifier
+            summary_key = f"{address}_{new_name}" if address != "Unknown" else f"{old_name}_{new_name}"
+            summary = bridge_summaries.get(identifier, "") or self.function_summaries.get(summary_key, "No summary available")
+            rows.append((iid, (address, old_name, new_name, summary, summary_key)))
+
+        return rows
+
+    def _reconcile_tree(self, rows):
+        """Reconcile the Treeview to `rows` via upsert instead of rebuild.
+
+        Existing rows are updated in place (only when values actually change)
+        and new rows are appended; rows no longer present are removed. Rows are
+        never reordered, so scroll position, selection, expanded state, and any
+        user-applied sort order are preserved. The tree is never fully cleared.
+        """
+        desired_ids = {iid for iid, _ in rows}
+
+        # Remove only rows that have genuinely disappeared.
+        for iid in list(self.tree.get_children()):
+            if iid not in desired_ids:
+                try:
+                    self.tree.delete(iid)
+                except tk.TclError:
+                    pass
+
+        # Upsert desired rows, keeping existing rows in their current position.
+        for iid, values in rows:
+            values = tuple(values)
+            if self.tree.exists(iid):
+                if tuple(self.tree.item(iid, "values")) != values:
+                    self.tree.item(iid, values=values)
+            else:
+                self.tree.insert("", "end", iid=iid, values=values)
+
+        self.count_label.config(text=f"Functions: {len(rows)}")
+
     def _update_function_list(self):
-        """Update the list of renamed functions."""
+        """Refresh the function list incrementally (upsert, never full rebuild)."""
         # THREAD SAFETY: Acquire lock before accessing shared dictionaries
         with self.dict_lock:
             try:
-                # Clear existing items
-                for item in self.tree.get_children():
-                    self.tree.delete(item)
-
-                if not hasattr(self.bridge, "analysis_state"):
-                    self.count_label.config(text="Functions: 0")
-                    return
-
-                renamed_functions = self.bridge.analysis_state.get("functions_renamed", {})
-
-                # Get improved function address mapping and summaries from bridge
-                function_address_mapping = getattr(self.bridge, "function_address_mapping", {})
-                bridge_summaries = getattr(self.bridge, "function_summaries", {})
-
-                # Debug logging
-                logger.info(
-                    f"DEBUG: Updating function list - renamed_functions: {len(renamed_functions)}, address_mapping: {len(function_address_mapping)}"
-                )
-                if renamed_functions:
-                    logger.info(f"DEBUG: Renamed functions keys: {list(renamed_functions.keys())}")
-                    logger.info(f"DEBUG: Renamed functions values: {list(renamed_functions.values())}")
-                if function_address_mapping:
-                    logger.info(f"DEBUG: Address mappings keys: {list(function_address_mapping.keys())}")
-                    for addr, info in function_address_mapping.items():
-                        logger.info(f"DEBUG: Address {addr} -> {info}")
-
-                # Also check if bridge has the expected attributes
-                if hasattr(self.bridge, "analysis_state"):
-                    logger.info(f"DEBUG: Bridge analysis_state exists with keys: {list(self.bridge.analysis_state.keys())}")
-                else:
-                    logger.warning("DEBUG: Bridge has no analysis_state attribute!")
-
-                if hasattr(self.bridge, "function_address_mapping"):
-                    logger.info(
-                        f"DEBUG: Bridge function_address_mapping exists with {len(self.bridge.function_address_mapping)} entries"
-                    )
-                else:
-                    logger.warning("DEBUG: Bridge has no function_address_mapping attribute!")
-
-                # Update count with total unique functions - use address mapping as primary source
-                # to avoid duplicates between renamed_functions and function_address_mapping
-                unique_functions = set()
-
-                # Add all functions from address mapping (most complete data)
-                for address in function_address_mapping.keys():
-                    unique_functions.add(address)
-
-                # Add any functions from renamed_functions that aren't in address mapping
-                for identifier in renamed_functions.keys():
-                    # Check if this identifier is already covered by address mapping
-                    already_covered = False
-                    for addr, info in function_address_mapping.items():
-                        if addr == identifier or info.get("old_name") == identifier or info.get("new_name") == identifier:
-                            already_covered = True
-                            break
-
-                    if not already_covered:
-                        unique_functions.add(identifier)
-
-                total_functions = len(unique_functions)
-                self.count_label.config(text=f"Functions: {total_functions}")
-
-                # Use the function address mapping as the primary source to avoid duplicates
-                processed_functions = set()
-
-                # Process functions from the address mapping first (most complete data)
-                for address, info in function_address_mapping.items():
-                    old_name = info.get("old_name", "Unknown")
-                    new_name = info.get("new_name", "Unknown")
-
-                    # Skip if we've already processed this function
-                    function_key = f"{address}_{new_name}"
-                    if function_key in processed_functions:
-                        continue
-                    processed_functions.add(function_key)
-
-                    # Clean up fake address prefix for display
-                    display_address = address.replace("name_", "") if address.startswith("name_") else address
-
-                    # Get summary from bridge first, then fallback to local storage
-                    summary_key = f"{address}_{new_name}"
-                    summary = (
-                        bridge_summaries.get(address, "")
-                        or bridge_summaries.get(old_name, "")
-                        or bridge_summaries.get(new_name, "")
-                        or self.function_summaries.get(summary_key, "No summary available")
-                    )
-
-                    # Insert into tree with summary_key as a hidden column
-                    self.tree.insert("", "end", values=(display_address, old_name, new_name, summary, summary_key))
-
-                # Process any remaining functions from renamed_functions that weren't in address mapping
-                for identifier, new_name in renamed_functions.items():
-                    # Skip if this function was already processed from address mapping
-                    already_processed = False
-                    for addr, info in function_address_mapping.items():
-                        if info.get("new_name") == new_name and (addr == identifier or info.get("old_name") == identifier):
-                            already_processed = True
-                            break
-
-                    if already_processed:
-                        continue
-
-                    # This is a function not in our enhanced mapping - add it with limited info
-                    function_key = f"{identifier}_{new_name}"
-                    if function_key in processed_functions:
-                        continue
-                    processed_functions.add(function_key)
-
-                    is_address = self._looks_like_address(identifier)
-                    address = identifier if is_address else "Unknown"
-                    old_name = "Unknown" if is_address else identifier
-
-                    summary_key = f"{address}_{new_name}" if address != "Unknown" else f"{old_name}_{new_name}"
-                    summary = bridge_summaries.get(identifier, "") or self.function_summaries.get(
-                        summary_key, "No summary available"
-                    )
-
-                    # Insert into tree
-                    self.tree.insert("", "end", values=(address, old_name, new_name, summary, summary_key))
-
+                rows = self._compute_desired_rows()
+                logger.debug(f"Reconciling function list: {len(rows)} rows")
+                self._reconcile_tree(rows)
             except Exception as e:
                 # During streaming loads, tree updates can fail due to rapid changes
                 # Log as debug instead of error to reduce noise
@@ -576,6 +561,41 @@ class RenamedFunctionsPanel:
                     logger.debug(f"Tree item not found during function list update: {e}")
                 else:
                     logger.error(f"Error updating function list: {e}")
+
+    def _upsert_function_row(self, address: str, old_name: str, new_name: str, summary: str = ""):
+        """Insert or update a single row without touching the rest of the tree.
+
+        Stable row ids keyed on the function address let the incremental
+        rename-all flow update one row per completed function in O(1), instead
+        of rebuilding the entire Treeview on every success (which hung the UI
+        past ~1000 functions and lost scroll/selection each time).
+        """
+        with self.dict_lock:
+            try:
+                iid = self._addr_iid(address)
+                display_address = address.replace("name_", "") if address.startswith("name_") else address
+                summary_key = f"{address}_{new_name}"
+
+                bridge_summaries = getattr(self.bridge, "function_summaries", {})
+                resolved_summary = (
+                    bridge_summaries.get(address, "")
+                    or bridge_summaries.get(old_name, "")
+                    or bridge_summaries.get(new_name, "")
+                    or self.function_summaries.get(summary_key, "")
+                    or summary
+                    or "No summary available"
+                )
+                values = (display_address, old_name, new_name, resolved_summary, summary_key)
+
+                if self.tree.exists(iid):
+                    if tuple(self.tree.item(iid, "values")) != values:
+                        self.tree.item(iid, values=values)
+                else:
+                    self.tree.insert("", "end", iid=iid, values=values)
+
+                self.count_label.config(text=f"Functions: {len(self.tree.get_children())}")
+            except tk.TclError as e:
+                logger.debug(f"Tree upsert skipped for {new_name}: {e}")
 
     def _looks_like_address(self, text: str) -> bool:
         """Check if a string looks like a memory address."""
@@ -1027,9 +1047,11 @@ class RenamedFunctionsPanel:
                 )
 
         # Only refresh the UI list if not in streaming mode
-        # During streaming, we'll do batch updates to prevent UI freezing
+        # During streaming, we'll do batch updates to prevent UI freezing.
+        # Upsert just this one row instead of rebuilding the whole tree, so
+        # bulk rename stays responsive and scroll/selection are preserved.
         if not self._streaming_load_active:
-            self._update_function_list()
+            self._upsert_function_row(address, old_name, new_name, summary)
 
     def set_streaming_mode(self, active: bool):
         """Enable or disable streaming mode to prevent UI updates during bulk loading."""
