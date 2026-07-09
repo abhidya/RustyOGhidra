@@ -9,6 +9,7 @@ import json
 import re
 from typing import Dict, Any
 from .daemon_thread_pool_executor import DaemonThreadPoolExecutor
+from .ui_thread import ui_safe
 from concurrent.futures import as_completed
 import logging
 
@@ -82,28 +83,6 @@ class ToolButtonsPanel:
         # Configure grid weights
         self.frame.grid_columnconfigure(0, weight=1)
         self.frame.grid_columnconfigure(1, weight=1)
-
-    def _set_tool_running(self, running: bool, tool_name: str = ""):
-        """Set the tool running state."""
-        self.tool_running = running
-
-        # Update all buttons
-        state = "disabled" if running else "normal"
-        for widget in self.frame.winfo_children():
-            if isinstance(widget, ttk.Button) and widget not in [self.stop_button]:
-                widget.config(state=state)
-
-        # Update stop button state
-        self.stop_button.config(state="normal" if running else "disabled")
-
-        # Update status and progress
-        if running:
-            self.should_stop = False  # Reset stop flag for new tool
-            self.status_label.config(text=f"Running {tool_name}...", foreground="orange")
-            self.progress.start()
-        else:
-            self.status_label.config(text="Ready", foreground="green")
-            self.progress.stop()
 
     def _run_ai_agent_query(self, query: str, tool_name: str):
         """Run a query through the AI agent workflow."""
@@ -1420,8 +1399,61 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 
         return sections
 
-    def _run_bulk_rename_workflow(self, display_name: str, enumeration_mode: str = "rename_only"):
-        """Optimized bulk function analysis workflow with deferred RAG vector creation and batch processing."""
+    @staticmethod
+    def _canon_addr(value):
+        """Normalize an address string so it compares across sources (0x/name_/leading zeros)."""
+        a = str(value).strip().lower()
+        if a.startswith("name_"):
+            a = a[5:]
+        if a.startswith("0x"):
+            a = a[2:]
+        return a.lstrip("0") or "0"
+
+    @staticmethod
+    def _format_eta(seconds):
+        """Human-readable ETA like '2m 34s' or '45s'."""
+        seconds = int(max(0, seconds))
+        if seconds >= 3600:
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+        if seconds >= 60:
+            return f"{seconds // 60}m {seconds % 60}s"
+        return f"{seconds}s"
+
+    def _collect_analyzed_keys(self):
+        """Addresses + names already analyzed in a loaded/prior session.
+
+        Uses the panel's thread-safe row snapshot when available, else falls
+        back to the bridge's function_address_mapping. Returns (addr_set, name_set).
+        """
+        addrs, names = set(), set()
+        panel = self.renamed_functions_panel
+        rows = panel.get_rows_snapshot() if panel and hasattr(panel, "get_rows_snapshot") else []
+        if rows:
+            for values in rows:
+                # values = (address, old_name, new_name, summary, summary_key)
+                if len(values) >= 3:
+                    if values[0] and values[0] != "Unknown":
+                        addrs.add(self._canon_addr(values[0]))
+                    for n in (values[1], values[2]):
+                        if n and n != "Unknown":
+                            names.add(n)
+        else:
+            fam = getattr(self.bridge, "function_address_mapping", {}) or {}
+            for addr, info in fam.items():
+                addrs.add(self._canon_addr(addr))
+                for key in ("old_name", "new_name"):
+                    n = info.get(key)
+                    if n and n != "Unknown":
+                        names.add(n)
+        return addrs, names
+
+    def _run_bulk_rename_workflow(self, display_name: str, enumeration_mode: str = "rename_only", skip_analyzed: bool = False):
+        """Optimized bulk function analysis workflow with deferred RAG vector creation and batch processing.
+
+        When skip_analyzed is True, functions already present from a loaded
+        session (matched by address or name) are removed before processing, so
+        the run — and its ETA — only cover functions that still need renaming.
+        """
 
         def worker():
             import time
@@ -1526,6 +1558,38 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                     if not valid_functions:
                         self.response_panel.add_response("Warning", "No valid functions found to rename.")
                         return
+
+                    # FEATURE: skip functions already analyzed in a loaded session
+                    session_skipped = 0
+                    if skip_analyzed:
+                        analyzed_addrs, analyzed_names = self._collect_analyzed_keys()
+                        if analyzed_addrs or analyzed_names:
+
+                            def _already_analyzed(function_string):
+                                if " at " in function_string:
+                                    name = function_string.split(" at ")[0].strip()
+                                    addr = function_string.split(" at ")[1].strip()
+                                else:
+                                    name = function_string.strip()
+                                    m = re.search(r"([0-9a-fA-F]{8,})", name)
+                                    addr = m.group(1) if m else name
+                                return self._canon_addr(addr) in analyzed_addrs or name in analyzed_names
+
+                            before = len(valid_functions)
+                            valid_functions = [f for f in valid_functions if not _already_analyzed(f)]
+                            session_skipped = before - len(valid_functions)
+                            self.response_panel.add_response(
+                                "⏭️ Session Skip",
+                                f"Skipped {session_skipped} function(s) already analyzed in the loaded session; "
+                                f"{len(valid_functions)} left to process.",
+                            )
+
+                        if not valid_functions:
+                            self.response_panel.add_response(
+                                "✅ Nothing To Do",
+                                f"All {session_skipped} functions were already analyzed in the loaded session.",
+                            )
+                            return
 
                     total_functions = len(valid_functions)
                     self.response_panel.add_response("Step 1 Complete", f"Found {total_functions} functions to process")
@@ -1646,12 +1710,18 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                                 # Periodic progress updates (every 10 functions)
                                 if completed_count % 10 == 0:
                                     progress_pct = (completed_count / total_functions) * 100
+                                    # ETA from wall-clock throughput over the functions left to process
+                                    elapsed = time.time() - start_time
+                                    rate = completed_count / elapsed if elapsed > 0 else 0
+                                    remaining = total_functions - completed_count
+                                    eta_str = self._format_eta(remaining / rate) if rate > 0 else "calculating..."
                                     self.response_panel.add_response(
                                         "Progress",
                                         f"⚡ Parallel Progress: {completed_count}/{total_functions} ({progress_pct:.1f}%) | "
                                         + f"✅ {successful_renames + enumerated_functions} processed | "
                                         + f"❌ {failed_renames} failed | "
-                                        + f"⏭️ {skipped_functions} skipped",
+                                        + f"⏭️ {skipped_functions} skipped | "
+                                        + f"⏳ {remaining} left, ETA {eta_str}",
                                     )
 
                             except Exception as e:
@@ -2108,15 +2178,32 @@ Choose your enumeration strategy:"""
         )
         desc3.pack(anchor="w", padx=20)
 
+        # Skip-already-analyzed option (from a loaded session)
+        analyzed_count = 0
+        if self.renamed_functions_panel and hasattr(self.renamed_functions_panel, "get_rows_snapshot"):
+            analyzed_count = len(self.renamed_functions_panel.get_rows_snapshot())
+
+        skip_analyzed_var = tk.BooleanVar(value=analyzed_count > 0)
+        skip_check = ttk.Checkbutton(
+            main_frame,
+            text=f"Skip functions already analyzed in the loaded session ({analyzed_count} found)",
+            variable=skip_analyzed_var,
+        )
+        skip_check.pack(anchor="w", pady=(0, 15))
+        if analyzed_count == 0:
+            skip_check.configure(state="disabled")
+
         # Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill="x")
 
         selected_mode = None
+        selected_skip = False
 
         def confirm_enumeration():
-            nonlocal selected_mode
+            nonlocal selected_mode, selected_skip
             selected_mode = enumeration_var.get()
+            selected_skip = skip_analyzed_var.get()
             enumeration_dialog.destroy()
 
         def cancel_enumeration():
@@ -2132,7 +2219,7 @@ Choose your enumeration strategy:"""
             return  # User cancelled
 
         # Start the bulk rename workflow with selected enumeration mode
-        self._run_bulk_rename_workflow("Rename All Functions", enumeration_mode=selected_mode)
+        self._run_bulk_rename_workflow("Rename All Functions", enumeration_mode=selected_mode, skip_analyzed=selected_skip)
 
     def _analyze_imports(self):
         """Analyze imports using hardcoded workflow."""
@@ -2362,7 +2449,13 @@ Please provide a comprehensive analysis of this information.
     def _set_tool_running(self, running: bool, tool_name: str = ""):
         """Set the tool running state."""
         self.tool_running = running
+        if running:
+            self.should_stop = False  # Reset stop flag for new tool (must stay synchronous)
+        self._apply_running_ui(running, tool_name)
 
+    @ui_safe
+    def _apply_running_ui(self, running: bool, tool_name: str = ""):
+        """Reflect running state in the widgets. Marshalled to the Tk main thread."""
         # Update all buttons
         state = "disabled" if running else "normal"
         for widget in self.frame.winfo_children():
@@ -2374,7 +2467,6 @@ Please provide a comprehensive analysis of this information.
 
         # Update status and progress
         if running:
-            self.should_stop = False  # Reset stop flag for new tool
             self.status_label.config(text=f"Running {tool_name}...", foreground="orange")
             self.progress.start()
         else:

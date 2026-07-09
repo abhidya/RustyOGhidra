@@ -5,6 +5,7 @@ import time
 from ..bridge import Bridge
 from .ai_response_panel import AIResponsePanel
 from .workflow_diagram import WorkflowDiagram
+from .ui_thread import ui_safe
 import logging
 
 logger = logging.getLogger(__name__)
@@ -302,7 +303,13 @@ class QueryInputPanel:
     def _set_query_running(self, running: bool):
         """Set the query running state."""
         self.query_running = running
+        if running:
+            self.should_stop = False  # Reset stop flag for new query (must stay synchronous)
+        self._apply_running_ui(running)
 
+    @ui_safe
+    def _apply_running_ui(self, running: bool):
+        """Reflect running state in the widgets. Marshalled to the Tk main thread."""
         # Update button states
         state = "disabled" if running else "normal"
         self.send_button.config(state=state)
@@ -312,7 +319,6 @@ class QueryInputPanel:
 
         # Update status and progress
         if running:
-            self.should_stop = False  # Reset stop flag for new query
             self.status_label.config(text="Processing query...", foreground="orange")
             self.progress.start()
         else:

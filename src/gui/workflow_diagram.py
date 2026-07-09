@@ -1,5 +1,6 @@
 import tkinter as tk
 from ttkbootstrap import Style
+from .ui_thread import ui_safe
 
 
 # Enhanced WorkflowDiagram class with RAG vector creation stage
@@ -31,8 +32,9 @@ class WorkflowDiagram:
 
         self._draw_workflow()
 
+    @ui_safe
     def _draw_workflow(self):
-        """Draw the workflow diagram."""
+        """Render the diagram from the current model state. Runs on the Tk main thread."""
         self.canvas.delete("all")
 
         # Calculate positions
@@ -96,12 +98,9 @@ class WorkflowDiagram:
                 font=("Arial", 9, "bold"),
             )
 
-        # Draw RAG status text below workflow if active
-        if self.rag_active and self.rag_status_text:
-            self.canvas.create_text(
-                self.width // 2, self.height - 15, text=self.rag_status_text, fill="#e74c3c", font=("Arial", 9, "bold")
-            )
-
+    # NOTE: the setters below update the model synchronously (safe from any
+    # thread — plain attribute writes) and then call the @ui_safe renderer,
+    # which marshals the actual canvas redraw onto the Tk main thread.
     def set_current_stage(self, stage: str | None):
         """Set the current active stage."""
         self.current_stage = stage.lower().replace(" ", "_") if stage else None

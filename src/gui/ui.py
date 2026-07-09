@@ -9,7 +9,6 @@ import logging
 import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
-from typing import Any, Dict
 
 import ttkbootstrap as tb
 
@@ -22,6 +21,7 @@ from .renamed_functions_panel import RenamedFunctionsPanel
 from .server_config_dialog import ServerConfigDialog
 from .tool_buttons_panel import ToolButtonsPanel
 from .workflow_diagram import WorkflowDiagram
+from . import ui_thread
 
 logger = logging.getLogger("ollama-ghidra-bridge.ui")
 
@@ -45,6 +45,11 @@ class OGhidraUI:
             themename="darkly",  # Dark gray theme with soft corners
             size=(1400, 900),
         )
+
+        # Make all @ui_safe-decorated widget updates thread-safe (marshals
+        # background-thread calls onto the Tk main loop). Must run before any
+        # worker can fire.
+        ui_thread.install(self.root)
 
         # Ensure closing the main window triggers a clean application shutdown
         # (save session, close Ghidra/pyGhidra client, exit mainloop).
@@ -645,118 +650,19 @@ class OGhidraUI:
                     if hasattr(self, "memory_panel"):
                         self.memory_panel.set_session_loading(True)
 
-                    # Try streaming load first for large sessions
-                    session_data = self.session_manager.load_session_streaming(session["id"])
-
-                    if session_data and session_data.get("streaming"):
-                        # Handle streaming load
-                        self._load_session_streaming(session_data, session)
-                        return
-                    elif not session_data:
-                        # Fallback to regular load
-                        session_data = self.session_manager.load_session(session["id"])
-
-                    if session_data:
-                        functions_loaded = 0
-
-                        # Restore analyzed functions to UI (deduplicated)
-                        if hasattr(self, "renamed_functions_panel") and self.renamed_functions_panel:
-                            analyzed_functions = session_data.get("analyzed_functions", {})
-
-                            # ----------------------
-                            # Deduplicate by canonical address and merge related records
-                            # ----------------------
-                            unique_funcs = {}
-                            processed_ids = set()  # canonical_id = address|new_name to avoid duplicates
-
-                            for func_data in analyzed_functions.values():
-                                # 1) Derive canonical address (prefer explicit address field that looks like an address)
-                                addr = func_data.get("address")
-                                if not addr or not self.renamed_functions_panel._looks_like_address(addr):
-                                    # Address sometimes stored in name fields – pick whichever looks like an address
-                                    for cand in (func_data.get("old_name"), func_data.get("new_name")):
-                                        if cand and self.renamed_functions_panel._looks_like_address(cand):
-                                            addr = cand
-                                            break
-
-                                # Fallback: use new_name / old_name if no real address (edge-case)
-                                if not addr:
-                                    addr = func_data.get("new_name") or func_data.get("old_name") or "Unknown"
-
-                                canonical_id = f"{addr}|{func_data.get('new_name', 'Unknown')}"
-                                if canonical_id in processed_ids:
-                                    # Already captured this address/name pair
-                                    continue
-                                processed_ids.add(canonical_id)
-
-                                if addr not in unique_funcs:
-                                    unique_funcs[addr] = {
-                                        "address": addr,
-                                        "old_name": func_data.get("old_name", "Unknown"),
-                                        "new_name": func_data.get("new_name", "Unknown"),
-                                        "behavior_summary": func_data.get("behavior_summary") or func_data.get("summary", ""),
-                                    }
-                                else:
-                                    existing = unique_funcs[addr]
-                                    # Merge names preferring non-Unknown values
-                                    if existing.get("old_name") in [None, "Unknown"] and func_data.get("old_name"):
-                                        existing["old_name"] = func_data["old_name"]
-                                    if existing.get("new_name") in [None, "Unknown"] and func_data.get("new_name"):
-                                        existing["new_name"] = func_data["new_name"]
-                                    # Merge summary if existing entry lacks one
-                                    if not existing.get("behavior_summary"):
-                                        existing["behavior_summary"] = func_data.get("behavior_summary") or func_data.get(
-                                            "summary", ""
-                                        )
-
-                        for addr, fd in unique_funcs.items():
-                            try:
-                                summary_val = fd.get("behavior_summary") or fd.get("summary", "")
-                                self.renamed_functions_panel.add_function_with_summary(
-                                    address=addr,
-                                    old_name=fd.get("old_name", "Unknown"),
-                                    new_name=fd.get("new_name", "Unknown"),
-                                    summary=summary_val,
-                                )
-                                functions_loaded += 1
-                            except Exception as e:
-                                logger.warning(f"Could not restore function {addr}: {e}")
-
-                        # Skip RAG vector restoration during session loading to prevent HuggingFace API calls
-                        # Vectors will be loaded on-demand via the "Load Vectors" button
-                        rag_vectors = session_data.get("rag_vectors", [])
-
-                        # Note: RAG vectors are available in session data but not loaded automatically
-                        # Use "Load Vectors" button in Analyzed Functions panel to create embeddings
-
-                        # Clear session loading flag and update memory panel
-                        if hasattr(self, "memory_panel"):
-                            self.memory_panel.set_session_loading(False)
-
-                        # Task mode and custom notepad are persisted outside saved sessions (data/user_prefs.json).
-
-                        result["loaded"] = True
-                        result["session"] = session
-                        load_dialog.destroy()
-
-                        success_msg = f"Session '{session['name']}' loaded successfully!\n\n"
-                        success_msg += f"• Restored {functions_loaded} analyzed functions\n"
-                        if len(rag_vectors) > 0:
-                            success_msg += f"• Found {len(rag_vectors)} RAG vectors in session (use 'Load Vectors' button to create embeddings)\n"
-                        success_msg += "• Session loaded without creating embeddings (prevents HuggingFace rate limiting)"
-
-                        messagebox.showinfo("Success", success_msg)
-                    else:
-                        # Clear session loading flag on error
-                        if hasattr(self, "memory_panel"):
-                            self.memory_panel.set_session_loading(False)
-                        messagebox.showerror("Error", "Failed to load session data.")
+                    # Close the picker and run ALL heavy work (file parse +
+                    # restore) off the UI thread via a cancelable progress
+                    # dialog. Keeps the window responsive (#39).
+                    result["loaded"] = True
+                    result["session"] = session
+                    load_dialog.destroy()
+                    self._start_session_load(session)
 
                 except Exception as e:
                     # Clear session loading flag on error
                     if hasattr(self, "memory_panel"):
                         self.memory_panel.set_session_loading(False)
-                    messagebox.showerror("Error", f"Failed to load session: {e}")
+                    messagebox.showerror("Error", f"Failed to start session load: {e}")
                     import traceback
 
                     logger.error(f"Load session error: {e}\n{traceback.format_exc()}")
@@ -776,174 +682,172 @@ class OGhidraUI:
 
             logger.error(f"Load session error: {e}\n{traceback.format_exc()}")
 
-    def _load_session_streaming(self, session_data: Dict[str, Any], session_info: Dict[str, Any]):
-        """Load a large session using streaming to prevent UI freezing."""
-        try:
-            import threading
-            from tkinter import messagebox, Toplevel, Label, Button, ttk
+    def _dedupe_analyzed_functions(self, analyzed_functions, panel):
+        """Collapse saved analyzed functions to one record per canonical address."""
+        unique_funcs = {}
+        processed_ids = set()  # canonical_id = address|new_name
 
-            # Create progress dialog - larger size to accommodate all elements
-            progress_dialog = Toplevel(self.root)
-            progress_dialog.title("Loading Large Session")
-            progress_dialog.geometry("500x300")
-            progress_dialog.transient(self.root)
-            progress_dialog.grab_set()
-            progress_dialog.resizable(False, False)
+        for func_data in analyzed_functions.values():
+            # Derive canonical address (prefer a field that looks like an address)
+            addr = func_data.get("address")
+            if not addr or (panel and not panel._looks_like_address(addr)):
+                for cand in (func_data.get("old_name"), func_data.get("new_name")):
+                    if cand and panel and panel._looks_like_address(cand):
+                        addr = cand
+                        break
+            if not addr:
+                addr = func_data.get("new_name") or func_data.get("old_name") or "Unknown"
 
-            # Center the dialog
-            progress_dialog.update_idletasks()
-            x = (progress_dialog.winfo_screenwidth() // 2) - (500 // 2)
-            y = (progress_dialog.winfo_screenheight() // 2) - (300 // 2)
-            progress_dialog.geometry(f"500x300+{x}+{y}")
+            canonical_id = f"{addr}|{func_data.get('new_name', 'Unknown')}"
+            if canonical_id in processed_ids:
+                continue
+            processed_ids.add(canonical_id)
 
-            # Main content frame
-            content_frame = ttk.Frame(progress_dialog)
-            content_frame.pack(fill="both", expand=True, padx=20, pady=20)
+            if addr not in unique_funcs:
+                unique_funcs[addr] = {
+                    "address": addr,
+                    "old_name": func_data.get("old_name", "Unknown"),
+                    "new_name": func_data.get("new_name", "Unknown"),
+                    "behavior_summary": func_data.get("behavior_summary") or func_data.get("summary", ""),
+                }
+            else:
+                existing = unique_funcs[addr]
+                if existing.get("old_name") in [None, "Unknown"] and func_data.get("old_name"):
+                    existing["old_name"] = func_data["old_name"]
+                if existing.get("new_name") in [None, "Unknown"] and func_data.get("new_name"):
+                    existing["new_name"] = func_data["new_name"]
+                if not existing.get("behavior_summary"):
+                    existing["behavior_summary"] = func_data.get("behavior_summary") or func_data.get("summary", "")
 
-            # Title
-            title_label = Label(content_frame, text="Loading Large Session", font=("Arial", 14, "bold"))
-            title_label.pack(pady=(0, 10))
+        return unique_funcs
 
-            # Session name
-            session_label = Label(content_frame, text=f"Session: {session_info['name']}", font=("Arial", 11))
-            session_label.pack(pady=2)
+    def _start_session_load(self, session):
+        """Load a session fully off the UI thread with a cancelable progress dialog (#39).
 
-            # File size
-            file_size = session_data.get("file_size_mb", 0)
-            size_label = Label(content_frame, text=f"File size: {file_size:.1f} MB", font=("Arial", 10))
-            size_label.pack(pady=2)
+        Handles both the streaming (large-session) and regular formats. Widgets
+        are built here on the main thread; the file parse and the entire restore
+        loop run in a worker, and every widget update is marshalled back to the
+        main thread via ui_thread.run_on_ui.
+        """
+        from tkinter import Toplevel, Label
 
-            # Progress status
-            progress_var = tk.StringVar(value="Initializing...")
-            progress_label = Label(content_frame, textvariable=progress_var, font=("Arial", 10))
-            progress_label.pack(pady=(10, 5))
+        # ---- progress dialog (built on the main thread) ----
+        dlg = Toplevel(self.root)
+        dlg.title("Loading Session")
+        dlg.geometry("500x240")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
 
-            # Progress bar
-            progress_bar = ttk.Progressbar(content_frame, mode="indeterminate", length=400)
-            progress_bar.pack(pady=10, fill="x")
-            progress_bar.start()
+        frame = ttk.Frame(dlg)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+        Label(frame, text="Loading Analysis Session", font=("Arial", 14, "bold")).pack(pady=(0, 8))
+        Label(frame, text=f"Session: {session['name']}", font=("Arial", 11)).pack(pady=2)
 
-            # Function count stats
-            stats_var = tk.StringVar(value="Functions loaded: 0")
-            stats_label = Label(content_frame, textvariable=stats_var, font=("Arial", 10, "bold"))
-            stats_label.pack(pady=5)
+        status_var = tk.StringVar(value="Parsing session file...")
+        Label(frame, textvariable=status_var, font=("Arial", 10)).pack(pady=(10, 5))
+        bar = ttk.Progressbar(frame, mode="indeterminate", length=400)
+        bar.pack(pady=10, fill="x")
+        bar.start()
+        stats_var = tk.StringVar(value="Functions loaded: 0")
+        Label(frame, textvariable=stats_var, font=("Arial", 10, "bold")).pack(pady=5)
 
-            # Info text
-            info_label = Label(
-                content_frame,
-                text="Large sessions are loaded progressively to prevent UI freezing.\nThis may take a few moments...",
-                font=("Arial", 9),
-                justify="center",
-            )
-            info_label.pack(pady=10)
+        cancel_requested = threading.Event()
 
-            # Button frame to ensure cancel button is always visible
-            button_frame = ttk.Frame(content_frame)
-            button_frame.pack(side="bottom", fill="x", pady=(20, 0))
+        def request_cancel():
+            cancel_requested.set()
+            status_var.set("Cancelling...")
 
-            # Cancel button - centered and prominent
-            cancel_requested = threading.Event()
+        ttk.Button(frame, text="Cancel", command=request_cancel).pack(pady=(8, 0))
+        dlg.protocol("WM_DELETE_WINDOW", request_cancel)
 
-            def cancel_load():
-                cancel_requested.set()
-                progress_dialog.destroy()
+        dlg.update_idletasks()
+        x = (dlg.winfo_screenwidth() - 500) // 2
+        y = (dlg.winfo_screenheight() - 240) // 2
+        dlg.geometry(f"500x240+{x}+{y}")
 
-            cancel_button = Button(
-                button_frame,
-                text="Cancel Loading",
-                command=cancel_load,
-                font=("Arial", 10),
-                bg="#ff6b6b",
-                fg="white",
-                relief="raised",
-                bd=2,
-                padx=20,
-                pady=5,
-            )
-            cancel_button.pack(side="bottom", pady=10)
-
-            # Loading worker
-            def load_worker():
+        def finish(title, body, error=False):
+            def done():
                 try:
-                    functions_loaded = 0
+                    dlg.destroy()
+                except tk.TclError:
+                    pass
+                if hasattr(self, "memory_panel"):
+                    self.memory_panel.set_session_loading(False)
+                (messagebox.showerror if error else messagebox.showinfo)(title, body)
 
-                    # Load functions in chunks
-                    if hasattr(self, "renamed_functions_panel") and self.renamed_functions_panel:
-                        progress_var.set("Loading functions...")
+            ui_thread.run_on_ui(done)
 
-                        # Enable streaming mode to prevent individual UI updates
-                        self.renamed_functions_panel.set_streaming_mode(True)
+        def worker():
+            loaded = 0
+            panel = getattr(self, "renamed_functions_panel", None)
+            try:
+                # Parse OFF the UI thread.
+                session_data = self.session_manager.load_session_streaming(session["id"])
+                if not session_data:
+                    session_data = self.session_manager.load_session(session["id"])
+                if not session_data:
+                    finish("Error", "Failed to load session data.", error=True)
+                    return
 
-                        function_iterator = session_data.get("function_iterator")
-                        if function_iterator:
-                            for address, func_data in function_iterator:
-                                if cancel_requested.is_set():
-                                    break
+                if panel and session_data.get("streaming"):
+                    ui_thread.run_on_ui(lambda: status_var.set("Loading functions (streaming)..."))
+                    panel.set_streaming_mode(True)
+                    iterator = session_data.get("function_iterator")
+                    if iterator:
+                        for address, fd in iterator:
+                            if cancel_requested.is_set():
+                                break
+                            try:
+                                panel.add_function_with_summary(
+                                    address=address,
+                                    old_name=fd.get("old_name", "Unknown"),
+                                    new_name=fd.get("new_name", "Unknown"),
+                                    summary=fd.get("behavior_summary", fd.get("summary", "")),
+                                    update_state=False,
+                                )
+                                loaded += 1
+                                if loaded % 50 == 0:
+                                    ui_thread.run_on_ui(lambda n=loaded: stats_var.set(f"Functions loaded: {n}"))
+                            except Exception as e:
+                                logger.debug(f"Could not restore function {address}: {e}")
+                    panel.set_streaming_mode(False)
+                elif panel:
+                    analyzed = session_data.get("analyzed_functions", {})
+                    unique = self._dedupe_analyzed_functions(analyzed, panel)
+                    ui_thread.run_on_ui(lambda t=len(unique): status_var.set(f"Restoring {t} functions..."))
+                    for addr, fd in unique.items():
+                        if cancel_requested.is_set():
+                            break
+                        try:
+                            panel.add_function_with_summary(
+                                address=addr,
+                                old_name=fd.get("old_name", "Unknown"),
+                                new_name=fd.get("new_name", "Unknown"),
+                                summary=fd.get("behavior_summary") or fd.get("summary", ""),
+                            )
+                            loaded += 1
+                            if loaded % 50 == 0:
+                                ui_thread.run_on_ui(lambda n=loaded: stats_var.set(f"Functions loaded: {n}"))
+                        except Exception as e:
+                            logger.warning(f"Could not restore function {addr}: {e}")
 
-                                try:
-                                    self.renamed_functions_panel.add_function_with_summary(
-                                        address=address,
-                                        old_name=func_data.get("old_name", "Unknown"),
-                                        new_name=func_data.get("new_name", "Unknown"),
-                                        summary=func_data.get("behavior_summary", func_data.get("summary", "")),
-                                        update_state=False,
-                                    )
-                                    functions_loaded += 1
+                if cancel_requested.is_set():
+                    finish("Cancelled", f"Loading cancelled after {loaded} analyzed functions.")
+                    return
 
-                                    # Update progress every 50 functions
-                                    if functions_loaded % 50 == 0:
-                                        stats_var.set(f"Functions loaded: {functions_loaded}")
-                                        progress_dialog.update_idletasks()
+                rag_vectors = session_data.get("rag_vectors", [])
+                msg = f"Session '{session['name']}' loaded successfully!\n\n"
+                msg += f"• Restored {loaded} analyzed functions\n"
+                if rag_vectors:
+                    msg += f"• {len(rag_vectors)} RAG vectors available (use 'Load Vectors' button)\n"
+                finish("Success", msg)
+            except Exception as e:
+                import traceback
 
-                                except Exception as e:
-                                    logger.debug(f"Could not restore function {address}: {e}")
+                logger.error(f"Session load error: {e}\n{traceback.format_exc()}")
+                finish("Error", f"Failed to load session: {e}", error=True)
 
-                        # Disable streaming mode and do final UI update
-                        self.renamed_functions_panel.set_streaming_mode(False)
-
-                    # Don't load RAG vectors automatically - they're too large
-                    # User can load them via "Load Vectors" button
-
-                    # Clear session loading flag
-                    if hasattr(self, "memory_panel"):
-                        self.memory_panel.set_session_loading(False)
-
-                    # Task mode and custom notepad are persisted outside saved sessions (data/user_prefs.json).
-
-                    # Close progress dialog and show success
-                    if not cancel_requested.is_set():
-                        progress_dialog.destroy()
-
-                        success_msg = f"Large session '{session_info['name']}' loaded successfully!\n\n"
-                        success_msg += f"• Restored {functions_loaded} analyzed functions\n"
-                        success_msg += f"• File size: {file_size:.1f} MB\n"
-                        success_msg += "• RAG vectors available but not loaded (use 'Load Vectors' button)\n"
-                        success_msg += "• Streaming load prevented UI freezing"
-
-                        messagebox.showinfo("Success", success_msg)
-
-                except Exception as e:
-                    # Clear session loading flag on error
-                    if hasattr(self, "memory_panel"):
-                        self.memory_panel.set_session_loading(False)
-
-                    progress_dialog.destroy()
-                    messagebox.showerror("Error", f"Failed to load session: {e}")
-                    import traceback
-
-                    logger.error(f"Streaming load error: {e}\n{traceback.format_exc()}")
-
-            # Start loading in background thread
-            threading.Thread(target=load_worker, daemon=True).start()
-
-        except Exception as e:
-            # Clear session loading flag on error
-            if hasattr(self, "memory_panel"):
-                self.memory_panel.set_session_loading(False)
-            messagebox.showerror("Error", f"Failed to setup streaming load: {e}")
-            import traceback
-
-            logger.error(f"Streaming setup error: {e}\n{traceback.format_exc()}")
+        threading.Thread(target=worker, daemon=True).start()
 
     def _health_check(self):
         """Perform a health check."""
@@ -981,8 +885,8 @@ class OGhidraUI:
             except Exception as e:
                 results.append(f"CAG System: ERROR - {e}")
 
-            # Show results
-            messagebox.showinfo("Health Check", "\n".join(results))
+            # Show results (marshal the modal onto the Tk main thread)
+            ui_thread.run_on_ui(lambda: messagebox.showinfo("Health Check", "\n".join(results)))
 
         threading.Thread(target=check, daemon=True).start()
 
