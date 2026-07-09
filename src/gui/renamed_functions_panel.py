@@ -1,4 +1,5 @@
 from ..bridge import Bridge
+from .ui_thread import run_on_ui
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from datetime import datetime
@@ -246,13 +247,17 @@ class RenamedFunctionsPanel:
             vectors_loaded = 0
             vectors_failed = 0
 
+            # All widget writes below marshal onto the Tk main thread; the main
+            # loop redraws, so no manual progress_dialog.update() is needed.
+            def set_status(text):
+                run_on_ui(lambda: progress_status.config(text=text))
+
             try:
                 # Disable the button during loading
-                self.load_vectors_button.config(state="disabled", text="Loading...")
+                run_on_ui(lambda: self.load_vectors_button.config(state="disabled", text="Loading..."))
 
                 # Get all function data
-                progress_status.config(text="Collecting function data...")
-                progress_dialog.update()
+                set_status("Collecting function data...")
 
                 functions_to_process = []
 
@@ -315,14 +320,12 @@ class RenamedFunctionsPanel:
                             )
 
                 total_functions = len(functions_to_process)
-                progress_bar.config(maximum=total_functions)
+                run_on_ui(lambda: progress_bar.config(maximum=total_functions))
 
-                progress_status.config(text=f"Loading {total_functions} functions into vectors...")
-                progress_dialog.update()
+                set_status(f"Loading {total_functions} functions into vectors...")
 
                 # **OPTIMIZED: Batch processing approach with embeddings**
-                progress_status.config(text="Initializing embedding service...")
-                progress_dialog.update()
+                set_status("Initializing embedding service...")
 
                 # ✅ FIXED: Use generic embeddings from Bridge
                 try:
@@ -355,8 +358,7 @@ class RenamedFunctionsPanel:
                     batch_end = min(batch_start + BATCH_SIZE, total_functions)
                     batch = functions_to_process[batch_start:batch_end]
 
-                    progress_status.config(text=f"Processing batch {batch_num + 1} of {num_batches}")
-                    progress_dialog.update()
+                    set_status(f"Processing batch {batch_num + 1} of {num_batches}")
 
                     # ✅ FIXED: Use generic batch embeddings
                     # Filter out empty summaries which cause 400 errors
@@ -394,13 +396,15 @@ class RenamedFunctionsPanel:
                             self._add_function_to_vector_store_direct(func_data, embedding)
                             vectors_loaded += 1
 
-                            # Update progress
+                            # Update progress (marshalled to the main thread)
                             overall_progress = batch_start + i + 1
-                            progress_bar.config(value=overall_progress)
-                            progress_detail.config(text=f"Added: {func_data['new_name']}")
-
-                            if overall_progress % 10 == 0:
-                                progress_dialog.update()
+                            new_name = func_data["new_name"]
+                            run_on_ui(
+                                lambda p=overall_progress, n=new_name: (
+                                    progress_bar.config(value=p),
+                                    progress_detail.config(text=f"Added: {n}"),
+                                )
+                            )
 
                         except Exception as e:
                             logger.warning(f"Failed to add {func_data['new_name']}: {e}")
@@ -412,16 +416,16 @@ class RenamedFunctionsPanel:
                     time.sleep(0.1)
 
                 # Update results
-                progress_status.config(text="Vector loading completed!")
+                set_status("Vector loading completed!")
                 results_text = f"✅ Successfully loaded: {vectors_loaded} vectors\n"
                 if vectors_failed > 0:
                     results_text += f"❌ Failed to load: {vectors_failed} vectors\n"
                 results_text += f"📊 Total processed: {total_functions} functions"
 
-                results_label.config(text=results_text, foreground="green")
+                run_on_ui(lambda: results_label.config(text=results_text, foreground="green"))
 
                 # Update vector status label
-                self.vector_status_label.config(text=f"Vectors: {vectors_loaded} loaded", foreground="green")
+                run_on_ui(lambda: self.vector_status_label.config(text=f"Vectors: {vectors_loaded} loaded", foreground="green"))
 
                 # Update memory panel if available
                 if hasattr(self.bridge, "cag_manager") and self.bridge.cag_manager:
@@ -432,43 +436,46 @@ class RenamedFunctionsPanel:
                             f"Vector store after loading: {len(vector_store.embeddings) if vector_store.embeddings else 0} vectors"
                         )
 
-                    # Trigger memory panel update by finding it in the UI hierarchy
-                    root = self.frame.winfo_toplevel()
-                    # Look for memory panel in the UI - it's typically in the left panel
-                    for widget in root.winfo_children():
-                        if hasattr(widget, "winfo_children"):
-                            for child in widget.winfo_children():
-                                if hasattr(child, "_update_memory_info"):
-                                    child._update_memory_info()
-                                    break
+                    # Trigger memory panel update by finding it in the UI hierarchy (on the main thread)
+                    def refresh_memory_panel():
+                        root = self.frame.winfo_toplevel()
+                        for widget in root.winfo_children():
+                            if hasattr(widget, "winfo_children"):
+                                for child in widget.winfo_children():
+                                    if hasattr(child, "_update_memory_info"):
+                                        child._update_memory_info()
+                                        break
 
-                # Add close button
-                def close_dialog():
-                    progress_dialog.destroy()
-                    self.load_vectors_button.config(state="normal", text="Load Vectors")
+                    run_on_ui(refresh_memory_panel)
 
-                close_button = ttk.Button(progress_frame, text="Close", command=close_dialog)
-                close_button.pack(pady=(10, 0))
-
-                # Auto-close after 3 seconds if successful
-                if vectors_failed == 0:
-                    progress_dialog.after(3000, close_dialog)
+                # Add close button (created + auto-close scheduled on the main thread)
+                run_on_ui(lambda: self._add_vector_close_button(progress_dialog, progress_frame, vectors_failed == 0))
 
             except Exception as e:
-                progress_status.config(text="Error occurred during vector loading!")
-                results_label.config(text=f"❌ Error: {str(e)}", foreground="red")
                 logger.error(f"Vector loading error: {e}")
-
-                # Add close button
-                def close_dialog():
-                    progress_dialog.destroy()
-                    self.load_vectors_button.config(state="normal", text="Load Vectors")
-
-                close_button = ttk.Button(progress_frame, text="Close", command=close_dialog)
-                close_button.pack(pady=(10, 0))
+                err = str(e)
+                set_status("Error occurred during vector loading!")
+                run_on_ui(lambda: results_label.config(text=f"❌ Error: {err}", foreground="red"))
+                run_on_ui(lambda: self._add_vector_close_button(progress_dialog, progress_frame, False))
 
         # Start loading in background thread
         threading.Thread(target=load_vectors_worker, daemon=True).start()
+
+    def _add_vector_close_button(self, progress_dialog, progress_frame, auto_close):
+        """Add the Close button to the vector-load dialog. MUST run on the main thread."""
+
+        def close_dialog():
+            try:
+                progress_dialog.destroy()
+            except tk.TclError:
+                pass
+            self.load_vectors_button.config(state="normal", text="Load Vectors")
+
+        ttk.Button(progress_frame, text="Close", command=close_dialog).pack(pady=(10, 0))
+
+        # Auto-close shortly after a fully successful load.
+        if auto_close:
+            progress_dialog.after(3000, close_dialog)
 
     def _add_function_to_vector_store_direct(self, func_data, embedding):
         """Add function directly to vector store without reloading model."""

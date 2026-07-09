@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import os
 from ..config import BridgeConfig
+from .ui_thread import run_on_ui
 import threading
 
 import logging
@@ -382,8 +383,8 @@ class ServerConfigDialog:
             except Exception as e:
                 results.append(f"GhidraMCP: ❌ {str(e)}")
 
-            # Show results
-            messagebox.showinfo("Connection Test", "\n".join(results))
+            # Show results (marshal the modal onto the Tk main thread)
+            run_on_ui(lambda: messagebox.showinfo("Connection Test", "\n".join(results)))
 
         threading.Thread(target=test, daemon=True).start()
 

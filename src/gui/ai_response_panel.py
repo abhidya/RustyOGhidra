@@ -57,26 +57,30 @@ class AIResponsePanel:
         self.response_text.tag_config("tool", foreground=colors.warning, font=("Consolas", 11, "italic"))
         self.response_text.tag_config("reasoning", foreground="#a0a0a0")  # Subtle gray for reasoning
 
-    @ui_safe
     def add_response(self, response_type: str, content: str, timestamp: Optional[datetime] = None):
-        """Add a new AI response to the display."""
+        """Add a new AI response. Model update is synchronous; render is marshalled."""
         if timestamp is None:
             timestamp = datetime.now()
 
-        # Store in history
+        # Model (source of truth): append synchronously so any thread/reader
+        # sees the entry immediately, regardless of when the Text catches up.
         response_entry = {"type": response_type, "content": content, "timestamp": timestamp.isoformat()}
         self.response_history.append(response_entry)
 
-        # Display in text widget
+        # View: project into the Text widget on the Tk main thread.
         formatted_response = f"\n{'=' * 60}\n"
         formatted_response += f"[{timestamp.strftime('%H:%M:%S')}] {response_type.upper()}\n"
         formatted_response += f"{'=' * 60}\n"
         formatted_response += f"{content}\n"
 
-        self.response_text.insert(tk.END, formatted_response)
-        self.response_text.see(tk.END)
+        self._render(formatted_response)
 
     @ui_safe
+    def _render(self, text: str):
+        """Append text to the response widget. MUST run on the Tk main thread."""
+        self.response_text.insert(tk.END, text)
+        self.response_text.see(tk.END)
+
     def add_cot_update(self, update_type: str, content: str, timestamp: Optional[datetime] = None):
         """Add a chain of thought update to the display (streaming during agentic loop).
 
@@ -119,8 +123,7 @@ class AIResponsePanel:
             # Default format
             formatted = f"[{time_str}] [{update_type}] {content}\n"
 
-        self.response_text.insert(tk.END, formatted)
-        self.response_text.see(tk.END)
+        self._render(formatted)
 
     def _clear_responses(self):
         """Clear all responses."""
