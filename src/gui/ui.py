@@ -9,7 +9,6 @@ import logging
 import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
-from typing import Any, Dict
 
 import ttkbootstrap as tb
 
