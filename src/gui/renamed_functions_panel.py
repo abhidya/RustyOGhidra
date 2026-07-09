@@ -11,8 +11,12 @@ logger = logging.getLogger(__name__)
 class RenamedFunctionsPanel:
     """Panel displaying renamed functions with their addresses and behavior summaries."""
 
+    # How often (ms) the main thread drains queued Tk mutations.
+    _UI_POLL_INTERVAL_MS = 50
+
     def __init__(self, parent, bridge: Bridge):
         import threading
+        import queue
 
         self.frame = ttk.LabelFrame(parent, text="Analyzed Functions", padding=10)
         self.bridge = bridge
@@ -20,6 +24,15 @@ class RenamedFunctionsPanel:
         self._streaming_load_active = False  # Flag to prevent updates during streaming
         self.batch_operation_in_progress = False  # Flag to prevent auto-refresh during batch operations
         self.dict_lock = threading.RLock()  # Thread-safe lock for dictionary access
+
+        # THREAD SAFETY: Tkinter is not thread-safe. Background workers (bulk
+        # rename, session load) must never touch widgets directly. They push a
+        # zero-arg callable onto this queue; the main thread drains it via a
+        # poller scheduled from _setup_widgets (i.e. registered on the main
+        # thread), so every Treeview mutation runs on the Tk main loop.
+        self._ui_queue = queue.Queue()
+        self._ui_poller_active = True
+
         self._setup_widgets()
         self._update_function_list()
 
@@ -89,8 +102,60 @@ class RenamedFunctionsPanel:
         self.tree.bind("<Double-1>", self._on_function_double_click)
         self.tree.bind("<Button-3>", self._on_right_click)  # Right-click context menu
 
+        # Start the main-thread UI queue poller (registered on the main thread).
+        self.frame.after(self._UI_POLL_INTERVAL_MS, self._drain_ui_queue)
+
         # Auto-refresh setup
         self._start_auto_refresh()
+
+    def _enqueue_ui(self, callback):
+        """Schedule `callback` to run on the Tk main thread.
+
+        Safe to call from any thread: it only touches a thread-safe queue and
+        never a widget. The main-thread poller (_drain_ui_queue) applies it.
+        """
+        self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self):
+        """Main-thread poller: apply all queued Tk mutations, then reschedule.
+
+        All ops pending at a given tick are applied in one batch and the count
+        label is refreshed exactly once afterwards, so a burst of incremental
+        upserts costs a single O(n) count scan rather than one per row.
+        """
+        import queue
+
+        applied = False
+        try:
+            while True:
+                try:
+                    callback = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                    applied = True
+                except tk.TclError as e:
+                    logger.debug(f"Queued UI update skipped: {e}")
+                except Exception as e:
+                    logger.error(f"Error applying queued UI update: {e}")
+
+            if applied:
+                self._refresh_count_label()
+        finally:
+            # Reschedule unless the widget is gone (app shutting down).
+            if self._ui_poller_active:
+                try:
+                    self.frame.after(self._UI_POLL_INTERVAL_MS, self._drain_ui_queue)
+                except tk.TclError:
+                    self._ui_poller_active = False
+
+    def _refresh_count_label(self):
+        """Update the 'Functions: N' label to the live row count. Main thread only."""
+        try:
+            self.count_label.config(text=f"Functions: {len(self.tree.get_children())}")
+        except tk.TclError:
+            pass
 
     def _load_vectors_from_functions(self):
         """Load all analyzed functions into the vector store for RAG enhancement."""
@@ -520,10 +585,11 @@ class RenamedFunctionsPanel:
     def _reconcile_tree(self, rows):
         """Reconcile the Treeview to `rows` via upsert instead of rebuild.
 
-        Existing rows are updated in place (only when values actually change)
-        and new rows are appended; rows no longer present are removed. Rows are
-        never reordered, so scroll position, selection, expanded state, and any
-        user-applied sort order are preserved. The tree is never fully cleared.
+        MUST run on the Tk main thread (invoked via the UI queue). Existing rows
+        are updated in place (only when values actually change) and new rows are
+        appended; rows no longer present are removed. Rows are never reordered,
+        so scroll position, selection, expanded state, and any user-applied sort
+        order are preserved. The tree is never fully cleared.
         """
         desired_ids = {iid for iid, _ in rows}
 
@@ -544,23 +610,25 @@ class RenamedFunctionsPanel:
             else:
                 self.tree.insert("", "end", iid=iid, values=values)
 
-        self.count_label.config(text=f"Functions: {len(rows)}")
+        self._refresh_count_label()
 
     def _update_function_list(self):
-        """Refresh the function list incrementally (upsert, never full rebuild)."""
-        # THREAD SAFETY: Acquire lock before accessing shared dictionaries
+        """Refresh the function list incrementally (upsert, never full rebuild).
+
+        Safe to call from any thread: the row set is computed under the data
+        lock, then the Treeview mutation is marshalled onto the Tk main thread.
+        The lock is released before any widget is touched.
+        """
+        # THREAD SAFETY: hold the lock only for the read-side snapshot.
         with self.dict_lock:
             try:
                 rows = self._compute_desired_rows()
-                logger.debug(f"Reconciling function list: {len(rows)} rows")
-                self._reconcile_tree(rows)
             except Exception as e:
-                # During streaming loads, tree updates can fail due to rapid changes
-                # Log as debug instead of error to reduce noise
-                if "not found" in str(e).lower():
-                    logger.debug(f"Tree item not found during function list update: {e}")
-                else:
-                    logger.error(f"Error updating function list: {e}")
+                logger.error(f"Error computing function list: {e}")
+                return
+
+        logger.debug(f"Reconciling function list: {len(rows)} rows")
+        self._enqueue_ui(lambda: self._reconcile_tree(rows))
 
     def _upsert_function_row(self, address: str, old_name: str, new_name: str, summary: str = ""):
         """Insert or update a single row without touching the rest of the tree.
@@ -569,33 +637,39 @@ class RenamedFunctionsPanel:
         rename-all flow update one row per completed function in O(1), instead
         of rebuilding the entire Treeview on every success (which hung the UI
         past ~1000 functions and lost scroll/selection each time).
+
+        Safe to call from any thread: values are snapshotted under the data
+        lock, then the Treeview mutation is marshalled onto the Tk main thread.
         """
+        # Snapshot the row values under the lock; touch no widgets here.
         with self.dict_lock:
-            try:
-                iid = self._addr_iid(address)
-                display_address = address.replace("name_", "") if address.startswith("name_") else address
-                summary_key = f"{address}_{new_name}"
+            iid = self._addr_iid(address)
+            display_address = address.replace("name_", "") if address.startswith("name_") else address
+            summary_key = f"{address}_{new_name}"
 
-                bridge_summaries = getattr(self.bridge, "function_summaries", {})
-                resolved_summary = (
-                    bridge_summaries.get(address, "")
-                    or bridge_summaries.get(old_name, "")
-                    or bridge_summaries.get(new_name, "")
-                    or self.function_summaries.get(summary_key, "")
-                    or summary
-                    or "No summary available"
-                )
-                values = (display_address, old_name, new_name, resolved_summary, summary_key)
+            bridge_summaries = getattr(self.bridge, "function_summaries", {})
+            resolved_summary = (
+                bridge_summaries.get(address, "")
+                or bridge_summaries.get(old_name, "")
+                or bridge_summaries.get(new_name, "")
+                or self.function_summaries.get(summary_key, "")
+                or summary
+                or "No summary available"
+            )
+            values = (display_address, old_name, new_name, resolved_summary, summary_key)
 
-                if self.tree.exists(iid):
-                    if tuple(self.tree.item(iid, "values")) != values:
-                        self.tree.item(iid, values=values)
-                else:
-                    self.tree.insert("", "end", iid=iid, values=values)
+        self._enqueue_ui(lambda: self._apply_row_upsert(iid, values, new_name))
 
-                self.count_label.config(text=f"Functions: {len(self.tree.get_children())}")
-            except tk.TclError as e:
-                logger.debug(f"Tree upsert skipped for {new_name}: {e}")
+    def _apply_row_upsert(self, iid, values, new_name):
+        """Apply a single-row upsert to the Treeview. MUST run on the main thread."""
+        try:
+            if self.tree.exists(iid):
+                if tuple(self.tree.item(iid, "values")) != values:
+                    self.tree.item(iid, values=values)
+            else:
+                self.tree.insert("", "end", iid=iid, values=values)
+        except tk.TclError as e:
+            logger.debug(f"Tree upsert skipped for {new_name}: {e}")
 
     def _looks_like_address(self, text: str) -> bool:
         """Check if a string looks like a memory address."""
