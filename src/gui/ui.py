@@ -22,6 +22,7 @@ from .renamed_functions_panel import RenamedFunctionsPanel
 from .server_config_dialog import ServerConfigDialog
 from .tool_buttons_panel import ToolButtonsPanel
 from .workflow_diagram import WorkflowDiagram
+from . import ui_thread
 
 logger = logging.getLogger("ollama-ghidra-bridge.ui")
 
@@ -45,6 +46,11 @@ class OGhidraUI:
             themename="darkly",  # Dark gray theme with soft corners
             size=(1400, 900),
         )
+
+        # Make all @ui_safe-decorated widget updates thread-safe (marshals
+        # background-thread calls onto the Tk main loop). Must run before any
+        # worker can fire.
+        ui_thread.install(self.root)
 
         # Ensure closing the main window triggers a clean application shutdown
         # (save session, close Ghidra/pyGhidra client, exit mainloop).

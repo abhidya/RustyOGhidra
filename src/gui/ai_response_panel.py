@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk, filedialog
 import json
 from datetime import datetime
+from .ui_thread import ui_safe
 
 
 class AIResponsePanel:
@@ -56,6 +57,7 @@ class AIResponsePanel:
         self.response_text.tag_config("tool", foreground=colors.warning, font=("Consolas", 11, "italic"))
         self.response_text.tag_config("reasoning", foreground="#a0a0a0")  # Subtle gray for reasoning
 
+    @ui_safe
     def add_response(self, response_type: str, content: str, timestamp: Optional[datetime] = None):
         """Add a new AI response to the display."""
         if timestamp is None:
@@ -74,6 +76,7 @@ class AIResponsePanel:
         self.response_text.insert(tk.END, formatted_response)
         self.response_text.see(tk.END)
 
+    @ui_safe
     def add_cot_update(self, update_type: str, content: str, timestamp: Optional[datetime] = None):
         """Add a chain of thought update to the display (streaming during agentic loop).
 

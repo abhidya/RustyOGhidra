@@ -9,6 +9,7 @@ import json
 import re
 from typing import Dict, Any
 from .daemon_thread_pool_executor import DaemonThreadPoolExecutor
+from .ui_thread import ui_safe
 from concurrent.futures import as_completed
 import logging
 
@@ -82,28 +83,6 @@ class ToolButtonsPanel:
         # Configure grid weights
         self.frame.grid_columnconfigure(0, weight=1)
         self.frame.grid_columnconfigure(1, weight=1)
-
-    def _set_tool_running(self, running: bool, tool_name: str = ""):
-        """Set the tool running state."""
-        self.tool_running = running
-
-        # Update all buttons
-        state = "disabled" if running else "normal"
-        for widget in self.frame.winfo_children():
-            if isinstance(widget, ttk.Button) and widget not in [self.stop_button]:
-                widget.config(state=state)
-
-        # Update stop button state
-        self.stop_button.config(state="normal" if running else "disabled")
-
-        # Update status and progress
-        if running:
-            self.should_stop = False  # Reset stop flag for new tool
-            self.status_label.config(text=f"Running {tool_name}...", foreground="orange")
-            self.progress.start()
-        else:
-            self.status_label.config(text="Ready", foreground="green")
-            self.progress.stop()
 
     def _run_ai_agent_query(self, query: str, tool_name: str):
         """Run a query through the AI agent workflow."""
@@ -2362,7 +2341,13 @@ Please provide a comprehensive analysis of this information.
     def _set_tool_running(self, running: bool, tool_name: str = ""):
         """Set the tool running state."""
         self.tool_running = running
+        if running:
+            self.should_stop = False  # Reset stop flag for new tool (must stay synchronous)
+        self._apply_running_ui(running, tool_name)
 
+    @ui_safe
+    def _apply_running_ui(self, running: bool, tool_name: str = ""):
+        """Reflect running state in the widgets. Marshalled to the Tk main thread."""
         # Update all buttons
         state = "disabled" if running else "normal"
         for widget in self.frame.winfo_children():
@@ -2374,7 +2359,6 @@ Please provide a comprehensive analysis of this information.
 
         # Update status and progress
         if running:
-            self.should_stop = False  # Reset stop flag for new tool
             self.status_label.config(text=f"Running {tool_name}...", foreground="orange")
             self.progress.start()
         else:

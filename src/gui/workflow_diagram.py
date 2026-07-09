@@ -1,5 +1,6 @@
 import tkinter as tk
 from ttkbootstrap import Style
+from .ui_thread import ui_safe
 
 
 # Enhanced WorkflowDiagram class with RAG vector creation stage
@@ -102,6 +103,7 @@ class WorkflowDiagram:
                 self.width // 2, self.height - 15, text=self.rag_status_text, fill="#e74c3c", font=("Arial", 9, "bold")
             )
 
+    @ui_safe
     def set_current_stage(self, stage: str | None):
         """Set the current active stage."""
         self.current_stage = stage.lower().replace(" ", "_") if stage else None
@@ -109,6 +111,7 @@ class WorkflowDiagram:
             self.rag_active = False
         self._draw_workflow()
 
+    @ui_safe
     def set_rag_progress(self, current: int, total: int, active: bool = True):
         """Set RAG vector creation progress."""
         self.rag_progress = current
@@ -121,6 +124,7 @@ class WorkflowDiagram:
             self.rag_status_text = ""
         self._draw_workflow()
 
+    @ui_safe
     def complete_rag_stage(self):
         """Mark RAG vector creation as complete."""
         self.rag_active = False
