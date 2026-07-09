@@ -33,6 +33,12 @@ class RenamedFunctionsPanel:
         self._ui_queue = queue.Queue()
         self._ui_poller_active = True
 
+        # Authoritative, thread-safe mirror of the displayed rows: iid -> values.
+        # Updated synchronously (under dict_lock) the moment a row's data is
+        # known, i.e. *before* the async Tk apply runs. Any thread can read a
+        # consistent snapshot via get_rows_snapshot() without touching a widget.
+        self._rows_model = {}
+
         self._setup_widgets()
         self._update_function_list()
 
@@ -250,10 +256,12 @@ class RenamedFunctionsPanel:
 
                 functions_to_process = []
 
-                # PRIMARY SOURCE: Collect from the tree widget (has ALL functions with summaries)
-                for item in self.tree.get_children():
+                # PRIMARY SOURCE: the thread-safe row model (has ALL functions
+                # with summaries). Read via snapshot rather than the Treeview so
+                # this worker thread never touches a widget and never misses a
+                # row whose insert is still queued.
+                for values in self.get_rows_snapshot():
                     try:
-                        values = self.tree.item(item, "values")
                         if len(values) >= 4:
                             address = values[0]
                             old_name = values[1]
@@ -265,7 +273,7 @@ class RenamedFunctionsPanel:
                                     {"address": address, "old_name": old_name, "new_name": new_name, "summary": summary}
                                 )
                     except Exception as e:
-                        logger.warning(f"Error reading tree item: {e}")
+                        logger.warning(f"Error reading row snapshot: {e}")
                         continue
 
                 # FALLBACK: If tree is empty, try bridge.function_address_mapping
@@ -619,13 +627,16 @@ class RenamedFunctionsPanel:
         lock, then the Treeview mutation is marshalled onto the Tk main thread.
         The lock is released before any widget is touched.
         """
-        # THREAD SAFETY: hold the lock only for the read-side snapshot.
+        # THREAD SAFETY: hold the lock only for the read-side snapshot and to
+        # refresh the authoritative row model; the widget is touched later, on
+        # the Tk main thread, via the queue.
         with self.dict_lock:
             try:
                 rows = self._compute_desired_rows()
             except Exception as e:
                 logger.error(f"Error computing function list: {e}")
                 return
+            self._rows_model = {iid: tuple(values) for iid, values in rows}
 
         logger.debug(f"Reconciling function list: {len(rows)} rows")
         self._enqueue_ui(lambda: self._reconcile_tree(rows))
@@ -657,8 +668,22 @@ class RenamedFunctionsPanel:
                 or "No summary available"
             )
             values = (display_address, old_name, new_name, resolved_summary, summary_key)
+            # Update the authoritative model immediately so readers on any
+            # thread see this row without waiting for the Tk apply to run.
+            self._rows_model[iid] = values
 
         self._enqueue_ui(lambda: self._apply_row_upsert(iid, values, new_name))
+
+    def get_rows_snapshot(self):
+        """Return a consistent snapshot of all rows as a list of value-tuples.
+
+        Thread-safe and lag-free: reflects every row whose data is known, even
+        ones whose Treeview insert is still queued. Prefer this over reading
+        tree.get_children() from any non-UI thread. Each tuple is
+        (address, old_name, new_name, summary, summary_key).
+        """
+        with self.dict_lock:
+            return list(self._rows_model.values())
 
     def _apply_row_upsert(self, iid, values, new_name):
         """Apply a single-row upsert to the Treeview. MUST run on the main thread."""

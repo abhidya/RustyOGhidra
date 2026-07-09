@@ -1445,21 +1445,24 @@ You can help analyze binary files by executing commands through GhidraMCP."""
         try:
             if hasattr(self, "_ui_instance"):
                 ui = self._ui_instance
-                if hasattr(ui, "renamed_functions_panel") and ui.renamed_functions_panel:
-                    if hasattr(ui.renamed_functions_panel, "tree"):
-                        for item in ui.renamed_functions_panel.tree.get_children():
-                            try:
-                                values = ui.renamed_functions_panel.tree.item(item, "values")
-                                if len(values) >= 4:
-                                    doc = {
-                                        "text": f"Function: {values[2]}\nOriginal: {values[1]}\nAddress: {values[0]}\nBehavior: {values[3]}",
-                                        "type": "function_analysis",
-                                        "name": values[2],
-                                        "metadata": {"address": values[0], "old_name": values[1], "new_name": values[2]},
-                                    }
-                                    function_docs.append(doc)
-                            except Exception:
-                                continue
+                panel = getattr(ui, "renamed_functions_panel", None)
+                if panel and hasattr(panel, "get_rows_snapshot"):
+                    # Read the thread-safe row model, not the Treeview. This is
+                    # safe to call from this worker thread and includes every
+                    # row whose data is known, even ones whose widget insert is
+                    # still queued (no poll-tick lag / missing rows).
+                    for values in panel.get_rows_snapshot():
+                        try:
+                            if len(values) >= 4:
+                                doc = {
+                                    "text": f"Function: {values[2]}\nOriginal: {values[1]}\nAddress: {values[0]}\nBehavior: {values[3]}",
+                                    "type": "function_analysis",
+                                    "name": values[2],
+                                    "metadata": {"address": values[0], "old_name": values[1], "new_name": values[2]},
+                                }
+                                function_docs.append(doc)
+                        except Exception:
+                            continue
         except Exception as e:
             self.logger.debug(f"Could not get functions from UI: {e}")
 
