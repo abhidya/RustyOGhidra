@@ -11,6 +11,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple, Iterator, Callable
 from dataclasses import dataclass, asdict
 import hashlib
+import copy
+import uuid
+
+from .port_workflow import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +68,19 @@ class EnhancedSessionManager:
     Handles analyzed functions, RAG vectors, UI state, and metadata.
     """
 
-    def __init__(self, sessions_dir: str = "analysis_sessions"):
+    def __init__(self, sessions_dir: str = None):
         """
         Initialize the enhanced session manager.
 
         Args:
-            sessions_dir: Directory to store session data
+            sessions_dir: Directory to store session data. Defaults to
+                `<OGhidra root>/analysis_sessions` anchored to this file — a
+                CWD-relative default silently reads/creates an empty sessions
+                dir when the app is launched from anywhere else, making all
+                saved sessions vanish from the Load Session list.
         """
+        if sessions_dir is None:
+            sessions_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis_sessions")
         self.sessions_dir = sessions_dir
         self.current_session_id: Optional[str] = None
         self.current_session_data: Optional[Dict[str, Any]] = None
@@ -97,7 +107,9 @@ class EnhancedSessionManager:
         """
         # Generate unique session ID
         timestamp = int(time.time())
-        session_id = f"session_{timestamp}_{hashlib.md5(session_name.encode()).hexdigest()[:8]}"
+        # The old timestamp+name hash collided when the same name was saved twice in one
+        # second. Keep the recognizable timestamp prefix while making every snapshot unique.
+        session_id = f"session_{timestamp}_{uuid.uuid4().hex[:8]}"
 
         # Create session directory
         session_dir = os.path.join(self.sessions_dir, session_id)
@@ -107,8 +119,11 @@ class EnhancedSessionManager:
         binary_hash = None
         if binary_path and os.path.exists(binary_path):
             try:
+                digest = hashlib.sha256()
                 with open(binary_path, "rb") as f:
-                    binary_hash = hashlib.sha256(f.read()).hexdigest()
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                binary_hash = digest.hexdigest()
             except Exception as e:
                 logger.warning(f"Could not calculate binary hash: {e}")
 
@@ -128,6 +143,7 @@ class EnhancedSessionManager:
 
         # Initialize session data structure with proper datetime serialization
         session_data = {
+            "schema_version": 2,
             "metadata": {
                 **asdict(metadata),
                 "created_at": metadata.created_at.isoformat(),
@@ -135,6 +151,12 @@ class EnhancedSessionManager:
             },
             "analyzed_functions": {},  # address -> FunctionAnalysis
             "rag_vectors": [],  # List of vector data
+            # `rag_vectors` historically contains retrieval DOCUMENTS, not embeddings. Keep
+            # the field for compatibility and identify its actual payload explicitly.
+            "rag_payload_kind": "retrieval_documents",
+            "embedding_reference": None,
+            "evidence_artifacts": [],
+            "port_dossier": None,
             "ui_state": asdict(UIState()),
             "analysis_log": [],  # Log of analysis operations
             "performance_stats": {"total_processing_time": 0.0, "average_function_time": 0.0, "rag_vector_count": 0},
@@ -155,6 +177,9 @@ class EnhancedSessionManager:
         rag_vectors: Optional[List[Any]] = None,
         ui_state: Optional[Dict[str, Any]] = None,
         performance_stats: Optional[Dict[str, Any]] = None,
+        evidence_artifacts: Optional[List[Dict[str, Any]]] = None,
+        port_dossier: Optional[Dict[str, Any]] = None,
+        embedding_reference: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Save the current session with all analysis data.
@@ -197,6 +222,13 @@ class EnhancedSessionManager:
             if rag_vectors:
                 self.current_session_data["rag_vectors"] = rag_vectors
 
+            if evidence_artifacts is not None:
+                self.current_session_data["evidence_artifacts"] = evidence_artifacts
+            if port_dossier is not None:
+                self.current_session_data["port_dossier"] = port_dossier
+            if embedding_reference is not None:
+                self.current_session_data["embedding_reference"] = embedding_reference
+
             # Update UI state
             if ui_state and self.current_session_data["ui_state"] is not None:
                 self.current_session_data["ui_state"].update(ui_state)
@@ -209,6 +241,17 @@ class EnhancedSessionManager:
             self.current_session_data["metadata"]["last_modified"] = datetime.now().isoformat()
             self.current_session_data["metadata"]["analyzed_functions_count"] = len(
                 self.current_session_data["analyzed_functions"]
+            )
+            self.current_session_data["metadata"]["total_functions"] = len(
+                self.current_session_data["analyzed_functions"]
+            )
+            self.current_session_data.setdefault("schema_version", 2)
+            self.current_session_data.setdefault("rag_payload_kind", "retrieval_documents")
+            self.current_session_data.setdefault("embedding_reference", None)
+            self.current_session_data.setdefault("evidence_artifacts", [])
+            self.current_session_data.setdefault("port_dossier", None)
+            self.current_session_data["performance_stats"]["rag_vector_count"] = len(
+                self.current_session_data.get("rag_vectors", [])
             )
 
             # Add to analysis log
@@ -403,10 +446,11 @@ class EnhancedSessionManager:
                 return False
 
             # Prepare export data
+            # Work on a copy: excluding vectors must not erase the active in-memory session.
             export_data = {
                 "export_version": "1.0",
                 "export_timestamp": datetime.now().isoformat(),
-                "session_data": session_data,
+                "session_data": copy.deepcopy(session_data),
             }
 
             # Optionally exclude vectors to reduce file size
@@ -414,8 +458,7 @@ class EnhancedSessionManager:
                 export_data["session_data"]["rag_vectors"] = []
 
             # Write to file
-            with open(export_path, "w", encoding="utf-8") as f:
-                json.dump(export_data, f, indent=2, default=str)
+            atomic_write_json(export_path, export_data)
 
             logger.info(f"Exported session {session_identifier} to {export_path}")
             return True
@@ -491,8 +534,7 @@ class EnhancedSessionManager:
 
             # Save main session file
             session_file = os.path.join(session_path, "session.json")
-            with open(session_file, "w", encoding="utf-8") as f:
-                json.dump(session_data, f, indent=2, default=str)
+            atomic_write_json(session_file, session_data)
 
             return True
 
@@ -550,6 +592,8 @@ class EnhancedSessionManager:
                     "metadata": session_data.get("metadata", {}),
                     "streaming": True,
                     "file_size_mb": file_size,
+                    "functions_count": session_data.get("functions_count", 0),
+                    "vectors_count": session_data.get("vectors_count", 0),
                     "function_iterator": self._stream_functions(session_identifier),
                     "rag_vectors_iterator": self._stream_rag_vectors(session_identifier),
                 }
@@ -570,9 +614,14 @@ class EnhancedSessionManager:
     def _stream_functions(self, session_identifier: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """Stream functions from large session file."""
         try:
-            # Use chunked loading as primary method (more reliable than ijson)
-            logger.info("Using chunked loading for function streaming")
-            yield from self._stream_functions_chunked(session_identifier)
+            try:
+                import ijson
+
+                with open(self._get_session_file_path(session_identifier), "rb") as f:
+                    yield from ijson.kvitems(f, "analyzed_functions")
+            except ImportError:
+                logger.info("ijson unavailable; using compatibility loader")
+                yield from self._stream_functions_chunked(session_identifier)
 
         except Exception as e:
             logger.error(f"Error streaming functions: {e}")
@@ -633,18 +682,38 @@ class EnhancedSessionManager:
             if not os.path.exists(session_file):
                 return None
 
-            # For reliability, just load the full file and extract metadata
-            # This is safer than trying to parse with ijson
-            logger.info("Loading session metadata using regular JSON loading")
-            session_data = self._load_session_data(session_identifier)
-            if session_data:
+            try:
+                import ijson
+
+                with open(session_file, "rb") as f:
+                    metadata = next(ijson.items(f, "metadata"), {})
+                with open(session_file, "rb") as f:
+                    ui_state = next(ijson.items(f, "ui_state"), {})
+                with open(session_file, "rb") as f:
+                    performance_stats = next(ijson.items(f, "performance_stats"), {})
+                vectors_count = int(performance_stats.get("rag_vector_count", 0) or 0)
+                if vectors_count == 0:
+                    # Older sessions left this statistic stale even when documents existed.
+                    # Count the array as a stream so the UI remains accurate without loading it.
+                    with open(session_file, "rb") as f:
+                        vectors_count = sum(1 for _ in ijson.items(f, "rag_vectors.item"))
                 return {
-                    "metadata": session_data.get("metadata", {}),
-                    "ui_state": session_data.get("ui_state", {}),
-                    "performance_stats": session_data.get("performance_stats", {}),
-                    "functions_count": len(session_data.get("analyzed_functions", {})),
-                    "vectors_count": len(session_data.get("rag_vectors", [])),
+                    "metadata": metadata,
+                    "ui_state": ui_state,
+                    "performance_stats": performance_stats,
+                    "functions_count": metadata.get("analyzed_functions_count", 0),
+                    "vectors_count": vectors_count,
                 }
+            except ImportError:
+                session_data = self._load_session_data(session_identifier)
+                if session_data:
+                    return {
+                        "metadata": session_data.get("metadata", {}),
+                        "ui_state": session_data.get("ui_state", {}),
+                        "performance_stats": session_data.get("performance_stats", {}),
+                        "functions_count": len(session_data.get("analyzed_functions", {})),
+                        "vectors_count": len(session_data.get("rag_vectors", [])),
+                    }
             return None
 
         except Exception as e:

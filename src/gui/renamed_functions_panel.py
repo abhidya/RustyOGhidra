@@ -1103,54 +1103,64 @@ class RenamedFunctionsPanel:
     def add_function_with_summary(
         self, address: str, old_name: str, new_name: str, summary: str = "", *, update_state: bool = True
     ):
-        """Add a function with a summary programmatically."""
+        """Add a function with a summary programmatically.
+
+        update_state=False suppresses only the per-row INFO logging (used by bulk
+        streaming loads); the bridge row-source dicts are always updated."""
         summary_key = f"{address}_{new_name}" if address != "Unknown" else f"{old_name}_{new_name}"
 
         # Store summary locally
         if summary:
             self.function_summaries[summary_key] = summary
 
+        # The bridge dicts below are the panel's AUTHORITATIVE row sources:
+        # _compute_desired_rows() reads ONLY bridge.function_address_mapping and
+        # bridge.analysis_state["functions_renamed"]. They must be populated on
+        # every path — including streaming session loads. (update_state=False used
+        # to skip this entire block, so >10MB sessions restored "successfully" but
+        # the final refresh computed 0 rows; the flag now gates only the per-row
+        # logging, which is too noisy for bulk loads.)
+        # THREAD SAFETY: Acquire lock before writing to shared dictionaries
+        with self.dict_lock:
+            # CRITICAL FIX: Update bridge data structures that the UI actually reads from
+            # Update bridge's function_address_mapping
+            if not hasattr(self.bridge, "function_address_mapping"):
+                self.bridge.function_address_mapping = {}
+
+            self.bridge.function_address_mapping[address] = {"old_name": old_name, "new_name": new_name}
+
+            # Update bridge's function summaries
+            if not hasattr(self.bridge, "function_summaries"):
+                self.bridge.function_summaries = {}
+
+            if summary:
+                # Store summary using multiple keys for robust retrieval
+                self.bridge.function_summaries[address] = summary
+                if old_name != "Unknown":
+                    self.bridge.function_summaries[old_name] = summary
+                if new_name != "Unknown":
+                    self.bridge.function_summaries[new_name] = summary
+
+            # Update bridge's analysis_state for legacy compatibility
+            if not hasattr(self.bridge, "analysis_state"):
+                self.bridge.analysis_state = {}
+
+            if "functions_renamed" not in self.bridge.analysis_state:
+                self.bridge.analysis_state["functions_renamed"] = {}
+
+            # Store in analysis_state using only address as key to avoid duplicate name entries
+            self.bridge.analysis_state["functions_renamed"][address] = new_name
+
         if update_state:
-            # THREAD SAFETY: Acquire lock before writing to shared dictionaries
-            with self.dict_lock:
-                # CRITICAL FIX: Update bridge data structures that the UI actually reads from
-                # Update bridge's function_address_mapping
-                if not hasattr(self.bridge, "function_address_mapping"):
-                    self.bridge.function_address_mapping = {}
+            # Debug logging to verify data storage
+            import logging
 
-                self.bridge.function_address_mapping[address] = {"old_name": old_name, "new_name": new_name}
-
-                # Update bridge's function summaries
-                if not hasattr(self.bridge, "function_summaries"):
-                    self.bridge.function_summaries = {}
-
-                if summary:
-                    # Store summary using multiple keys for robust retrieval
-                    self.bridge.function_summaries[address] = summary
-                    if old_name != "Unknown":
-                        self.bridge.function_summaries[old_name] = summary
-                    if new_name != "Unknown":
-                        self.bridge.function_summaries[new_name] = summary
-
-                # Update bridge's analysis_state for legacy compatibility
-                if not hasattr(self.bridge, "analysis_state"):
-                    self.bridge.analysis_state = {}
-
-                if "functions_renamed" not in self.bridge.analysis_state:
-                    self.bridge.analysis_state["functions_renamed"] = {}
-
-                # Store in analysis_state using only address as key to avoid duplicate name entries
-                self.bridge.analysis_state["functions_renamed"][address] = new_name
-
-                # Debug logging to verify data storage
-                import logging
-
-                logger = logging.getLogger("ollama-ghidra-bridge.ui")
-                logger.info(f"Added function to session: {address} | {old_name} -> {new_name}")
-                logger.info(f"Bridge function_address_mapping now has {len(self.bridge.function_address_mapping)} entries")
-                logger.info(
-                    f"Bridge analysis_state functions_renamed now has {len(self.bridge.analysis_state['functions_renamed'])} entries"
-                )
+            logger = logging.getLogger("ollama-ghidra-bridge.ui")
+            logger.info(f"Added function to session: {address} | {old_name} -> {new_name}")
+            logger.info(f"Bridge function_address_mapping now has {len(self.bridge.function_address_mapping)} entries")
+            logger.info(
+                f"Bridge analysis_state functions_renamed now has {len(self.bridge.analysis_state['functions_renamed'])} entries"
+            )
 
         # Only refresh the UI list if not in streaming mode
         # During streaming, we'll do batch updates to prevent UI freezing.

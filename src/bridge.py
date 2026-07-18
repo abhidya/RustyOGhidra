@@ -38,6 +38,7 @@ from src.context_manager import ContextManager
 from src.analysis_dump import AnalysisDumper
 from src.coverage_tracker import CoverageTracker
 from src.lead_tracker import LeadTracker
+from src.port_workflow import PORT_MODE, atomic_write_json, extract_dossier, prompt_for_phase
 from datetime import datetime
 
 
@@ -242,7 +243,7 @@ class Bridge:
         self.current_workflow_stage = None  # Can be: 'planning', 'execution', 'analysis', 'review', None
 
         # Task mode controls how much guidance we inject.
-        # Modes: off (no special mode), purpose_id, malware, vuln, custom
+        # Modes: off (no special mode), port_1to1, purpose_id, malware, vuln, custom
         self.task_mode_enabled = False
         self.task_mode = "off"
 
@@ -355,6 +356,37 @@ class Bridge:
             "enabled": bool(getattr(self, "task_mode_enabled", False)),
             "mode": getattr(self, "task_mode", "off"),
         }
+
+    def _capture_port_dossier(self, response: str) -> Optional[str]:
+        """Validate and persist a dossier emitted by the 1:1-port analysis phase."""
+        if not (
+            bool(getattr(self, "task_mode_enabled", False))
+            and getattr(self, "task_mode", "off") == PORT_MODE
+        ):
+            return None
+        payload = extract_dossier(response)
+        if payload is None:
+            self.logger.warning("port_1to1 response did not contain a valid dossier JSON object")
+            return None
+        scope = payload.get("scope", {})
+        family = re.sub(r"[^a-z0-9]+", "-", str(scope.get("family", "unknown")).lower()).strip("-")
+        action = int(scope.get("actionIndex", 0))
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        default_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "port_dossiers")
+        target_dir = getattr(self, "port_dossiers_dir", default_dir)
+        path = os.path.join(target_dir, f"{family}-action-{action}-{stamp}.json")
+        atomic_write_json(path, payload)
+        try:
+            self.session.add_knowledge(
+                "latest_port_dossier",
+                path,
+                category="port_1to1",
+                tags=[family, f"action-{action}"],
+            )
+        except Exception:
+            pass
+        self.logger.info(f"Validated port dossier saved to {path}")
+        return path
 
     def set_grep_layer_enabled(self, enabled: bool) -> None:
         """Enable or disable the hybrid search (grep layer) functionality."""
@@ -617,6 +649,18 @@ Do NOT skip to tool execution. Provide concrete details from the data above.
         embedding_model = model or getattr(client_config, "embedding_model", "nomic-embed-text")
 
         try:
+            # Fast path: a single batched request per chunk instead of one HTTP round-trip per
+            # text (avoids the per-call chat throttle). ~20x faster for Load Vectors / KB builds.
+            if hasattr(cls._ollama_client, "embed_batch"):
+                try:
+                    batched = cls._ollama_client.embed_batch(valid_texts, model=embedding_model)
+                    if batched and len(batched) == len(valid_texts):
+                        return batched
+                    if batched:
+                        logger.debug("embed_batch returned partial results; falling back to per-text")
+                except Exception as e:
+                    logger.debug(f"embed_batch unavailable/failed, falling back to per-text: {e}")
+
             embeddings = []
             for text in valid_texts:
                 embedding = cls._ollama_client.embed(text, model=embedding_model)
@@ -844,7 +888,10 @@ You can help analyze binary files by executing commands through GhidraMCP."""
             system_sections.append(tools_section)
 
         # 3. Phase-specific instructions (static rules)
-        if phase == "planning":
+        port_mode = bool(getattr(self, "task_mode_enabled", False)) and getattr(self, "task_mode", "off") == PORT_MODE
+        if port_mode:
+            system_sections.append(prompt_for_phase(phase))
+        elif phase == "planning":
             # Task mode gating: only use deployment-vuln planning prompt when explicitly in vuln mode.
             use_vuln_prompt = bool(getattr(self, "task_mode_enabled", False)) and getattr(self, "task_mode", "off") == "vuln"
             planning_template = (
@@ -2085,8 +2132,20 @@ You can help analyze binary files by executing commands through GhidraMCP."""
                 self._emit_cot("Phase", "Phase 1: Planning")
                 self.current_workflow_stage = "planning"
 
+                # NAMING FAST-PATH: the bulk-rename goal is fixed and self-describing —
+                # an LLM planning pass burns minutes of reasoning tokens to restate the
+                # investigation directive. Use the caller's canned plan on cycle 1.
+                if getattr(self, "naming_fastpath", False) and cycle == 1:
+                    plan_response = getattr(self, "naming_fastpath_plan", None) or (
+                        "Investigate the target function directly: decompile callees/callers as needed, "
+                        "search the knowledge base for the struct offsets and symbols involved, then give "
+                        "the final four-section naming answer."
+                    )
+                    self.current_plan = plan_response
+                    self.current_plan_tools = self._parse_plan_tools(plan_response)
+                    self.add_to_context("plan", plan_response)
                 # For cycles after the first, add context about what we learned
-                if cycle > 1:
+                elif cycle > 1:
                     cycle_context = "\n\n## Previous Cycle Results\n"
                     cycle_context += f"Cycles completed: {cycle - 1}\n"
                     cycle_context += f"Previous evaluation: {all_cycle_results[-1]['reason']}\n"
@@ -2168,7 +2227,13 @@ You can help analyze binary files by executing commands through GhidraMCP."""
                 self.logger.info(f"🧠 Cycle {cycle} - Phase 3: Analysis")
                 self._emit_cot("Phase", "Phase 3: Analysis")
                 self.current_workflow_stage = "analysis"
-                response = self._analyze_execution_results(exec_results)
+                if getattr(self, "naming_fastpath", False):
+                    # One direct call producing the four-section naming answer, instead of
+                    # the two-call consolidate-findings + security-report pipeline whose
+                    # malware-triage output the rename workflow discards anyway.
+                    response = self._analyze_for_naming(exec_results)
+                else:
+                    response = self._analyze_execution_results(exec_results)
                 self.logger.info(f"✅ Analysis completed: {len(response)} chars")
                 self._emit_cot("Status", f"Analysis completed ({len(response)} chars)")
 
@@ -2179,9 +2244,19 @@ You can help analyze binary files by executing commands through GhidraMCP."""
                 self.logger.info(f"🔍 Cycle {cycle} - Phase 4: Goal Evaluation")
                 self._emit_cot("Phase", "Phase 4: Goal Evaluation")
                 self.current_workflow_stage = "evaluation"
-                goal_achieved, reason = self._evaluate_goal_achievement(
-                    goal=query, analysis=response, exec_results=exec_results
-                )
+                if getattr(self, "naming_fastpath", False):
+                    # The naming goal is achieved iff the answer contains a Suggested Name —
+                    # a string check, not another LLM round-trip.
+                    goal_achieved = "Suggested Name:" in (response or "")
+                    reason = (
+                        "four-section naming answer produced"
+                        if goal_achieved
+                        else "analysis lacks a 'Suggested Name:' section"
+                    )
+                else:
+                    goal_achieved, reason = self._evaluate_goal_achievement(
+                        goal=query, analysis=response, exec_results=exec_results
+                    )
 
                 # Store cycle results
                 all_cycle_results.append(
@@ -2358,10 +2433,12 @@ You can help analyze binary files by executing commands through GhidraMCP."""
         # Check if agentic loop is enabled
         if self.llm_config.agentic_loop_enabled:
             self.logger.info("🔄 Using multi-cycle agentic loop mode")
-            return self.process_query_with_agentic_loop(query)
+            response = self.process_query_with_agentic_loop(query)
         else:
             self.logger.info("➡️ Using single-pass mode (legacy)")
-            return self.process_query_single_pass(query)
+            response = self.process_query_single_pass(query)
+        self._capture_port_dossier(response)
+        return response
 
     def _generate_plan(self, query: str) -> str:
         """
@@ -3513,19 +3590,40 @@ Output ONLY JSON (same structure), top {max_items} items."""
         coverage_section = ""
         task_mode_enabled = bool(getattr(self, "task_mode_enabled", False))
 
-        if task_mode_enabled and self.coverage_tracker:
+        port_mode = task_mode_enabled and getattr(self, "task_mode", "off") == PORT_MODE
+        if task_mode_enabled and not port_mode and self.coverage_tracker:
             coverage_section = self.coverage_tracker.format_for_prompt()
 
         # Helper to get lead info (ONLY when task mode is enabled)
         leads_section = ""
-        if task_mode_enabled and self.lead_tracker:
+        if task_mode_enabled and not port_mode and self.lead_tracker:
             # Parse leads from previous cycle results if any
             if exec_results.analysis_dump:
                 self.lead_tracker.parse_analysis_dump(exec_results.analysis_dump)
             leads_section = self.lead_tracker.format_for_prompt()
 
         # Instructions for next step - WITH or WITHOUT investigation methodology based on task mode
-        if task_mode_enabled:
+        if port_mode:
+            hybrid_search_banner = ""
+            if self.grep_layer_enabled:
+                hybrid_search_banner = """
+**HYBRID SEARCH ENABLED** - use summaries only to discover candidate constructors,
+dispatchers, tables, and phase functions. Re-open every candidate in primary evidence.
+
+"""
+            user_sections.append(f"""
+{hybrid_search_banner}## Your next evidence step
+
+Continue the scoped chain: constructor -> action dispatcher -> variant table -> phase table ->
+phase/helper verification. Prefer the smallest tool call that closes a named evidence gap.
+Preserve addresses, raw constants, branch predicates, table indexes, and unresolved host returns.
+
+REASONING: [Which dossier claim or blocker this tool call will establish]
+EXECUTE: tool_name(param1="value1", param2="value2")
+
+If every reachable path is evidenced and the dossier is ready: "INVESTIGATION COMPLETE"
+""")
+        elif task_mode_enabled:
             # Task Mode ON: Simplified instructions (methodology moved to system prompt)
 
             # Add hybrid search reminder banner if enabled
@@ -3586,6 +3684,80 @@ If done: "INVESTIGATION COMPLETE"
 
         return (system_prompt, user_prompt)
 
+    def _analyze_for_naming(self, exec_results: ExecutionPhaseResults) -> str:
+        """Single-call analysis for the function-naming fast path (naming_fastpath=True).
+
+        The generic analysis phase spends two LLM calls producing a malware-triage
+        deliverable (structured-findings JSON with security_apis, then a report with a
+        Security Assessment) that the rename workflow immediately discards. Here the
+        evidence is ranked deterministically and ONE call produces the four-section
+        naming answer the goal itself specifies.
+        """
+        from src.context_manager import RelevanceRanker
+
+        current_cycle = self.current_loop_number
+        current_cycle_executions = [
+            te for te in exec_results.tool_executions if getattr(te, "loop_number", current_cycle) == current_cycle
+        ]
+        ranker = RelevanceRanker(top_n_per_category=getattr(self.llm_config, "top_n_per_category", 10))
+        ranked_results = ranker.rank_results(current_cycle_executions, exec_results.goal)
+        formatted_ranked = ranker.format_ranked_for_prompt(ranked_results, max_chars_per_category=2000)
+
+        prompt = (
+            f"{exec_results.goal}\n\n"
+            f"## EVIDENCE GATHERED (results of your own investigation tools)\n{formatted_ranked}\n\n"
+            "You now have all the evidence you are going to get. Give your FINAL answer for the "
+            "target function in the exact required four-section format (**Function Analysis:**, "
+            "**Behavior Summary:**, **Suggested Name:**, **Rationale:**). Ground every claim in the "
+            "code and the evidence above — if a table, note, or sibling documents a DIFFERENT "
+            "address, you may cite the structural similarity but must NOT claim identity."
+        )
+        response = self.ollama.generate(prompt=prompt)
+        return self._clean_final_response(response) if response and response.strip() else ""
+
+    def _analyze_for_port(self, exec_results: ExecutionPhaseResults) -> str:
+        """Produce a dossier-shaped result without the generic malware report pipeline."""
+        from src.context_manager import RelevanceRanker
+
+        current_cycle = self.current_loop_number
+        current_cycle_executions = [
+            te for te in exec_results.tool_executions if getattr(te, "loop_number", current_cycle) == current_cycle
+        ]
+        ranker = RelevanceRanker(top_n_per_category=max(20, getattr(self.llm_config, "top_n_per_category", 10)))
+        ranked_results = ranker.rank_results(current_cycle_executions, exec_results.goal)
+        formatted_ranked = ranker.format_ranked_for_prompt(ranked_results, max_chars_per_category=6000)
+        schema_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schemas", "port-dossier.schema.json"
+        )
+        try:
+            with open(schema_path, "r", encoding="utf-8") as handle:
+                schema = handle.read()
+        except OSError:
+            schema = "Version 1 dossier with scope, variants, phases, claims, blockers, and tests."
+
+        prompt = f"""
+## Port goal
+{exec_results.goal}
+
+## Evidence gathered in this cycle
+{formatted_ranked}
+
+## Required dossier schema
+{schema}
+
+Reconstruct only mechanics supported by the evidence. Preserve raw values, addresses, branch
+direction, signedness/width, table routing, helper arguments, and unresolved host returns. Every
+DERIVED_ROM claim needs a primary address/range and qualifying evidence. Finish with exactly one
+fenced JSON dossier conforming to the schema; nothing may follow the fence.
+"""
+        response = self.ollama.generate(
+            prompt=prompt,
+            system_prompt=prompt_for_phase("analysis"),
+            phase="analysis",
+            max_tokens=max(4096, getattr(self.llm_config, "max_tokens", 4096)),
+        )
+        return self._clean_final_response(response) if response and response.strip() else ""
+
     def _analyze_execution_results(self, exec_results: ExecutionPhaseResults) -> str:
         """
         Analysis phase: Review all execution results and provide comprehensive analysis.
@@ -3604,6 +3776,12 @@ If done: "INVESTIGATION COMPLETE"
         Returns:
             Final analysis response
         """
+        if (
+            bool(getattr(self, "task_mode_enabled", False))
+            and getattr(self, "task_mode", "off") == PORT_MODE
+        ):
+            return self._analyze_for_port(exec_results)
+
         self.logger.info("📊 Starting analysis phase (hybrid approach)")
 
         # Import the hybrid context components
@@ -4389,6 +4567,13 @@ IMPORTANT: You must provide a COMPLETE report with a conclusion. Do not truncate
             Tuple of (goal_achieved: bool, reason: str)
         """
         self.logger.info("🔍 Evaluating goal achievement...")
+
+        if (
+            bool(getattr(self, "task_mode_enabled", False))
+            and getattr(self, "task_mode", "off") == PORT_MODE
+            and extract_dossier(analysis) is None
+        ):
+            return False, "Analysis is missing a schema-valid, evidence-gated port dossier"
 
         # Build evaluation prompt
         system_prompt, _ = self._build_structured_prompt(phase="evaluation")

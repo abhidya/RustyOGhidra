@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gotyaforce.local/schemas/port-dossier-v1.json",
+  "title": "Gotcha Force 1:1 port dossier",
+  "type": "object",
+  "required": ["version", "scope", "claims", "variants", "phases", "blockers", "tests"],
+  "properties": {
+    "version": { "const": 1 },
+    "scope": {
+      "type": "object",
+      "required": ["family", "actionIndex"],
+      "properties": {
+        "family": { "type": "string", "minLength": 1 },
+        "borgIds": { "type": "array", "items": { "type": "string" } },
+        "actionIndex": { "type": "integer", "minimum": 0 },
+        "constructorAddress": { "$ref": "#/$defs/address" },
+        "dispatcherAddress": { "$ref": "#/$defs/address" }
+      },
+      "additionalProperties": true
+    },
+    "variants": { "type": "array", "items": { "type": "object" } },
+    "phases": { "type": "array", "items": { "type": "object" } },
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["claimId", "status", "statement", "evidence"],
+        "properties": {
+          "claimId": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["DERIVED_ROM", "OBSERVED", "INFERRED", "TUNED", "BLOCKED"] },
+          "function": { "$ref": "#/$defs/address" },
+          "addressRange": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "$ref": "#/$defs/address" }
+          },
+          "statement": { "type": "string", "minLength": 1 },
+          "rawValue": {},
+          "interpretedValue": {},
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["tier", "source"],
+              "properties": {
+                "tier": { "enum": ["authoritative", "verified_derived", "observed", "inferred", "advisory"] },
+                "source": { "type": "string", "minLength": 1 },
+                "addressRange": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/address" }
+                },
+                "excerpt": { "type": "string" }
+              },
+              "additionalProperties": true
+            }
+          },
+          "unresolved": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": true
+      }
+    },
+    "blockers": { "type": "array", "items": { "type": "object" } },
+    "tests": { "type": "array", "items": { "type": "object" } },
+    "contradictions": { "type": "array", "items": { "type": "object" } },
+    "implementationTargets": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "address": { "type": "string", "pattern": "^(0x)?[0-9a-fA-F]{8}$" }
+  },
+  "additionalProperties": true
+}
+

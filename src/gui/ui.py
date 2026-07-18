@@ -789,9 +789,13 @@ class OGhidraUI:
                     finish("Error", "Failed to load session data.", error=True)
                     return
 
+                # Keep every per-row update off Tk. Both loaders populate the locked bridge
+                # dictionaries in streaming mode, then queue one final widget refresh.
+                if panel:
+                    panel.set_streaming_mode(True)
+
                 if panel and session_data.get("streaming"):
                     ui_thread.run_on_ui(lambda: status_var.set("Loading functions (streaming)..."))
-                    panel.set_streaming_mode(True)
                     iterator = session_data.get("function_iterator")
                     if iterator:
                         for address, fd in iterator:
@@ -810,7 +814,6 @@ class OGhidraUI:
                                     ui_thread.run_on_ui(lambda n=loaded: stats_var.set(f"Functions loaded: {n}"))
                             except Exception as e:
                                 logger.debug(f"Could not restore function {address}: {e}")
-                    panel.set_streaming_mode(False)
                 elif panel:
                     analyzed = session_data.get("analyzed_functions", {})
                     unique = self._dedupe_analyzed_functions(analyzed, panel)
@@ -824,6 +827,7 @@ class OGhidraUI:
                                 old_name=fd.get("old_name", "Unknown"),
                                 new_name=fd.get("new_name", "Unknown"),
                                 summary=fd.get("behavior_summary") or fd.get("summary", ""),
+                                update_state=False,
                             )
                             loaded += 1
                             if loaded % 50 == 0:
@@ -832,14 +836,19 @@ class OGhidraUI:
                             logger.warning(f"Could not restore function {addr}: {e}")
 
                 if cancel_requested.is_set():
+                    if panel:
+                        ui_thread.run_on_ui(lambda: panel.set_streaming_mode(False))
                     finish("Cancelled", f"Loading cancelled after {loaded} analyzed functions.")
                     return
 
                 rag_vectors = session_data.get("rag_vectors", [])
+                rag_count = len(rag_vectors) if rag_vectors else int(session_data.get("vectors_count", 0) or 0)
+                if panel:
+                    ui_thread.run_on_ui(lambda: panel.set_streaming_mode(False))
                 msg = f"Session '{session['name']}' loaded successfully!\n\n"
                 msg += f"• Restored {loaded} analyzed functions\n"
-                if rag_vectors:
-                    msg += f"• {len(rag_vectors)} RAG vectors available (use 'Load Vectors' button)\n"
+                if rag_count:
+                    msg += f"• {rag_count} retrieval documents available (use 'Load Vectors' button)\n"
                 finish("Success", msg)
             except Exception as e:
                 import traceback

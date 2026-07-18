@@ -622,8 +622,18 @@ class CustomAPIClient:
 
         embedding_model = model if model is not None else getattr(self.config, "embedding_model", "text-embedding-ada-002")
 
-        # Construct embeddings endpoint URL
-        if self.base_url.endswith("/embeddings") or self.base_url.endswith("/v1/embeddings"):
+        # Construct embeddings endpoint URL.
+        # Prefer an explicitly configured embedding endpoint (embeddings may be served on a
+        # different host/port than chat, e.g. a second LM Studio instance).
+        cfg_embed_url = (getattr(self.config, "embedding_api_url", "") or "").strip().rstrip("/")
+        if cfg_embed_url:
+            if cfg_embed_url.endswith("/embeddings"):
+                api_url = cfg_embed_url
+            elif cfg_embed_url.endswith("/v1"):
+                api_url = f"{cfg_embed_url}/embeddings"
+            else:
+                api_url = f"{cfg_embed_url}/v1/embeddings"
+        elif self.base_url.endswith("/embeddings") or self.base_url.endswith("/v1/embeddings"):
             api_url = self.base_url
         else:
             # Standard OpenAI embeddings endpoint
@@ -719,6 +729,60 @@ class CustomAPIClient:
                 self._request_semaphore.release()
             except Exception:
                 pass
+
+    def _resolve_embeddings_url(self) -> str:
+        """Resolve the /v1/embeddings endpoint (shared by embed and embed_batch)."""
+        cfg_embed_url = (getattr(self.config, "embedding_api_url", "") or "").strip().rstrip("/")
+        if cfg_embed_url:
+            if cfg_embed_url.endswith("/embeddings"):
+                return cfg_embed_url
+            if cfg_embed_url.endswith("/v1"):
+                return f"{cfg_embed_url}/embeddings"
+            return f"{cfg_embed_url}/v1/embeddings"
+        base = self.base_url
+        if base.endswith("/embeddings") or base.endswith("/v1/embeddings"):
+            return base
+        if base.endswith("/v1/chat/completions"):
+            base = base[: -len("/v1/chat/completions")]
+        elif base.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")]
+        return f"{base.rstrip('/')}/v1/embeddings"
+
+    def embed_batch(self, texts, model: Optional[str] = None, chunk: int = 64) -> List[List[float]]:
+        """Embed many texts with as few HTTP round-trips as possible. The OpenAI-compatible
+        /v1/embeddings endpoint accepts a LIST `input`, so send up to `chunk` texts per POST
+        instead of one-per-call, and skip the per-item chat throttle (request_delay /
+        global-min-interval) which is meaningless on a separate fast embedding endpoint.
+        Returns vectors in input order, or [] on failure so callers can fall back to embed()."""
+        valid = [t.strip() for t in (texts or []) if isinstance(t, str) and t.strip()]
+        if not valid:
+            return []
+        embedding_model = model if model is not None else getattr(self.config, "embedding_model", "text-embedding-ada-002")
+        api_url = self._resolve_embeddings_url()
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        step = max(1, int(chunk))
+        out: List[List[float]] = []
+        for i in range(0, len(valid), step):
+            batch = valid[i : i + step]
+            payload = {"model": embedding_model, "input": batch}
+            last_err = None
+            for attempt in range(self.max_retries + 1):
+                try:
+                    resp = requests.post(api_url, headers=headers, json=payload, timeout=self.timeout, verify=self.verify_ssl)
+                    resp.raise_for_status()
+                    data = sorted(resp.json().get("data", []), key=lambda d: d.get("index", 0))
+                    embs = [d.get("embedding", []) for d in data]
+                    if len(embs) != len(batch) or any(not e for e in embs):
+                        raise ValueError(f"expected {len(batch)} embeddings, got {len([e for e in embs if e])}")
+                    out.extend(embs)
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(min(2 * (attempt + 1), 6))
+            else:
+                self.logger.error(f"embed_batch failed for chunk at {i}: {last_err}")
+                return []
+        return out
 
     def check_health(self) -> bool:
         """Check if the Custom API endpoint is reachable."""

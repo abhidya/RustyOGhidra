@@ -32,7 +32,15 @@ class SimpleVectorStore:
             embeddings: List of document embeddings
         """
         self.documents = documents
-        self.embeddings = embeddings
+        # Normalize embeddings to a list of 1-D vectors. Loading precomputed vectors
+        # (np.load) yields a 2-D ndarray, whose truthiness is ambiguous and breaks the
+        # `if self.embeddings` / `not self.embeddings` checks used throughout this class.
+        if embeddings is None:
+            self.embeddings = []
+        elif isinstance(embeddings, np.ndarray):
+            self.embeddings = [row for row in embeddings]
+        else:
+            self.embeddings = list(embeddings)
 
         # Build FAISS index if embeddings available and library present
         self._faiss_index = None
@@ -60,7 +68,9 @@ class SimpleVectorStore:
             logger.warning("No documents or embeddings available")
             return []
 
-        # Use embeddings from Bridge class
+        # Use embeddings from Bridge class. Catch broadly: a failure to embed the query
+        # must degrade to "no semantic results" (keyword retrieval still works), never
+        # propagate and kill KB retrieval entirely.
         try:
             from src.bridge import Bridge
 
@@ -69,9 +79,17 @@ class SimpleVectorStore:
                 logger.warning("No embedding model available. Vector search disabled.")
                 return []
             query_embedding = np.array(query_embeddings[0])
-        except ImportError:
-            logger.warning("Bridge not available for embeddings")
+        except Exception as e:
+            logger.warning(f"Bridge embeddings unavailable ({e.__class__.__name__}: {e})")
             return []
+
+        # Self-heal: documents appended after construction (e.g. per-function analyses
+        # added during a sweep) are invisible to a stale FAISS index — rebuild it.
+        if _FAISS_AVAILABLE and self._faiss_index is not None and self._faiss_index.ntotal != len(self.embeddings):
+            logger.info(
+                "FAISS index stale (%d indexed vs %d stored) — rebuilding", self._faiss_index.ntotal, len(self.embeddings)
+            )
+            self._build_faiss_index()
 
         if _FAISS_AVAILABLE and self._faiss_index is not None:
             q = query_embedding.astype("float32").reshape(1, -1)
@@ -287,9 +305,46 @@ class SimpleVectorStore:
 
         return sorted(matches, key=lambda x: x["score"], reverse=True)
 
+    # C/decompiler boilerplate that must not drive keyword retrieval.
+    _KW_STOPWORDS = {
+        "void", "int", "char", "short", "long", "float", "double", "return", "undefined",
+        "unsigned", "signed", "param_1", "param_2", "param_3", "param_4", "if", "else",
+        "while", "for", "switch", "case", "break", "true", "false", "null", "sizeof",
+        "code", "byte", "uint", "ushort", "ulong", "bool", "local", "stack", "concat44",
+    }
+
+    def _distill_keywords(self, query: str, max_terms: int = 40) -> str:
+        """Extract the salient, high-signal tokens from a query (typically raw decompiled
+        code): hex literals, addresses, and named identifiers. Feeding the full code to
+        TF keyword scoring lets `int`/`return` boilerplate drown the informative terms."""
+        import re
+
+        terms = []
+        seen = set()
+        # hex literals and addresses (0x580, 80327f38), incl. inside DAT_/PTR_FUN_ tokens
+        for m in re.finditer(r"0x[0-9a-fA-F]{2,8}\b|(?:\b|_)(80[0-9a-fA-F]{6})\b", query):
+            tok = (m.group(1) or m.group(0)).lower()
+            if tok not in seen:
+                seen.add(tok)
+                terms.append(tok)
+        # named identifiers: underscore-joined or camelCase, ≥6 chars, not pure boilerplate
+        for m in re.finditer(r"\b[A-Za-z][A-Za-z0-9_]{5,}\b", query):
+            tok = m.group(0)
+            low = tok.lower()
+            if low in seen or low in self._KW_STOPWORDS or low.startswith(("local_", "ustack", "astack", "auvar", "uvar", "cvar", "ivar", "svar", "dvar", "fvar", "pvar")):
+                continue
+            seen.add(low)
+            terms.append(tok)
+        return " ".join(terms[:max_terms])
+
     def get_relevant_knowledge(self, query: str, token_limit: int = 2000) -> str:
         """
         Get relevant knowledge for a query.
+
+        Combines exact-token keyword retrieval (hex offsets, addresses, symbol names —
+        the highest-signal hooks for reverse-engineering notes) with semantic search,
+        normalizing each side's scores before merging so an exact address hit in a
+        decode note can outrank a merely code-flavored semantic neighbor.
 
         Args:
             query: The query string
@@ -298,7 +353,35 @@ class SimpleVectorStore:
         Returns:
             Relevant knowledge as a string
         """
-        results = self.search(query, top_k=3)
+        combined = []
+        kw_query = self._distill_keywords(query)
+        if kw_query:
+            kw_results = self._keyword_search(kw_query, top_k=6)
+            top_kw = max((r["score"] for r in kw_results), default=0.0)
+            for r in kw_results:
+                r["score"] = r["score"] / top_kw if top_kw > 0 else 0.0
+                r["search_type"] = "keyword"
+            combined.extend(kw_results)
+
+        sem_results = self.search(query, top_k=3)
+        top_sem = max((r["score"] for r in sem_results), default=0.0)
+        for r in sem_results:
+            r["score"] = r["score"] / top_sem if top_sem > 0 else 0.0
+            r["search_type"] = "semantic"
+        combined.extend(sem_results)
+
+        if combined:
+            results = self._merge_and_rerank(combined, top_k=3, keyword_weight=0.5)
+            if logger.isEnabledFor(logging.DEBUG):
+                for r in results:
+                    d = r.get("document", {})
+                    logger.debug(
+                        "KB hit: %s [%s] score=%.3f via %s",
+                        d.get("name", d.get("title", "?")), d.get("type", "?"),
+                        r.get("combined_score", 0.0), "+".join(sorted(r.get("search_types", set()))),
+                    )
+        else:
+            results = []
 
         if not results:
             return ""
@@ -335,12 +418,19 @@ class SimpleVectorStore:
         """Internal helper to build FAISS index."""
         if not _FAISS_AVAILABLE or not self.embeddings:
             return
-        dim = len(self.embeddings[0])
-        self._faiss_index = faiss.IndexFlatIP(dim)
-        vecs = np.array(self.embeddings).astype("float32")
-        faiss.normalize_L2(vecs)
-        self._faiss_index.add(vecs)
-        logger.info("CAG FAISS index built with %d documents", len(self.embeddings))
+        try:
+            dim = len(self.embeddings[0])
+            index = faiss.IndexFlatIP(dim)
+            vecs = np.array(self.embeddings).astype("float32")
+            faiss.normalize_L2(vecs)
+            index.add(vecs)
+            self._faiss_index = index
+            logger.info("CAG FAISS index built with %d documents", len(self.embeddings))
+        except Exception as e:
+            # Ragged embeddings (mixed models/dims) can't be stacked — fall back to the
+            # brute-force cosine path, which skips dimension-mismatched vectors per query.
+            logger.warning("FAISS index build failed (%s); using brute-force search", e)
+            self._faiss_index = None
 
 
 def create_vector_store_from_docs(documents: List[Dict[str, Any]]) -> Optional[SimpleVectorStore]:

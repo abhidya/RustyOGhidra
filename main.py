@@ -1359,6 +1359,17 @@ def main():
         action="store_true",
         help="Disable Cache-Augmented Generation (CAG)",
     )
+    parser.add_argument(
+        "--task-mode",
+        choices=["off", "port_1to1", "purpose_id", "malware", "vuln", "custom"],
+        default=None,
+        help="Enable a specialized task mode; port_1to1 enforces evidence-first game-porting prompts",
+    )
+    parser.add_argument(
+        "--enable-hybrid-search",
+        action="store_true",
+        help="Enable function-summary hybrid search for discovery (retrieved summaries remain non-authoritative)",
+    )
 
     args = parser.parse_args()
 
@@ -1397,6 +1408,10 @@ def main():
         max_agent_steps=config.max_steps,
         enable_cag=config.cag_enabled,
     )
+    if args.task_mode is not None:
+        bridge.set_task_mode(enabled=args.task_mode != "off", mode=args.task_mode)
+    if args.enable_hybrid_search:
+        bridge.set_grep_layer_enabled(True)
 
     # Print header (only for non-UI modes)
     if not args.ui:

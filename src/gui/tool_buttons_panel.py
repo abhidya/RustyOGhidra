@@ -605,6 +605,146 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _label_known_data_tables(self):
+        """Deterministically rename Ghidra DATA labels for the decoded ROM tables whose
+        addresses we know exactly (from research/decomp/data/). No LLM — exact lookups.
+        Returns (renamed, attempted)."""
+        renamed = attempted = 0
+        try:
+            from src.gf_context import get_gf_context
+
+            labels = list(get_gf_context().iter_data_labels())
+        except Exception as e:
+            logger.debug(f"data-table labels unavailable: {e}")
+            return (0, 0)
+        for addr, label in labels:
+            attempted += 1
+            try:
+                res = self.bridge.ghidra.rename_data(address=addr, new_name=label)
+                if not (isinstance(res, str) and res.lower().startswith("error")):
+                    renamed += 1
+            except Exception as e:
+                logger.debug(f"rename_data {addr}->{label} failed: {e}")
+        return (renamed, attempted)
+
+    def _maybe_apply_borg_type(self, address, decompiled_code):
+        """If a function dereferences borg struct fields, type its first param as
+        BorgInstance* (so decompiles show actor->action_state). No-op if the BorgInstance
+        type doesn't exist yet (run apply_borg_struct.py once to create it). Returns bool."""
+        try:
+            from src.gf_context import get_gf_context
+
+            gf = get_gf_context()
+            if not gf.is_borg_function(decompiled_code):
+                return False
+            pname = gf.first_param_name(decompiled_code)
+            if not pname:
+                return False
+            res = self.bridge.ghidra.set_local_variable_type(
+                function_address=address, variable_name=pname, new_type="BorgInstance *"
+            )
+            return "set successfully" in str(res).lower()
+        except Exception as e:
+            logger.debug(f"borg-type apply skipped {address}: {e}")
+            return False
+
+    def _unique_name(self, name, address):
+        """Ensure a rename target is unique within this sweep. Distinct functions that the AI
+        names identically (e.g. several thin dispatchers all → dispatchBorgActionState) would
+        otherwise collide and get silently suffixed by Ghidra; disambiguate with the address."""
+        lock = getattr(self, "_used_names_lock", None)
+        used = getattr(self, "_used_names", None)
+        if lock is None or used is None:
+            return name
+        with lock:
+            if name not in used:
+                used.add(name)
+                return name
+            suffix = str(address).lower().replace("0x", "")[-6:]
+            cand = f"{name}_{suffix}"
+            i = 2
+            while cand in used:
+                cand = f"{name}_{suffix}_{i}"
+                i += 1
+            used.add(cand)
+            return cand
+
+    def _agentic_rename_enabled(self):
+        """Whether bulk rename should route each function through the full agentic loop
+        (tool-calling + CAG + self-review) instead of the single-shot KB-grounded prompt.
+        Enabled via env AGENTIC_RENAME=1 or a runtime attribute set by the UI."""
+        import os
+
+        if getattr(self, "agentic_rename", None) is not None:
+            return bool(self.agentic_rename)
+        return os.getenv("AGENTIC_RENAME", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    def _agentic_name_function(self, analysis_query, function_name, address):
+        """Name one function via the shared agentic loop. Serialized with a lock — it
+        mutates shared Bridge state (goal/context/session), and the max_workers=1 guard
+        alone doesn't hold if agentic mode is toggled while a parallel sweep is running.
+        Enables the Hybrid-Search CAG path so the Gotcha Force KB is injected, without
+        the malware-flavored Task-Mode depth instructions, and turns on the bridge's
+        naming fast-path (canned plan, one-call analysis, string-check goal eval).
+        Falls back to a single-shot generate on any error."""
+        lock = getattr(self, "_agentic_serial_lock", None)
+        if lock is None:
+            import threading
+
+            lock = self._agentic_serial_lock = threading.Lock()
+        b = self.bridge
+        with lock:
+            prev_grep = getattr(b, "grep_layer_enabled", False)
+            prev_task = getattr(b, "task_mode_enabled", False)
+            try:
+                b.grep_layer_enabled = True   # route CAG/KB injection (bridge.py:976)
+                b.task_mode_enabled = False   # avoid malware DEPTH_INSTRUCTIONS
+                # Naming fast-path: skip the LLM planning pass (canned plan with seed
+                # steps), replace the 2-call findings+report analysis with one direct
+                # naming call, and evaluate the goal with a string check.
+                b.naming_fastpath = True
+                b.naming_fastpath_plan = (
+                    f"Name the function {function_name} @ {address}. Seed steps, then investigate "
+                    "callees/siblings as needed and give the four-section naming answer:\n"
+                    f'EXECUTE: get_xrefs_to(address="{address}")\n'
+                    f'EXECUTE: get_xrefs_from(address="{address}")\n'
+                )
+                try:
+                    from src.models.memory import SessionMemory
+
+                    b.session = SessionMemory(session_id=f"rename_{address}")
+                    b.context = []
+                except Exception as e:
+                    logger.debug(f"session reset skipped: {e}")
+                # Investigation directive: tell the loop it may load functions BY ADDRESS
+                # (callers/callees shown in the prompt) and run follow-up searches to gather
+                # evidence before committing a name. This is what makes the agentic path better
+                # than a single shot on ambiguous functions.
+                investigation = (
+                    f"You are naming exactly ONE function ({function_name} @ {address}) in the "
+                    "Gotcha Force decompilation. Available tools each step: "
+                    "decompile_function_by_address(address=...), get_xrefs_to(address=...), "
+                    "get_xrefs_from(address=...), and search_function_summaries(query=...). "
+                    "If the function's role is unclear, INVESTIGATE FIRST: decompile the caller/callee "
+                    "addresses referenced below, follow their xrefs, and search the knowledge base for "
+                    "the struct offsets / symbols involved. Gather evidence, THEN give your final answer "
+                    "for THIS function in the exact required format (do not rename anything else). "
+                    "If you discover an already-named sibling with nearly identical code, name THIS "
+                    "function PARALLEL to that sibling and encode the distinguishing difference (the "
+                    "differing callee, field, or constant) in the name — do not mint an unrelated "
+                    "synonym that hides the family relationship.\n\n"
+                )
+                result = b.process_query_with_agentic_loop(investigation + analysis_query)
+                return result if (result and result.strip()) else b.ollama.generate(prompt=analysis_query)
+            except Exception as e:
+                logger.warning(f"Agentic naming failed for {function_name}@{address}; single-shot fallback: {e}")
+                return b.ollama.generate(prompt=analysis_query)
+            finally:
+                b.grep_layer_enabled = prev_grep
+                b.task_mode_enabled = prev_task
+                b.naming_fastpath = False
+                b.naming_fastpath_plan = None
+
     def _process_single_function_for_bulk_rename(self, function_index, full_function_string, enumeration_mode, total_functions):
         """
         Process a single function for bulk rename (designed for parallel execution).
@@ -791,6 +931,33 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
             except Exception:
                 context = {"callers_code": [], "callees_code": [], "truncated": False}
 
+            # STEP 1.6: Resolve literal references (struct offsets, engine symbols, borg ids)
+            # against the Gotcha Force structured knowledge base. This is deterministic,
+            # authoritative grounding (not fuzzy) and is the highest-signal context for naming.
+            gf_resolved = ""
+            try:
+                from src.gf_context import get_gf_context
+
+                gf_resolved = get_gf_context().resolve_for_code(function_decompile_result, self_addr=address)
+            except Exception as e:
+                logger.debug(f"gf_context resolve skipped: {e}")
+
+            # Add the fuzzy half of the KB: semantically-retrieved decode notes from the
+            # Gotcha Force research corpus (CAG vector store). Complements the exact resolver.
+            try:
+                cag_mgr = getattr(self.bridge, "cag_manager", None)
+                vs = cag_mgr.vector_store if cag_mgr else None
+                if vs is not None:
+                    notes = vs.get_relevant_knowledge(function_decompile_result[:2500], token_limit=500)
+                    if notes and notes.strip():
+                        gf_resolved = (gf_resolved + "\n\n## RELATED DECODE NOTES (semantic retrieval)\n" + notes).strip()
+            except Exception as e:
+                logger.debug(f"CAG semantic notes skipped: {e}")
+
+            # Fold-in: if this function handles a borg, type its first param as BorgInstance*
+            # so its decompile (and future passes over it) read actor->action_state, etc.
+            result["borg_typed"] = self._maybe_apply_borg_type(address, function_decompile_result)
+
             # STEP 2: AI Analysis (with retry logic for LLM failures)
             max_retries = 2
             retry_count = 0
@@ -798,48 +965,28 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 
             while retry_count <= max_retries and not ai_response:
                 contextual_info = self._format_context_for_prompt(context)
-                analysis_query = f"""Analyze the function '{function_name}' and provide a highly descriptive rename suggestion.
+                try:
+                    from src.gf_context import build_naming_prompt
 
-## TARGET FUNCTION: {function_name}
-```c
-{function_decompile_result}
-```
-{contextual_info}
+                    analysis_query = build_naming_prompt(
+                        function_name, function_decompile_result, contextual_info, gf_resolved
+                    )
+                except Exception as e:
+                    logger.debug(f"build_naming_prompt failed, using minimal prompt: {e}")
+                    analysis_query = (
+                        f"Analyze the Gotcha Force function '{function_name}' and suggest a camelCase name.\n\n"
+                        f"```c\n{function_decompile_result}\n```\n{contextual_info}\n{gf_resolved}\n\n"
+                        "Respond with **Function Analysis:**, **Behavior Summary:**, **Suggested Name:**, **Rationale:**."
+                    )
 
-Based on the target function's code AND the contextual information about its callers and callees above, analyze the function thoroughly and provide a highly descriptive rename suggestion.
-
-You MUST follow this EXACT format in your response:
-
-**Function Analysis:**
-[Provide comprehensive analysis: What does this function do? Identify specific operations like memory allocation, string manipulation, network operations, file I/O, cryptographic operations, data validation, etc. Examine parameters, return values, called functions, and code patterns. Look for domain-specific functionality.]
-
-**Behavior Summary:**
-[Write a precise 1-4 sentence summary describing the function's primary behavior, data flow, and purpose in the program architecture]
-
-**Suggested Name:** [descriptiveSpecificFunctionName]
-**Rationale:** [Explain in detail why this name accurately captures the function's specific purpose and distinguishes it from other functions]
-
-ENHANCED NAMING REQUIREMENTS:
-- Be HIGHLY SPECIFIC about the operation (e.g., "parseHttpHeaders" not "parseData", "validateEmailFormat" not "validateInput")
-- Include data type/domain context (e.g., "processNetworkPacket", "decryptUserCredentials", "compressImageBuffer")
-- Use action verbs that describe the EXACT operation: parse, validate, encrypt, decrypt, compress, decompress, serialize, deserialize, allocate, deallocate, transform, convert, extract, insert, remove, update, calculate, generate, verify, authenticate, etc.
-- Use precise nouns: Buffer, Packet, Header, Payload, Token, Credential, Session, Connection, Registry, Configuration, Certificate, Signature, etc.
-- Be domain-aware: If it's crypto operations use crypto terms, if it's network use network terms, if it's file system use file terms
-- Use camelCase format
-- Length: 2-5 words (prioritize clarity over brevity)
-- Avoid generic terms: process, handle, manage, data, function, method, routine, etc.
-
-EXAMPLES of good names:
-- parseJsonConfiguration (not parseData)
-- validateTlsCertificate (not validateInput)
-- encryptAesPayload (not encryptData)
-- allocateMemoryBuffer (not allocateMemory)
-- extractRegistryKeys (not extractData)
-- calculateChecksumValue (not calculateValue)
-
-CRITICAL: You MUST include all four sections with the exact headers shown above. Focus on making the suggested name as specific and descriptive as possible."""
-
-                ai_response = self.bridge.ollama.generate(prompt=analysis_query)
+                if self._agentic_rename_enabled():
+                    # Full agentic loop: the model can pull callee decompiles / xrefs,
+                    # consult the KB, and self-review before committing a name.
+                    ai_response = self._agentic_name_function(analysis_query, function_name, address)
+                else:
+                    # No output cap: qwen3.6 reasons, then emits the four sections; let it run
+                    # to its natural EOS (koboldcpp context here is 256K).
+                    ai_response = self.bridge.ollama.generate(prompt=analysis_query)
 
                 if ai_response and ai_response.strip():
                     function_summary = ai_response.strip()
@@ -915,6 +1062,7 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                             result["result_type"] = "enumerated"
                         elif suggested_name and is_generic_name:
                             # Generic function with AI-suggested name - rename it
+                            suggested_name = self._unique_name(suggested_name, address)
                             try:
                                 rename_result = self.bridge.execute_command(
                                     "rename_function", {"old_name": function_name, "new_name": suggested_name}
@@ -936,6 +1084,7 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                         # rename_only mode - only process generic names
                         if suggested_name and is_generic_name:
                             # Perform rename
+                            suggested_name = self._unique_name(suggested_name, address)
                             try:
                                 rename_result = self.bridge.execute_command(
                                     "rename_function", {"old_name": function_name, "new_name": suggested_name}
@@ -1048,6 +1197,133 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
             result["error_msg"] = f"Exception processing function: {e}"
             result["result_type"] = "failed"
             return result
+
+    def _rag_doc_for(self, func_data):
+        """Build the vector-store document for one processed function. Mirrors the shape of
+        the persisted corpus docs (data/vector_db) so retrieval treats them uniformly:
+        type='function_analysis', text carries name+address+behavior, metadata carries the
+        address for dedup/rerank keys."""
+        addr = func_data.get("address", "")
+        old = func_data.get("old_name", "Unknown")
+        new = func_data.get("new_name", old)
+        summary = func_data.get("raw_summary") or ""
+        if not summary:
+            s = func_data.get("summary")
+            summary = s.get("raw", "") if isinstance(s, dict) else (s or "")
+        text = f"Function: {new}\nOriginal: {old}\nAddress: {addr}\nBehavior: {summary}"
+        return {
+            "text": text,
+            "type": "function_analysis",
+            "name": new,
+            "metadata": {"address": addr, "old_name": old, "new_name": new},
+        }
+
+    def _ingest_vector_now(self, func_data):
+        """Embed one function's summary and append it to the live CAG vector store so the
+        NEXT function in this same sweep can find it via search_function_summaries. Without
+        this, within-run renames are invisible until the end-of-run batch (a family's 30th
+        member can't see its first 29). Best-effort: any failure is logged and skipped.
+
+        Concurrency: the single-shot sweep reads the store from worker threads (KB step),
+        so mutate documents/embeddings under a lock. The FAISS index self-heals on the read
+        side (rebuilds when stale, falls back to brute force on error), so a concurrent
+        append never corrupts a search — it just triggers a rebuild next query."""
+        try:
+            cag = getattr(self.bridge, "cag_manager", None)
+            if cag is None:
+                return False
+            vs = cag.vector_store
+            doc = self._rag_doc_for(func_data)
+            if not doc["metadata"]["address"] or not doc["text"].strip():
+                return False
+
+            embs = type(self.bridge).get_embeddings([doc["text"]])
+            if not embs:
+                return False
+            import numpy as np
+
+            emb = np.array(embs[0])
+
+            lock = getattr(self, "_vec_ingest_lock", None)
+            if lock is None:
+                import threading
+
+                lock = self._vec_ingest_lock = threading.Lock()
+
+            with lock:
+                if vs is None:
+                    from src.cag.vector_store import SimpleVectorStore
+
+                    vs = SimpleVectorStore(documents=[], embeddings=[])
+                    cag._vector_store = vs
+                    cag._vector_store_initialized = True
+                # Keep embeddings as a list of 1-D vectors (SimpleVectorStore normalizes to
+                # this); appending one row keeps documents and embeddings length-aligned.
+                if not isinstance(vs.embeddings, list):
+                    vs.embeddings = [row for row in vs.embeddings]
+                vs.documents.append(doc)
+                vs.embeddings.append(emb)
+            return True
+        except Exception as e:
+            logger.debug(f"incremental vector ingest skipped for {func_data.get('address')}: {e}")
+            return False
+
+    def _checkpoint_session(self, processed_functions_data, enumeration_mode, extra_stats=None):
+        """Persist progress mid-sweep so a crash/hang doesn't lose hours of inference. The
+        session is created once (first checkpoint) and re-saved in place thereafter, so the
+        end-of-run save and every checkpoint target the same session file rather than
+        spawning duplicates. Best-effort: never raises into the sweep loop."""
+        try:
+            import time
+
+            if not processed_functions_data:
+                return False
+            if not hasattr(self, "session_manager") or self.session_manager is None:
+                from src.enhanced_session_manager import EnhancedSessionManager
+
+                self.session_manager = EnhancedSessionManager()
+
+            # Create the checkpoint session exactly once, then reuse its id.
+            if not getattr(self, "_checkpoint_session_id", None):
+                name = f"BulkRename_{enumeration_mode}_{int(time.time())}"
+                self.session_manager.create_session(
+                    session_name=name,
+                    binary_path=getattr(self.bridge, "current_binary_path", "Unknown"),
+                    description=f"Auto-checkpoint during {enumeration_mode} (in progress)",
+                )
+                self._checkpoint_session_id = self.session_manager.current_session_id
+            else:
+                # Point the manager back at our checkpoint session in case something else
+                # touched it, so save_current_session writes to the right file.
+                self.session_manager.load_session(self._checkpoint_session_id)
+
+            analyzed = {}
+            for fd in processed_functions_data:
+                addr = fd.get("address")
+                if not addr:
+                    continue
+                analyzed[addr] = {
+                    "address": addr,
+                    "old_name": fd.get("old_name", "Unknown"),
+                    "new_name": fd.get("new_name", "Unknown"),
+                    "behavior_summary": fd.get("raw_summary", ""),
+                    "timestamp": fd.get("timestamp", time.time()),
+                }
+
+            rag_vectors = []
+            cag = getattr(self.bridge, "cag_manager", None)
+            if cag and getattr(cag, "vector_store", None) and hasattr(cag.vector_store, "documents"):
+                rag_vectors = cag.vector_store.documents or []
+
+            stats = {"enumeration_mode": enumeration_mode, "checkpoint": True, "save_timestamp": time.time()}
+            if extra_stats:
+                stats.update(extra_stats)
+            return self.session_manager.save_current_session(
+                analyzed_functions=analyzed, rag_vectors=rag_vectors, performance_stats=stats
+            )
+        except Exception as e:
+            logger.warning(f"Session checkpoint skipped: {e}")
+            return False
 
     def _create_batch_rag_vectors(self, processed_functions_data):
         """Create RAG vectors in batches for processed functions with visual progress feedback."""
@@ -1194,7 +1470,15 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
         Returns:
             dict with keys: 'callers', 'callees', 'callers_code', 'callees_code', 'truncated'
         """
-        context = {"callers": [], "callees": [], "callers_code": [], "callees_code": [], "truncated": False, "total_chars": 0}
+        context = {
+            "callers": [],
+            "callees": [],
+            "callers_code": [],
+            "callees_code": [],
+            "data_refs": [],
+            "truncated": False,
+            "total_chars": 0,
+        }
 
         try:
             # Get callers (who calls this function?)
@@ -1225,7 +1509,14 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                         try:
                             # USE CACHE: This dramatically reduces redundant Ghidra calls
                             caller_code = self._decompile_function_cached(address=str(caller_addr))
-                            if caller_code and not caller_code.lower().startswith("error"):
+                            if caller_code and "no function found" in caller_code.lower():
+                                # The xref source is not inside a function: this function's
+                                # address is stored in DATA (a function-pointer / dispatch
+                                # table entry) — that fact IS the grounding, not noise.
+                                context["data_refs"].append(
+                                    {"address": caller_addr, "direction": "from", "label": self._data_label_for(caller_addr)}
+                                )
+                            elif caller_code and not caller_code.lower().startswith("error"):
                                 # Truncate individual caller code to 1000 chars
                                 if len(caller_code) > 1000:
                                     caller_code = caller_code[:1000] + "...[truncated]"
@@ -1265,7 +1556,12 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                         try:
                             # USE CACHE: This dramatically reduces redundant Ghidra calls
                             callee_code = self._decompile_function_cached(address=str(callee_addr))
-                            if callee_code and not callee_code.lower().startswith("error"):
+                            if callee_code and "no function found" in callee_code.lower():
+                                # Outgoing reference into DATA (table read / pointer fetch).
+                                context["data_refs"].append(
+                                    {"address": callee_addr, "direction": "to", "label": self._data_label_for(callee_addr)}
+                                )
+                            elif callee_code and not callee_code.lower().startswith("error"):
                                 # Truncate individual callee code to 1000 chars
                                 if len(callee_code) > 1000:
                                     callee_code = callee_code[:1000] + "...[truncated]"
@@ -1302,9 +1598,21 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 
         return context
 
+    @staticmethod
+    def _data_label_for(address) -> str:
+        """Look up a known decoded ROM-table label for a data address (deterministic KB),
+        or '' if unknown."""
+        try:
+            from src.gf_context import get_gf_context
+
+            addr_int = int(str(address).replace("0x", ""), 16)
+            return get_gf_context().data_labels.get(addr_int, "")
+        except Exception:
+            return ""
+
     def _format_context_for_prompt(self, context: dict) -> str:
         """Format gathered context into a prompt-friendly string."""
-        if not context["callers"] and not context["callees"]:
+        if not context["callers"] and not context["callees"] and not context.get("data_refs"):
             return ""
 
         sections = []
@@ -1322,6 +1630,26 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
             for i, callee in enumerate(context["callees_code"], 1):
                 sections.append(f"\n### Callee {i} at address {callee['address']}:")
                 sections.append(f"```c\n{callee['code']}\n```")
+
+        # Add data references (xrefs that land outside any function). An incoming data
+        # xref means this function's address sits in a function-pointer / dispatch table
+        # — high-signal grounding that it's a table-dispatched handler in a family.
+        data_refs = context.get("data_refs") or []
+        if data_refs:
+            sections.append("\n## NON-FUNCTION XREFS (data references):")
+            for ref in data_refs:
+                known = f" — known decoded table: `{ref['label']}`" if ref.get("label") else ""
+                if ref["direction"] == "from":
+                    sections.append(
+                        f"- This function's address is stored in DATA at {ref['address']} "
+                        f"(likely an entry in a function-pointer / dispatch table, i.e. this is a "
+                        f"table-dispatched handler){known}"
+                    )
+                else:
+                    sections.append(
+                        f"- This function references DATA at {ref['address']} "
+                        f"(table read / pointer fetch, not a call to a function){known}"
+                    )
 
         if context["truncated"]:
             sections.append("\n*Note: Context truncated to fit character limits. Showing most relevant callers/callees.*")
@@ -1471,6 +1799,27 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                 processed_functions_data = []  # Store all processed functions for batch RAG creation
                 batch_size = 50  # Process functions in batches for better performance
 
+                # Track names assigned this sweep so distinct functions don't collide on one name.
+                import threading
+
+                self._used_names = set()
+                self._used_names_lock = threading.Lock()
+
+                # Fresh checkpoint session per sweep (don't append to a prior run's file).
+                self._checkpoint_session_id = None
+
+                # Phase 0: deterministically label the decoded ROM data tables (no LLM).
+                # These are exact address→name lookups, so run them once up front; naming the
+                # data also makes function decompiles more readable for the pass that follows.
+                try:
+                    d_renamed, d_attempted = self._label_known_data_tables()
+                    if d_attempted:
+                        self.response_panel.add_response(
+                            "🏷️ Data Tables", f"Labeled {d_renamed}/{d_attempted} known ROM data tables (deterministic)."
+                        )
+                except Exception as e:
+                    logger.debug(f"data-table labeling skipped: {e}")
+
                 # Add initial message to response panel
                 self.response_panel.add_response(
                     f"🚀 Smart Tool: {display_name}", f"Starting OPTIMIZED bulk function analysis with mode: {enumeration_mode}"
@@ -1595,9 +1944,18 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                     self.response_panel.add_response("Step 1 Complete", f"Found {total_functions} functions to process")
                     # PARALLEL PROCESSING CONFIGURATION
                     max_workers = 5  # Process 5 functions concurrently (configurable)
+                    if self._agentic_rename_enabled():
+                        # The agentic loop mutates shared Bridge state (goal/context/session),
+                        # so it must run one function at a time.
+                        max_workers = 1
+                        self.response_panel.add_response(
+                            "🧠 Agentic Rename",
+                            "AGENTIC_RENAME enabled: routing each function through the agentic loop "
+                            "(tool-calling + KB + self-review), serially. Much slower, higher quality.",
+                        )
                     self.response_panel.add_response(
                         "⚡ Parallel Processing",
-                        f"Using {max_workers} concurrent workers for faster processing",
+                        f"Using {max_workers} concurrent worker(s)",
                     )
 
                     # Step 2: Process functions in parallel using a daemon-based
@@ -1608,6 +1966,7 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                     failed_renames = 0
                     skipped_functions = 0
                     enumerated_functions = 0  # Functions analyzed but not renamed (for enumeration)
+                    borg_typed_count = 0  # Functions whose first param got typed BorgInstance*
                     completed_count = 0  # Track completion for progress updates
 
                     # PARALLEL PROCESSING: Submit all functions to thread pool
@@ -1651,6 +2010,9 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                             try:
                                 result = future.result()
 
+                                if result.get("borg_typed"):
+                                    borg_typed_count += 1
+
                                 # Handle result based on type
                                 if result["result_type"] == "skipped":
                                     skipped_functions += 1
@@ -1674,6 +2036,8 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                                     # Add function data
                                     if result["function_data"]:
                                         processed_functions_data.append(result["function_data"])
+                                        # Make this rename searchable for the REST of this run.
+                                        self._ingest_vector_now(result["function_data"])
 
                                     # Add to UI panel
                                     if self.renamed_functions_panel and result["function_data"]:
@@ -1694,6 +2058,8 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                                     # Add function data
                                     if result["function_data"]:
                                         processed_functions_data.append(result["function_data"])
+                                        # Make this analysis searchable for the REST of this run.
+                                        self._ingest_vector_now(result["function_data"])
 
                                     # Add to UI panel
                                     if self.renamed_functions_panel and result["function_data"]:
@@ -1706,6 +2072,25 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                                             )
                                         except Exception as e:
                                             logger.warning(f"Could not update UI panel: {e}")
+
+                                # Periodic crash-safety checkpoint: persist progress to the
+                                # session file every 100 completed so a mid-run crash loses
+                                # minutes, not the whole sweep. Same session id as the final save.
+                                if completed_count % 100 == 0 and processed_functions_data:
+                                    if self._checkpoint_session(
+                                        processed_functions_data,
+                                        enumeration_mode,
+                                        extra_stats={
+                                            "successful_renames": successful_renames,
+                                            "enumerated_functions": enumerated_functions,
+                                            "failed_renames": failed_renames,
+                                            "completed": completed_count,
+                                        },
+                                    ):
+                                        self.response_panel.add_response(
+                                            "💾 Checkpoint",
+                                            f"Saved progress ({len(processed_functions_data)} functions) at {completed_count}/{total_functions}.",
+                                        )
 
                                 # Periodic progress updates (every 10 functions)
                                 if completed_count % 10 == 0:
@@ -1799,16 +2184,19 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
                                 if hasattr(self.bridge.cag_manager.vector_store, "documents"):
                                     rag_vectors = self.bridge.cag_manager.vector_store.documents or []
 
-                        # Save session with auto-generated name
-                        auto_session_name = f"BulkRename_{enumeration_mode}_{int(time.time())}"
-
-                        # Always create a new session for bulk operations (don't reuse old sessions)
-                        # This ensures clean state and proper data persistence
-                        self.session_manager.create_session(
-                            session_name=auto_session_name,
-                            binary_path=getattr(self.bridge, "current_binary_path", "Unknown"),
-                            description=f"Auto-saved after {operation_type} operation",
-                        )
+                        # Reuse the checkpoint session if one was created mid-run, so the
+                        # final save updates that file instead of spawning a duplicate.
+                        # Otherwise create a fresh session (short sweeps never checkpointed).
+                        if getattr(self, "_checkpoint_session_id", None):
+                            auto_session_name = self.session_manager.current_session_data["metadata"]["session_name"]
+                            self.session_manager.load_session(self._checkpoint_session_id)
+                        else:
+                            auto_session_name = f"BulkRename_{enumeration_mode}_{int(time.time())}"
+                            self.session_manager.create_session(
+                                session_name=auto_session_name,
+                                binary_path=getattr(self.bridge, "current_binary_path", "Unknown"),
+                                description=f"Auto-saved after {operation_type} operation",
+                            )
 
                         # Save the session data
                         session_save_success = self.session_manager.save_current_session(
@@ -1862,6 +2250,7 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 • Total functions found: {total_functions}
 • Successfully renamed: {successful_renames}
 • Successfully enumerated: {enumerated_functions}
+• Typed as BorgInstance*: {borg_typed_count}
 • Failed to process: {failed_renames}
 • Skipped: {skipped_functions}
 

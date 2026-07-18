@@ -39,7 +39,7 @@ class OllamaConfig(BaseModel):
         description="Embedding model name cannot be empty",
         env="OLLAMA_EMBEDDING_MODEL",
     )
-    timeout: int = Field(ge=1, le=600, default=120, description="Timeout for requests in seconds (1-600)", env="OLLAMA_TIMEOUT")
+    timeout: int = Field(ge=1, le=3600, default=120, description="Timeout for requests in seconds (1-3600)", env="OLLAMA_TIMEOUT")
     username: str = Field(default=None, env="OLLAMA_USERNAME")
     password: str = Field(default=None, env="OLLAMA_PASSWORD")
 
@@ -1158,7 +1158,7 @@ class GoogleConfig(BaseModel):
     embedding_model: str = Field(
         default="gemini-embedding-1.0", description="Embedding model name", env="GOOGLE_EMBEDDING_MODEL"
     )
-    timeout: int = Field(ge=1, le=600, default=120, description="Timeout for requests in seconds (1-600)", env="GOOGLE_TIMEOUT")
+    timeout: int = Field(ge=1, le=3600, default=120, description="Timeout for requests in seconds (1-3600)", env="GOOGLE_TIMEOUT")
 
     # Request Delay
     request_delay: float = Field(
@@ -1208,7 +1208,7 @@ class ExternalConfig(BaseModel):
     base_url: str = Field(default="", description="Base URL for API", env="EXTERNAL_BASE_URL")
     model: str = Field(default="gemini-1.5-flash", description="Default Model Name", env="EXTERNAL_MODEL")
     embedding_model: str = Field(default="", description="Embedding model name", env="EXTERNAL_EMBEDDING_MODEL")
-    timeout: int = Field(ge=1, le=600, default=120, description="Timeout in seconds", env="EXTERNAL_TIMEOUT")
+    timeout: int = Field(ge=1, le=3600, default=120, description="Timeout in seconds", env="EXTERNAL_TIMEOUT")
 
     # Request Delay
     request_delay: float = Field(
@@ -1288,8 +1288,17 @@ class CustomAPIConfig(BaseModel):
         description="Embedding model for Custom API",
         env="CUSTOM_API_EMBEDDING_MODEL",
     )
+    embedding_api_url: str = Field(
+        default="",
+        description=(
+            "Separate base/endpoint URL for embeddings when the embedding model is served on a "
+            "different host/port than chat (e.g. a second LM Studio instance). If empty, the "
+            "embeddings URL is derived from api_url."
+        ),
+        env="CUSTOM_API_EMBEDDING_URL",
+    )
     timeout: int = Field(
-        ge=1, le=600, default=300, description="Timeout for requests in seconds (1-600)", env="CUSTOM_API_TIMEOUT"
+        ge=1, le=3600, default=300, description="Timeout for requests in seconds (1-3600)", env="CUSTOM_API_TIMEOUT"
     )
 
     # Generation parameters
@@ -1887,6 +1896,8 @@ def get_config() -> BridgeConfig:
             config_data["custom_api"]["model"] = os.getenv("CUSTOM_API_MODEL")
         if os.getenv("CUSTOM_API_EMBEDDING_MODEL"):
             config_data["custom_api"]["embedding_model"] = os.getenv("CUSTOM_API_EMBEDDING_MODEL")
+        if os.getenv("CUSTOM_API_EMBEDDING_URL"):
+            config_data["custom_api"]["embedding_api_url"] = os.getenv("CUSTOM_API_EMBEDDING_URL")
         if os.getenv("CUSTOM_API_TIMEOUT"):
             try:
                 config_data["custom_api"]["timeout"] = int(os.getenv("CUSTOM_API_TIMEOUT"))

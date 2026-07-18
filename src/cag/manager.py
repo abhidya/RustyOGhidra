@@ -455,22 +455,33 @@ class CAGManager:
             import json
             import numpy as np
 
-            vector_db_path = Path("data/vector_db")
-            vectors_file = vector_db_path / "vectors.npy"
-            documents_file = vector_db_path / "documents.json"
+            # The embedded KB lives under the OGhidra install root (parent of src/).
+            # A CWD-relative path silently loses the whole 2400+ doc research corpus when
+            # the app is launched from anywhere else, so anchor to this file first.
+            oghidra_root = Path(__file__).resolve().parents[2]
+            candidates = [oghidra_root / "data" / "vector_db", Path("data/vector_db")]
 
-            # Check if all required files exist
-            if not all(f.exists() for f in [vectors_file, documents_file]):
-                logging.debug("Vector database files not found")
+            vector_db_path = None
+            for cand in candidates:
+                if (cand / "vectors.npy").exists() and (cand / "documents.json").exists():
+                    vector_db_path = cand
+                    break
+
+            if vector_db_path is None:
+                logging.warning(
+                    "Vector database files not found (looked in: %s) — "
+                    "the research-corpus KB will be ABSENT from semantic retrieval",
+                    "; ".join(str(c) for c in candidates),
+                )
                 return [], None
 
             # Load the vector database
-            vectors = np.load(vectors_file)
+            vectors = np.load(vector_db_path / "vectors.npy")
 
-            with open(documents_file, "r") as f:
+            with open(vector_db_path / "documents.json", "r") as f:
                 documents = json.load(f)
 
-            logging.info(f"Successfully loaded vector database with {len(vectors)} vectors")
+            logging.info(f"Successfully loaded vector database with {len(vectors)} vectors from {vector_db_path}")
             return documents, vectors
 
         except Exception as e:
@@ -498,7 +509,10 @@ class CAGManager:
             else:
                 logging.warning(f"Workplan file not found: {full_path}")
 
-        # Load knowledge base if enabled and exists (and not already in main vector DB)
+        # Optionally load a legacy single-file knowledge base. For Gotcha Force the real KB is
+        # the embedded vector DB (data/vector_db, loaded by _load_existing_vector_db) plus the
+        # deterministic resolver (src/gf_context.py), so this file is expected to be absent —
+        # its absence is normal, not a failure, hence debug-level.
         if self.enable_kb:
             kb_path = os.path.join(self.kb_dir, "knowledge_base.md")
             if os.path.exists(kb_path):
@@ -506,7 +520,7 @@ class CAGManager:
                     content = f.read()
                     docs.append({"text": content, "type": "knowledge_base", "name": "knowledge_base.md"})
             else:
-                logging.warning(f"Knowledge base file not found: {kb_path}")
+                logging.debug(f"Optional legacy knowledge base file not present (fine): {kb_path}")
 
         logging.info(f"Loaded {len(docs)} CAG-specific documents")
         return docs
@@ -546,9 +560,11 @@ class CAGManager:
 
                     return SimpleVectorStore(existing_docs, existing_vectors)
 
-                # Combine documents and vectors
+                # Combine documents and vectors. existing_vectors may be a 2-D numpy array
+                # (loaded via np.load); `ndarray + list` would broadcast-add instead of
+                # concatenating, so coerce both sides to a list of 1-D row vectors first.
                 all_docs = existing_docs + cag_docs
-                all_vectors = existing_vectors + cag_vectors
+                all_vectors = list(existing_vectors) + list(cag_vectors)
 
                 from .vector_store import SimpleVectorStore
 
@@ -575,19 +591,44 @@ class CAGManager:
             return SimpleVectorStore(existing_docs, existing_vectors)
 
     def _check_ollama_availability(self) -> bool:
-        """Check if Ollama server is available for embeddings."""
+        """Check whether an embeddings backend is available.
+
+        Historically this only probed a local Ollama server (/api/tags). That is wrong for
+        custom_api / external providers (e.g. LM Studio) whose embeddings may live on a
+        different endpoint than chat, so it would silently disable the whole CAG vector store.
+        Now it is provider-aware.
+        """
         try:
             import requests
             from src.config import get_config
 
             config = get_config()
+            provider = str(getattr(config, "llm_provider", "ollama")).lower()
+
+            if provider in ("custom_api", "external"):
+                # Resolve the embeddings endpoint the same way CustomAPIClient.embed() does.
+                cfg = getattr(config, "custom_api", None)
+                embed_url = (getattr(cfg, "embedding_api_url", "") or "").strip().rstrip("/")
+                if not embed_url:
+                    api_url = str(getattr(cfg, "api_url", "") or "")
+                    base = api_url.split("/v1/")[0].rstrip("/") if "/v1/" in api_url else api_url.rstrip("/")
+                    embed_url = base
+                if not embed_url:
+                    return False
+                # A models probe is cheap and doesn't consume the embed model.
+                probe = embed_url if embed_url.endswith(("/v1", "/models")) else embed_url + "/v1/models"
+                probe = probe if probe.endswith("/models") else probe.rstrip("/") + "/models"
+                try:
+                    r = requests.get(probe, timeout=3, verify=getattr(cfg, "verify_ssl", False))
+                    return r.status_code == 200
+                except Exception:
+                    # Endpoint may not implement /models; assume configured backend is usable.
+                    return True
+
+            # Default: Ollama
             ollama_url = str(config.ollama.base_url)
             response = requests.get(f"{ollama_url}/api/tags", timeout=2)
-            if response.status_code == 200:
-                # Basic server check passed, assume embeddings will work
-                # Don't test actual embeddings during init to avoid circular dependencies
-                return True
-            return False
+            return response.status_code == 200
         except Exception:
             return False
 

@@ -58,7 +58,7 @@ class QueryInputPanel:
                 if isinstance(st, dict):
                     self.task_mode_enabled_var.set(bool(st.get("enabled", False)))
                     mode = str(st.get("mode", "off") or "off")
-                    if mode in ("purpose_id", "malware", "vuln", "custom"):
+                    if mode in ("port_1to1", "purpose_id", "malware", "vuln", "custom"):
                         self.task_mode_var.set(mode)
                     else:
                         self.task_mode_var.set("purpose_id")
@@ -74,7 +74,7 @@ class QueryInputPanel:
         self.task_mode_combo = ttk.Combobox(
             taskmode_frame,
             textvariable=self.task_mode_var,
-            values=["purpose_id", "malware", "vuln", "custom"],
+            values=["port_1to1", "purpose_id", "malware", "vuln", "custom"],
             state="readonly",
             width=12,
         )
