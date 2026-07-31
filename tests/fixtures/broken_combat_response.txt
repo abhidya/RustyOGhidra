@@ -1,0 +1,10 @@
+{
+  "summary": "replace combat module",
+  "action": "edit",
+  "files": [
+    {
+      "path": "packages/combat/src/combat.ts",
+      "content": "export interface CombatState { hp: number }\nexport function updateCombat() { /* replacement omitted */ }\n"
+    }
+  ]
+}

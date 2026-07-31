@@ -1296,6 +1296,18 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 
 def main():
     """Main entry point for the Ollama-GhidraMCP Bridge CLI."""
+    if len(sys.argv) > 1 and sys.argv[1] == "probe-state-machine":
+        from src.state_machine_probe import main as state_machine_probe_main
+
+        return state_machine_probe_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "prove-incremental-port":
+        from src.incremental_port import main as incremental_port_main
+
+        return incremental_port_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "select-family-unit":
+        from src.candidate_selection import main as candidate_selection_main
+
+        return candidate_selection_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "export-port":
         from src.port_cli import main as port_cli_main
 
