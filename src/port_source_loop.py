@@ -84,6 +84,15 @@ def _safe_source_path(repo_root: Path, relative: str) -> Path:
     return target
 
 
+def _restore_originals(originals: dict[Path, bytes | None]) -> None:
+    for target, content in originals.items():
+        if content is None:
+            target.unlink(missing_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+
 def _source_tokens(bundle: dict[str, Any]) -> set[str]:
     identity = bundle.get("identity", {})
     text = " ".join(
@@ -91,6 +100,7 @@ def _source_tokens(bundle: dict[str, Any]) -> set[str]:
             str(identity.get("name", "")),
             str(identity.get("prototype", "")),
             str(bundle.get("decompiler", {}).get("c", ""))[:12000],
+            json.dumps(bundle.get("analysis_context", {}), default=str)[:12000],
         )
     )
     words = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)
@@ -211,6 +221,7 @@ class SequentialSourcePortLoop:
         *,
         attempt: int,
         failure: str | None,
+        analysis_context: dict[str, Any] | None = None,
     ) -> str:
         identity = bundle.get("identity", {})
         decompiler = bundle.get("decompiler", {})
@@ -225,6 +236,14 @@ class SequentialSourcePortLoop:
             "Decompiler evidence:",
             str(decompiled)[:6000],
         ]
+        if analysis_context:
+            lines.extend(
+                [
+                    "",
+                    "Saved analysis, sibling functions, and research grounding:",
+                    json.dumps(analysis_context, indent=2, default=str)[:12000],
+                ]
+            )
         if failure:
             lines.extend(["", "Previous automatic check failed:", failure[-6000:]])
         return "\n".join(lines)
@@ -236,8 +255,10 @@ class SequentialSourcePortLoop:
         aliases: list[str],
         failure: str | None,
         attempt: int,
+        analysis_context: dict[str, Any] | None = None,
     ) -> str:
-        context_files = _rank_source_context(self.repo_root, bundle)
+        ranking_bundle = {**bundle, "analysis_context": analysis_context or {}}
+        context_files = _rank_source_context(self.repo_root, ranking_bundle)
         contexts = []
         for path in context_files:
             content = path.read_text(encoding="utf-8")
@@ -265,11 +286,21 @@ Repair attempt: {attempt}/{MAX_REPAIR_ATTEMPTS}
 Authoritative Ghidra bundle:
 {json.dumps(_bundle_for_prompt(bundle), indent=2)}
 
+Saved-session analysis, sibling decompiles, Ghidra tool evidence, and research corpus:
+{json.dumps(analysis_context or {}, indent=2, default=str)}
+
 Relevant current browser source:
 {chr(10).join(contexts)}
 """
 
-    def run(self, *, address: str, aliases: list[str], bundle: dict[str, Any]) -> SourceLoopResult:
+    def run(
+        self,
+        *,
+        address: str,
+        aliases: list[str],
+        bundle: dict[str, Any],
+        analysis_context: dict[str, Any] | None = None,
+    ) -> SourceLoopResult:
         checkpoint_root = self.run_root / "source-checkpoints" / address.removeprefix("0x")
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         originals: dict[Path, bytes | None] = {}
@@ -280,7 +311,13 @@ Relevant current browser source:
         for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
             attempt_root = checkpoint_root / f"attempt-{attempt:02d}"
             attempt_root.mkdir(parents=True, exist_ok=True)
-            prompt = self._prompt(bundle, aliases=aliases, failure=failure, attempt=attempt)
+            prompt = self._prompt(
+                bundle,
+                aliases=aliases,
+                failure=failure,
+                attempt=attempt,
+                analysis_context=analysis_context,
+            )
             (attempt_root / "prompt.txt").write_text(prompt, encoding="utf-8")
             self.activity.emit(
                 "prompt",
@@ -291,6 +328,7 @@ Relevant current browser source:
                     bundle,
                     attempt=attempt,
                     failure=failure,
+                    analysis_context=analysis_context,
                 ),
                 address=address,
                 status="sent",
@@ -335,7 +373,10 @@ Relevant current browser source:
                     "model": model_name,
                     "system_prompt": (
                         "You are the implementation engine for a 1:1 browser port. "
-                        "Use the supplied Ghidra evidence and edit the real repository source."
+                        "First classify whether the function is gameplay-relevant or platform/runtime-only. "
+                        "Use the supplied saved analysis, Ghidra tool evidence, sibling functions, and "
+                        "Gotcha Force research corpus. Edit the real repository only for gameplay behavior; "
+                        "return action=exclude for platform, SDK, debug-monitor, toolchain, or runtime code."
                     ),
                     "temperature": 0.1,
                     "max_tokens": MODEL_MAX_OUTPUT_TOKENS,
@@ -452,6 +493,8 @@ Relevant current browser source:
                 failure = "\n\n".join(gate_outputs)
                 (attempt_root / "verification.txt").write_text(failure, encoding="utf-8")
                 if not passed:
+                    _restore_originals(originals)
+                    touched.clear()
                     self.activity.emit(
                         "retry",
                         f"Repair requested · attempt {attempt + 1}",
@@ -488,6 +531,8 @@ Relevant current browser source:
                     checkpoint=commit,
                 )
             except Exception as error:
+                _restore_originals(originals)
+                touched.clear()
                 failure = f"{type(error).__name__}: {error}"
                 (attempt_root / "error.txt").write_text(failure, encoding="utf-8")
                 self.activity.emit(
@@ -498,12 +543,7 @@ Relevant current browser source:
                     status="failed",
                 )
 
-        for target, content in originals.items():
-            if content is None:
-                target.unlink(missing_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
+        _restore_originals(originals)
         return SourceLoopResult(
             passed=False,
             attempts=MAX_REPAIR_ATTEMPTS,

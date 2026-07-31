@@ -327,15 +327,15 @@ def export_port_artifact(
     return ExportResult(artifact=artifact, report=report, attempts=attempts, output_path=target)
 
 
-def historical_summary(session_path: str | Path, address: str | int) -> str | None:
+def historical_analysis(session_path: str | Path, address: str | int) -> dict[str, Any] | None:
     payload = json.loads(Path(session_path).read_text(encoding="utf-8"))
     functions = payload.get("analyzed_functions", {})
     normalized = normalize_address(address)[2:]
     candidates = (normalized, f"0x{normalized}", f"FUN_{normalized}")
     for key in candidates:
         value = functions.get(key)
-        if isinstance(value, dict) and value.get("behavior_summary"):
-            return str(value["behavior_summary"])
+        if isinstance(value, dict):
+            return dict(value)
     for value in functions.values():
         if not isinstance(value, dict):
             continue
@@ -343,6 +343,14 @@ def historical_summary(session_path: str | Path, address: str | int) -> str | No
             item_address = normalize_address(value.get("address", ""))
         except ValueError:
             continue
-        if item_address == f"0x{normalized}" and value.get("behavior_summary"):
-            return str(value["behavior_summary"])
+        if item_address == f"0x{normalized}":
+            return dict(value)
     return None
+
+
+def historical_summary(session_path: str | Path, address: str | int) -> str | None:
+    analysis = historical_analysis(session_path, address)
+    if not analysis:
+        return None
+    summary = analysis.get("behavior_summary") or analysis.get("summary")
+    return str(summary) if summary else None

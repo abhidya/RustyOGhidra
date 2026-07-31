@@ -5,12 +5,14 @@ import pytest
 
 from src.port_scheduler import (
     PortScheduler,
+    discover_analysis_session,
     dependency_order,
     exact_groups,
     extract_direct_calls,
     fingerprint_instructions,
     normalize_instruction_lines,
     parse_function_line,
+    platform_exclusion_reason,
 )
 from src.port_source_loop import SourceLoopResult
 
@@ -42,6 +44,15 @@ class FakeGhidra:
     def get_function_by_address(self, address):
         return f"Function: FUN_{address[2:]} at {address[2:]}"
 
+    def get_xrefs_to(self, address):
+        return [{"from_address": "0x80004000"}]
+
+    def get_xrefs_from(self, address):
+        return [{"to_address": "0x80003000"}]
+
+    def decompile_function_by_address(self, address):
+        return f"void sibling_{address[-4:]}(void) {{}}"
+
 
 class OfflineGhidra(FakeGhidra):
     def disassemble_function(self, address):
@@ -70,6 +81,32 @@ def test_function_parsing_fingerprints_and_calls_are_address_stable():
     assert normalize_instruction_lines(first) == ["li r3,1", "bl 0x80003000"]
     assert fingerprint_instructions(first) == fingerprint_instructions(second)
     assert extract_direct_calls(first, "0x80001000") == ["0x80003000"]
+
+
+def test_discovers_most_complete_saved_analysis(tmp_path):
+    sessions = tmp_path / "analysis_sessions"
+    small = sessions / "small" / "session.json"
+    large = sessions / "large" / "session.json"
+    small.parent.mkdir(parents=True)
+    large.parent.mkdir(parents=True)
+    small.write_text("{}", encoding="utf-8")
+    large.write_text('{"analyzed_functions":{"80001000":{"address":"80001000"}}}', encoding="utf-8")
+    assert discover_analysis_session(tmp_path) == large
+
+
+def test_platform_exclusion_is_conservative_and_pre_model():
+    assert platform_exclusion_reason(
+        {"identity": {"name": "__check_pad3", "thunk": False}},
+        {"behavior_summary": "startup check"},
+    )
+    assert platform_exclusion_reason(
+        {"identity": {"name": "FUN_80001000", "thunk": False}},
+        {"behavior_summary": "MetroTRK debug monitor initialization"},
+    )
+    assert platform_exclusion_reason(
+        {"identity": {"name": "stepCombat", "thunk": False}},
+        {"behavior_summary": "updates player combat state"},
+    ) is None
 
 
 def test_exact_groups_preserve_alias_addresses_and_dependency_order():
@@ -137,16 +174,41 @@ def test_scheduler_sends_first_bundle_to_qwen_before_extracting_the_rest(tmp_pat
     seen = []
 
     class FakeSourceLoop:
-        def run(self, *, address, aliases, bundle):
+        def run(self, *, address, aliases, bundle, analysis_context):
             seen.append(
                     {
                         "address": address,
                         "aliases": aliases,
                         "bundle_address": bundle["identity"]["address"],
+                        "saved_name": analysis_context["saved_session_analysis"]["new_name"],
+                        "caller_count": len(analysis_context["sibling_functions"]["callers"]),
                     }
             )
             return SourceLoopResult(passed=True, attempts=1, action="exclude")
 
+    session = tmp_path / "session.json"
+    session.write_text(
+        json.dumps(
+            {
+                "analyzed_functions": {
+                    "80001000": {
+                        "address": "80001000",
+                        "new_name": "stepGameplay",
+                        "behavior_summary": "updates player gameplay",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    scheduler.session_path = session
+    scheduler._session_functions = {
+        "0x80001000": {
+            "address": "80001000",
+            "new_name": "stepGameplay",
+            "behavior_summary": "updates player gameplay",
+        }
+    }
     scheduler.source_loop = FakeSourceLoop()
 
     exit_code = scheduler.run()
@@ -158,6 +220,8 @@ def test_scheduler_sends_first_bundle_to_qwen_before_extracting_the_rest(tmp_pat
             "address": "0x80001000",
             "aliases": ["0x80001000"],
             "bundle_address": "0x80001000",
+            "saved_name": "stepGameplay",
+            "caller_count": 1,
         }
     ]
     assert manifest["functions"]["0x80001000"]["port_status"] == "excluded"

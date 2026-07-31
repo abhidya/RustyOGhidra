@@ -75,6 +75,8 @@ def test_sequential_loop_feeds_gate_error_back_to_qwen(tmp_path: Path):
     class RepairingLLM:
         def generate_structured(self, **kwargs):
             prompts.append(kwargs["prompt"])
+            if prompts and len(prompts) == 2:
+                assert not (tmp_path / "apps/game/src/port.ts").exists()
             value = "broken" if len(prompts) == 1 else "fixed"
             return (
                 '{"summary":"repair","files":[{"path":"apps/game/src/port.ts",'
@@ -100,9 +102,16 @@ def test_sequential_loop_feeds_gate_error_back_to_qwen(tmp_path: Path):
         address="0x80000004",
         aliases=["0x80000004"],
         bundle={"identity": {"name": "repairPort"}, "decompiler": {"c": "void repairPort(void) {}"}},
+        analysis_context={
+            "saved_session_analysis": {"new_name": "repairGameplay", "behavior_summary": "gameplay"},
+            "sibling_functions": {"callers": [], "callees": []},
+            "research_corpus": {"exact": "known actor state", "semantic": ""},
+        },
     )
 
     assert result.passed
     assert result.attempts == 2
     assert "TS2322 first failure" in prompts[1]
+    assert "repairGameplay" in prompts[0]
+    assert "known actor state" in prompts[0]
     assert '"fixed"' in (tmp_path / "apps/game/src/port.ts").read_text(encoding="utf-8")

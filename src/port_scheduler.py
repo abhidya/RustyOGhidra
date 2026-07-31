@@ -46,6 +46,14 @@ TERMINAL_UNIT_STATES = {
 }
 
 
+def discover_analysis_session(oghidra_root: Path) -> Path | None:
+    """Use the most complete saved analysis when the GUI has none explicitly loaded."""
+    candidates = list((oghidra_root / "analysis_sessions").glob("*/session.json"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_size, path.stat().st_mtime))
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -94,6 +102,95 @@ def is_thunk(lines: Iterable[str]) -> bool:
         return False
     non_return = [line for line in normalized if not line.startswith(("blr", "bctr"))]
     return len(non_return) == 1 and bool(re.match(r"^b\s+", non_return[0]))
+
+
+def _xref_addresses(values: Any, *, direction: str) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    keys = (
+        ("from_address", "from", "fromAddress")
+        if direction == "from"
+        else ("to_address", "to", "toAddress")
+    )
+    addresses: list[str] = []
+    for value in values:
+        candidate: Any = None
+        if isinstance(value, dict):
+            candidate = next((value.get(key) for key in keys if value.get(key)), None)
+        elif isinstance(value, str):
+            match = re.search(r"(?:0x)?([0-9a-fA-F]{8,16})", value)
+            candidate = match.group(1) if match else None
+        if candidate:
+            try:
+                normalized = normalize_address(candidate)
+            except ValueError:
+                continue
+            if normalized not in addresses:
+                addresses.append(normalized)
+    return addresses
+
+
+def platform_exclusion_reason(
+    bundle: dict[str, Any],
+    session_analysis: dict[str, Any] | None = None,
+) -> str | None:
+    """Conservatively remove proven non-browser platform/runtime functions before Qwen."""
+    identity = bundle.get("identity", {})
+    name = str(identity.get("name") or "").strip()
+    lowered = name.lower()
+    if bool(identity.get("thunk")):
+        return "Ghidra identifies this function as a thunk"
+
+    exact_names = {
+        "__check_pad3",
+        "__set_debug_bba",
+        "__init_registers",
+        "__init_hardware",
+        "__flush_cache",
+    }
+    platform_prefixes = (
+        "__trk",
+        "trk_",
+        "initmetrotrk",
+        "metrotrk",
+        "__cxa_",
+        "__cxx_",
+        "__gnu_",
+        "__std_",
+    )
+    runtime_names = {
+        "memcpy",
+        "memmove",
+        "memset",
+        "memcmp",
+        "strlen",
+        "strcmp",
+        "strcpy",
+        "malloc",
+        "free",
+        "abort",
+    }
+    if lowered in exact_names or lowered in runtime_names or lowered.startswith(platform_prefixes):
+        return f"{name} is a known SDK, toolchain, debug-monitor, or runtime function"
+
+    summary = ""
+    if session_analysis:
+        summary = str(
+            session_analysis.get("behavior_summary")
+            or session_analysis.get("summary")
+            or ""
+        ).lower()
+    strong_markers = (
+        "metrotrk",
+        "debug monitor",
+        "platform-only",
+        "toolchain runtime",
+        "compiler runtime",
+        "standard library implementation",
+    )
+    if any(marker in summary for marker in strong_markers):
+        return "saved analysis classifies this as platform/toolchain/runtime behavior"
+    return None
 
 
 def exact_groups(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -225,7 +322,30 @@ class PortScheduler:
         os.environ["OGHIDRA_PORT_LIVENESS_PATH"] = str(self.liveness_path)
         os.environ["OGHIDRA_PORT_RUN_ID"] = self.run_id
         self.mode = mode
-        self.session_path = Path(session_path).resolve() if session_path else None
+        requested_session = Path(session_path).resolve() if session_path else None
+        self.session_path = (
+            requested_session
+            if requested_session and requested_session.is_file()
+            else discover_analysis_session(self.oghidra_root)
+        )
+        self._session_functions: dict[str, dict[str, Any]] = {}
+        if self.session_path and self.session_path.is_file():
+            try:
+                payload = json.loads(self.session_path.read_text(encoding="utf-8"))
+                for key, value in payload.get("analyzed_functions", {}).items():
+                    if not isinstance(value, dict):
+                        continue
+                    candidate = value.get("address") or key
+                    try:
+                        normalized = normalize_address(candidate)
+                    except ValueError:
+                        continue
+                    self._session_functions[normalized] = dict(value)
+            except (OSError, ValueError, json.JSONDecodeError):
+                self._session_functions = {}
+        self._decompile_cache: dict[str, str] = {}
+        self._research_store: Any | None = None
+        self._research_store_loaded = False
         self.max_bundles = max_bundles
         self.max_units = max_units
         self.config = get_config()
@@ -693,6 +813,124 @@ class PortScheduler:
         counts["waiting"] = max(0, remaining_functions - represented)
         self.state["queue_summary"] = dict(sorted(counts.items()))
 
+    def _saved_analysis(self, address: str) -> dict[str, Any] | None:
+        return self._session_functions.get(normalize_address(address))
+
+    def _decompile_sibling(self, address: str) -> str | None:
+        if address in self._decompile_cache:
+            return self._decompile_cache[address]
+        decompile = getattr(self.ghidra, "decompile_function_by_address", None)
+        if not callable(decompile):
+            return None
+        try:
+            text = str(decompile(address=address))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if not text.strip() or re.search(r"error:|no function found|request failed", text, re.IGNORECASE):
+            return None
+        self._decompile_cache[address] = text
+        return text
+
+    def _research_context(self, address: str, decompiled: str) -> dict[str, str]:
+        context = {"exact": "", "semantic": ""}
+        if not decompiled.strip():
+            return context
+        try:
+            from src.gf_context import get_gf_context
+
+            context["exact"] = get_gf_context().resolve_for_code(
+                decompiled,
+                self_addr=address,
+            )
+        except Exception:
+            pass
+
+        vector_db = self.oghidra_root / "data" / "vector_db"
+        if not vector_db.is_dir():
+            return context
+        try:
+            if not self._research_store_loaded:
+                from src.cag import CAGManager
+
+                self._research_store = CAGManager(self.config).vector_store
+                self._research_store_loaded = True
+            if self._research_store is not None:
+                context["semantic"] = self._research_store.get_relevant_knowledge(
+                    decompiled[:2500],
+                    token_limit=800,
+                )
+        except Exception:
+            self._research_store_loaded = True
+        return context
+
+    def _analysis_context(
+        self,
+        address: str,
+        bundle: dict[str, Any],
+        session_analysis: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        get_to = getattr(self.ghidra, "get_xrefs_to", None)
+        get_from = getattr(self.ghidra, "get_xrefs_from", None)
+        try:
+            callers = _xref_addresses(
+                get_to(address=address) if callable(get_to) else [],
+                direction="from",
+            )
+        except Exception:
+            callers = []
+        try:
+            outgoing = _xref_addresses(
+                get_from(address=address) if callable(get_from) else [],
+                direction="to",
+            )
+        except Exception:
+            outgoing = []
+        callees = []
+        for candidate in [*bundle.get("calls", []), *outgoing]:
+            try:
+                normalized = normalize_address(candidate)
+            except ValueError:
+                continue
+            if normalized != normalize_address(address) and normalized not in callees:
+                callees.append(normalized)
+
+        siblings = {"callers": [], "callees": []}
+        for direction, addresses in (("callers", callers), ("callees", callees)):
+            for sibling_address in addresses[:3]:
+                code = self._decompile_sibling(sibling_address)
+                if code:
+                    siblings[direction].append(
+                        {"address": sibling_address, "decompiler": code[:6000]}
+                    )
+
+        decompiled = str(bundle.get("decompiler", {}).get("c") or "")
+        context = {
+            "saved_session_analysis": session_analysis,
+            "sibling_functions": siblings,
+            "research_corpus": self._research_context(address, decompiled),
+            "evidence_tools_used": [
+                "get_xrefs_to",
+                "get_xrefs_from",
+                "decompile_function_by_address",
+                "gf_context.resolve_for_code",
+                "research_vector_store.get_relevant_knowledge",
+            ],
+        }
+        activity = getattr(self.source_loop, "activity", None)
+        if activity is not None:
+            activity.emit(
+                "tool",
+                f"Evidence gathered · {address}",
+                (
+                    f"saved analysis: {'yes' if session_analysis else 'no'} · "
+                    f"callers: {len(siblings['callers'])} · callees: {len(siblings['callees'])} · "
+                    f"research: {'yes' if any(context['research_corpus'].values()) else 'no'}"
+                ),
+                address=address,
+                status="passed",
+            )
+        return context
+
     def _process_group(self, group: dict[str, Any]) -> None:
         address = group["canonical_address"]
         group["attempts"] = int(group.get("attempts", 0)) + 1
@@ -705,16 +943,35 @@ class PortScheduler:
             group["status"] = "bundle_failed"
             return
 
+        bundle_path = Path(function["bundle_path"])
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        session_analysis = self._saved_analysis(address)
+        exclusion = platform_exclusion_reason(bundle, session_analysis)
+        if exclusion:
+            group["status"] = "excluded"
+            group["verification"] = exclusion
+            group["exclusion_source"] = "deterministic_pre_model"
+            self._queue_view(group)
+            self._save_all()
+            self.source_loop.activity.emit(
+                "result",
+                f"Excluded before Qwen · {address}",
+                exclusion,
+                address=address,
+                status="passed",
+            )
+            return
+
         group["status"] = "model_running"
         self._queue_view(group)
         self._save_all()
         try:
-            bundle_path = Path(function["bundle_path"])
-            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            analysis_context = self._analysis_context(address, bundle, session_analysis)
             result = self.source_loop.run(
                 address=address,
                 aliases=group["member_addresses"],
                 bundle=bundle,
+                analysis_context=analysis_context,
             )
         except Exception as error:
             group["status"] = "model_invalid"
