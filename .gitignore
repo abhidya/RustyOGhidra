@@ -309,6 +309,8 @@ gradle-app.setting
 
 # Project-specific artifacts.
 logs/*
+port_artifacts/
+analysis_sessions/*/port-artifacts.json
 uv.lock
 
 # Gradle project files for GhidraMCP caught by python's gitignore above.

@@ -3,6 +3,7 @@ Client for interacting with the GhidraMCP API.
 """
 
 import logging
+import json
 import re
 import struct
 import base64
@@ -25,6 +26,10 @@ class AbstractGhidraClient(ABC):
     implement the same public tool surface. Shared backend-agnostic
     helpers live here.
     """
+
+    def get_function_bundle(self, address: str) -> Dict[str, Any] | None:
+        """Return a versioned structured bundle when the backend supports it."""
+        return None
 
     def __init__(self, config: GhidraMCPConfig, ollama_client=None) -> None:
         self.config = config
@@ -1252,6 +1257,16 @@ class GhidraMCPClient(AbstractGhidraClient):
 
         return self._http_get_lines("list_functions", {"offset": offset, "limit": limit})
 
+    def get_function_bundle(self, address: str) -> Dict[str, Any] | None:
+        text = self._http_request_text("GET", "function_bundle", params={"address": address})
+        if text.startswith(("Error", "Request failed")):
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) and not payload.get("error") else None
+
     def decompile_function_by_address(self, address: str, offset: int = 0, limit: int = 500) -> str:
         offset, limit = self._get_offset_limit(offset, limit, default_limit=500)
         return "\n".join(
@@ -1633,8 +1648,10 @@ class PyGhidraClient(AbstractGhidraClient):
                 walk_programs(self._project, _collect, start="/")
             except Exception:
                 discovered = []
-        else:
-            # Fallback: introspect the project object via the Ghidra API
+        if not discovered:
+            # Fallback: introspect the project object via the Ghidra API. Some
+            # pyGhidra releases expose walk_programs() but return no rows for
+            # local non-shared projects, so availability alone is not enough.
             try:
                 project_data = self._project.getProjectData()
                 root = project_data.getRootFolder()
@@ -1644,7 +1661,18 @@ class PyGhidraClient(AbstractGhidraClient):
                     try:
                         for df in folder.getFiles():
                             try:
-                                if hasattr(df, "isProgram") and df.isProgram():
+                                content_type = str(df.getContentType()) if hasattr(df, "getContentType") else ""
+                                is_program = (
+                                    (hasattr(df, "isProgram") and df.isProgram())
+                                    or content_type.lower() == "program"
+                                )
+                                # DomainFile.isProgram() is not present on every
+                                # supported Ghidra release and some local
+                                # projects report an empty content type until
+                                # the file is opened. Include all domain files
+                                # as discovery candidates; consume_program()
+                                # remains the authoritative type check.
+                                if is_program or df is not None:
                                     name = df.getName()
                                     path = df.getPathname()
                                     discovered.append((str(name), str(path)))

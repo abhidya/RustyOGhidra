@@ -1296,6 +1296,19 @@ CRITICAL: You MUST include all four sections with the exact headers shown above.
 
 def main():
     """Main entry point for the Ollama-GhidraMCP Bridge CLI."""
+    if len(sys.argv) > 1 and sys.argv[1] == "export-port":
+        from src.port_cli import main as port_cli_main
+
+        return port_cli_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "finish-port":
+        from src.port_scheduler import main as port_scheduler_main
+
+        return port_scheduler_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "source-poc":
+        from src.port_source_loop import main as port_source_main
+
+        return port_source_main(sys.argv[2:])
+
     # Initialize configuration from environment variables
     config = get_config()
 

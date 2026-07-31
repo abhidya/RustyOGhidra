@@ -17,6 +17,8 @@ package com.lauriewired;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressRange;
+import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
@@ -26,6 +28,7 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.pcode.PcodeOpAST;
 import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
@@ -70,6 +73,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -272,6 +276,12 @@ public class GhidraMCPPlugin extends Plugin {
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             sendResponse(exchange, decompileFunctionByAddress(address, offset, limit));
+        });
+
+        server.createContext("/function_bundle", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            sendJsonResponse(exchange, buildFunctionBundleJson(address));
         });
 
         server.createContext("/disassemble_function", exchange -> {
@@ -984,6 +994,177 @@ public class GhidraMCPPlugin extends Plugin {
         } catch (Exception e) {
             return "Error decompiling function: " + e.getMessage();
         }
+    }
+
+    /**
+     * Versioned, machine-readable extraction used by the whole-program port scheduler.
+     * Unlike the text endpoints, failures are explicit fields and never masquerade as C.
+     */
+    private String buildFunctionBundleJson(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null)
+            return "{\"bundle_schema\":1,\"error\":\"No program loaded\"}";
+        if (addressStr == null || addressStr.isEmpty())
+            return "{\"bundle_schema\":1,\"error\":\"Address is required\"}";
+
+        DecompInterface decomp = new DecompInterface();
+        try {
+            Address address = program.getAddressFactory().getAddress(addressStr);
+            Function function = getFunctionForAddress(program, address);
+            if (function == null) {
+                return "{\"bundle_schema\":1,\"error\":\"No function found at address "
+                        + jsonEscape(addressStr) + "\"}";
+            }
+
+            StringBuilder ranges = new StringBuilder();
+            ranges.append("[");
+            AddressRangeIterator rangeIterator = function.getBody().getAddressRanges();
+            boolean firstRange = true;
+            while (rangeIterator.hasNext()) {
+                AddressRange range = rangeIterator.next();
+                if (!firstRange)
+                    ranges.append(",");
+                firstRange = false;
+                ranges.append("[\"").append(jsonEscape(range.getMinAddress().toString())).append("\",\"")
+                        .append(jsonEscape(range.getMaxAddress().toString())).append("\"]");
+            }
+            ranges.append("]");
+
+            StringBuilder normalizedInstructions = new StringBuilder();
+            StringBuilder instructionJson = new StringBuilder("[");
+            Listing listing = program.getListing();
+            InstructionIterator instructions = listing.getInstructions(function.getBody(), true);
+            boolean firstInstruction = true;
+            while (instructions.hasNext()) {
+                Instruction instruction = instructions.next();
+                String normalized = instruction.toString().replaceAll("\\s+", " ").trim().toLowerCase();
+                normalizedInstructions.append(normalized).append("\n");
+                if (!firstInstruction)
+                    instructionJson.append(",");
+                firstInstruction = false;
+                instructionJson.append("\"").append(jsonEscape(normalized)).append("\"");
+            }
+            instructionJson.append("]");
+
+            decomp.openProgram(program);
+            DecompileResults results = decomp.decompileFunction(function, 60, new ConsoleTaskMonitor());
+            boolean completed = results != null && results.decompileCompleted();
+            String c = completed && results.getDecompiledFunction() != null
+                    ? results.getDecompiledFunction().getC()
+                    : "";
+            String error = completed ? "" : (results != null ? results.getErrorMessage() : "no decompiler result");
+
+            StringBuilder pcodeJson = new StringBuilder("[");
+            StringBuilder normalizedPcode = new StringBuilder();
+            boolean firstPcode = true;
+            HighFunction highFunction = completed ? results.getHighFunction() : null;
+            if (highFunction != null) {
+                Iterator<PcodeOpAST> operations = highFunction.getPcodeOps();
+                while (operations.hasNext()) {
+                    PcodeOpAST operation = operations.next();
+                    StringBuilder row = new StringBuilder(operation.getMnemonic());
+                    row.append("|out=").append(operation.getOutput() == null ? "" : operation.getOutput().toString());
+                    for (int index = 0; index < operation.getNumInputs(); index++) {
+                        row.append("|in").append(index).append("=")
+                                .append(operation.getInput(index).toString());
+                    }
+                    String normalized = row.toString();
+                    normalizedPcode.append(normalized).append("\n");
+                    if (!firstPcode)
+                        pcodeJson.append(",");
+                    firstPcode = false;
+                    pcodeJson.append("\"").append(jsonEscape(normalized)).append("\"");
+                }
+            }
+            pcodeJson.append("]");
+
+            List<String> calls = new ArrayList<>();
+            for (Function called : function.getCalledFunctions(new ConsoleTaskMonitor())) {
+                calls.add(called.getEntryPoint().toString());
+            }
+            Collections.sort(calls);
+            StringBuilder callsJson = new StringBuilder("[");
+            for (int index = 0; index < calls.size(); index++) {
+                if (index > 0)
+                    callsJson.append(",");
+                callsJson.append("\"").append(jsonEscape(calls.get(index))).append("\"");
+            }
+            callsJson.append("]");
+
+            String instructionFingerprint = sha256Hex(normalizedInstructions.toString());
+            String pcodeFingerprint = normalizedPcode.length() > 0
+                    ? sha256Hex(normalizedPcode.toString())
+                    : null;
+            return "{"
+                    + "\"bundle_schema\":1,"
+                    + "\"identity\":{"
+                    + "\"address\":\"" + jsonEscape(function.getEntryPoint().toString()) + "\","
+                    + "\"name\":\"" + jsonEscape(function.getName()) + "\","
+                    + "\"prototype\":\"" + jsonEscape(function.getSignature().toString()) + "\","
+                    + "\"body_ranges\":" + ranges + ","
+                    + "\"thunk\":" + function.isThunk() + ","
+                    + "\"inline\":" + function.isInline() + ","
+                    + "\"no_return\":" + function.hasNoReturn()
+                    + "},"
+                    + "\"decompiler\":{"
+                    + "\"c\":\"" + jsonEscape(c) + "\","
+                    + "\"completed\":" + completed + ","
+                    + "\"warnings\":[],"
+                    + "\"errors\":" + (error.isEmpty() ? "[]" : "[\"" + jsonEscape(error) + "\"]")
+                    + "},"
+                    + "\"normalized_disassembly\":" + instructionJson + ","
+                    + "\"normalized_pcode\":" + pcodeJson + ","
+                    + "\"calls\":" + callsJson + ","
+                    + "\"data_references\":[],"
+                    + "\"fingerprints\":{"
+                    + "\"instruction_shape\":\"" + instructionFingerprint + "\","
+                    + "\"normalized_pcode\":"
+                    + (pcodeFingerprint == null ? "null" : "\"" + pcodeFingerprint + "\"")
+                    + "}"
+                    + "}";
+        } catch (Exception error) {
+            return "{\"bundle_schema\":1,\"error\":\"" + jsonEscape(error.getMessage()) + "\"}";
+        } finally {
+            decomp.dispose();
+        }
+    }
+
+    private static String sha256Hex(String value) throws Exception {
+        byte[] digest = MessageDigest.getInstance("SHA-256")
+                .digest(value.getBytes(StandardCharsets.UTF_8));
+        return HexFormat.of().formatHex(digest);
+    }
+
+    private static String jsonEscape(String value) {
+        if (value == null)
+            return "";
+        StringBuilder escaped = new StringBuilder();
+        for (char character : value.toCharArray()) {
+            switch (character) {
+                case '\\':
+                    escaped.append("\\\\");
+                    break;
+                case '"':
+                    escaped.append("\\\"");
+                    break;
+                case '\n':
+                    escaped.append("\\n");
+                    break;
+                case '\r':
+                    escaped.append("\\r");
+                    break;
+                case '\t':
+                    escaped.append("\\t");
+                    break;
+                default:
+                    if (character < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) character));
+                    } else {
+                        escaped.append(character);
+                    }
+            }
+        }
+        return escaped.toString();
     }
 
     /**

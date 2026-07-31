@@ -8,6 +8,7 @@ import os
 import tempfile
 import hashlib
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
@@ -207,7 +208,17 @@ def atomic_write_json(path: os.PathLike[str] | str, payload: Mapping[str, Any]) 
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
+        # Windows denies replacement while another process has the destination
+        # briefly open (GUI polling, antivirus, indexer). Preserve atomic writes,
+        # but wait out the transient sharing violation instead of killing the run.
+        for attempt in range(40):
+            try:
+                os.replace(tmp_name, target)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 39:
+                    raise
+                time.sleep(0.05)
     except Exception:
         try:
             os.unlink(tmp_name)

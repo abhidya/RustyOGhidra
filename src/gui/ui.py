@@ -8,6 +8,7 @@ Comprehensive GUI interface for the Ollama-GhidraMCP Bridge application.
 import logging
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 import ttkbootstrap as tb
@@ -15,6 +16,7 @@ import ttkbootstrap as tb
 from ..bridge import Bridge
 from ..config import BridgeConfig
 from .memory_info_panel import MemoryInfoPanel
+from .port_run_panel import PortRunPanel
 from .ai_response_panel import AIResponsePanel
 from .query_input_panel import QueryInputPanel
 from .renamed_functions_panel import RenamedFunctionsPanel
@@ -56,6 +58,13 @@ class OGhidraUI:
         self.root.protocol("WM_DELETE_WINDOW", self._quit_application)
 
         self._setup_ui()
+        self.port_run_panel = PortRunPanel(
+            self.root,
+            active_session_path=self._active_port_session_path,
+            host=self.port_workspace,
+            on_show=self._select_port_workspace,
+        )
+        self.port_run_panel.mount()
         self._setup_menu()
 
         # Start health monitoring
@@ -63,6 +72,16 @@ class OGhidraUI:
 
         # Display startup configuration info
         self._show_startup_info()
+
+    def _active_port_session_path(self) -> Path | None:
+        """Return the saved session currently loaded in this OGhidra window."""
+        manager = getattr(self, "session_manager", None)
+        session_id = getattr(manager, "current_session_id", None)
+        sessions_dir = getattr(manager, "sessions_dir", None)
+        if not session_id or not sessions_dir:
+            return None
+        session_path = Path(sessions_dir) / session_id / "session.json"
+        return session_path if session_path.is_file() else None
 
     def _show_startup_info(self):
         """Display configuration info on startup."""
@@ -125,14 +144,24 @@ class OGhidraUI:
 
     def _setup_main_panel(self, parent):
         """Setup the main panel with query input and AI responses (primary focus)."""
+        self.main_notebook = ttk.Notebook(parent)
+        self.main_notebook.pack(fill="both", expand=True)
+        analysis_workspace = ttk.Frame(self.main_notebook, padding=4)
+        self.port_workspace = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(analysis_workspace, text="Analysis")
+        self.main_notebook.add(self.port_workspace, text="Finish Game Port")
+
         # Query input panel
-        self.query_panel = QueryInputPanel(parent, self.bridge, None, None)  # workflow_diagram set later
+        self.query_panel = QueryInputPanel(analysis_workspace, self.bridge, None, None)  # workflow_diagram set later
         self.query_panel.get_widget().pack(fill="x", pady=(0, 10))
 
         # AI Response panel (main content area)
         # Pass the generate report callback from main UI
-        self.response_panel = AIResponsePanel(parent, generate_callback=self._menu_generate_report)
+        self.response_panel = AIResponsePanel(analysis_workspace, generate_callback=self._menu_generate_report)
         self.response_panel.get_widget().pack(fill="both", expand=True)
+
+    def _select_port_workspace(self) -> None:
+        self.main_notebook.select(self.port_workspace)
 
     def _setup_sidebar_panel(self, parent):
         """Setup the sidebar with analyzed functions (secondary, slimmer)."""
@@ -201,6 +230,10 @@ class OGhidraUI:
         # Analysis menu (Smart Tools)
         analysis_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Analysis", menu=analysis_menu)
+
+        # Autonomous evidence-to-browser port workflow
+        analysis_menu.add_command(label="Finish Game Port", command=self._menu_finish_game_port)
+        analysis_menu.add_separator()
 
         # Current function operations
         analysis_menu.add_command(label="Analyze Current Function", command=self._menu_analyze_current)
@@ -1119,6 +1152,10 @@ class OGhidraUI:
 
     # ========== Analysis Menu Handlers ==========
 
+    def _menu_finish_game_port(self):
+        """Start or attach to the durable autonomous port controller."""
+        self.port_run_panel.show(auto_start=True)
+
     def _menu_analyze_current(self):
         """Menu handler: Analyze Current Function."""
         if hasattr(self, "tool_panel"):
@@ -1187,6 +1224,8 @@ Features:
         """Quit the application."""
         if messagebox.askyesno("Quit", "Are you sure you want to quit?"):
             try:
+                if hasattr(self, "port_run_panel"):
+                    self.port_run_panel.detach()
                 # Save session before quitting
                 if hasattr(self.bridge, "cag_manager") and self.bridge.cag_manager:
                     self.bridge.cag_manager.save_session()

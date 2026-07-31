@@ -7,7 +7,9 @@ Handles communication with OpenAI-compatible APIs (GPT-5, custom endpoints, etc.
 
 import json
 import logging
+import os
 import requests
+import re
 import time
 import uuid
 import warnings
@@ -16,7 +18,7 @@ import email.utils
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union, Tuple
+from typing import Callable, Dict, Any, List, Optional, Union, Tuple
 from tenacity import Retrying, stop_after_attempt, wait_exponential, retry_if_exception
 import urllib3
 
@@ -106,6 +108,45 @@ class CustomAPIClient:
 
         # SSL verification (disabled by default for custom APIs with cert issues)
         self.verify_ssl = getattr(config, "verify_ssl", False)
+        self.last_response_metadata: Dict[str, Any] = {}
+        self.generation_metrics: Dict[str, Any] = {
+            "api_calls": 0,
+            "structured_tool_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "duration_seconds": 0.0,
+            "token_source": "unavailable",
+            "active": False,
+            "status": "idle",
+        }
+        liveness_path = os.getenv("OGHIDRA_PORT_LIVENESS_PATH")
+        self._liveness_path = Path(liveness_path).resolve() if liveness_path else None
+        self._liveness_run_id = os.getenv("OGHIDRA_PORT_RUN_ID")
+        self._metrics_lock = threading.Lock()
+        if self._liveness_path is not None and self._liveness_run_id:
+            try:
+                previous_metrics = json.loads(self._liveness_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                previous_metrics = {}
+            if previous_metrics.get("run_id") == self._liveness_run_id:
+                for key in (
+                    "api_calls",
+                    "structured_tool_calls",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "duration_seconds",
+                ):
+                    if isinstance(previous_metrics.get(key), (int, float)):
+                        self.generation_metrics[key] = previous_metrics[key]
+                self.generation_metrics["token_source"] = previous_metrics.get(
+                    "token_source",
+                    "unavailable",
+                )
+                if self.generation_metrics["duration_seconds"]:
+                    self.generation_metrics["tokens_per_second"] = (
+                        self.generation_metrics["completion_tokens"]
+                        / self.generation_metrics["duration_seconds"]
+                    )
 
         print(f"[Custom API] Initialized: url={self.base_url} model={self.default_model} delay={self.request_delay}s")
 
@@ -113,6 +154,28 @@ class CustomAPIClient:
             self._setup_llm_logger()
 
         self._log_throttle_state()
+        self._write_liveness()
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Deterministic fallback when an OpenAI-compatible endpoint omits usage."""
+        if not text:
+            return 0
+        return len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
+
+    def _write_liveness(self) -> None:
+        if self._liveness_path is None:
+            return
+        payload = {
+            **self.generation_metrics,
+            "model": self.default_model,
+            "run_id": self._liveness_run_id,
+            "updated_at": datetime.now().isoformat(),
+        }
+        self._liveness_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._liveness_path.with_suffix(f"{self._liveness_path.suffix}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, self._liveness_path)
 
     def _log_throttle_state(self) -> None:
         state = {
@@ -186,6 +249,76 @@ class CustomAPIClient:
             cb(event_type, payload)
         except Exception:
             pass
+
+    @staticmethod
+    def _read_streaming_response(
+        response,
+        callback: Callable[[str, Dict[str, Any]], None],
+    ) -> Dict[str, Any]:
+        """Consume OpenAI-compatible SSE and rebuild the normal response shape."""
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_name: str | None = None
+        tool_arguments: List[str] = []
+        usage: Dict[str, Any] = {}
+        saw_sse = False
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data:"):
+                continue
+            saw_sse = True
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                content_parts.append(content)
+                callback("assistant_delta", {"text": content})
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+                callback("assistant_delta", {"text": reasoning, "channel": "reasoning"})
+            for tool_call in delta.get("tool_calls") or []:
+                function = tool_call.get("function") or {}
+                name = function.get("name")
+                if isinstance(name, str) and name:
+                    tool_name = name
+                    callback("tool_call_start", {"name": name})
+                arguments = function.get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    tool_arguments.append(arguments)
+                    callback("tool_call_delta", {"name": tool_name, "text": arguments})
+
+        if not saw_sse:
+            return response.json()
+
+        message: Dict[str, Any] = {"content": "".join(content_parts)}
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if tool_arguments:
+            message["tool_calls"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": "".join(tool_arguments),
+                    },
+                }
+            ]
+        return {"choices": [{"message": message}], "usage": usage}
 
     def _apply_global_throttle(self) -> None:
         """Enforce a global minimum interval between request starts."""
@@ -390,11 +523,16 @@ class CustomAPIClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         phase: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Dict[str, Any] | str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> str:
         """
         Generate a response from the Custom API.
         Supports OpenAI-compatible chat completions format.
         """
+        request_clock: float | None = None
         start_time = time.time() if self.llm_log_timing else None
 
         # Request Delay
@@ -469,6 +607,15 @@ class CustomAPIClient:
             # Generic OpenAI-compatible API - use standard max_tokens
             payload["max_tokens"] = effective_max_tokens
 
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if stream_callback is not None:
+            payload["stream"] = True
+
         # Construct API endpoint URL
         if self.base_url.endswith("/chat/completions") or self.base_url.endswith("/v1/chat/completions"):
             api_url = self.base_url
@@ -512,24 +659,112 @@ class CustomAPIClient:
             )
 
             def do_post():
-                resp = requests.post(api_url, headers=headers, json=payload, timeout=self.timeout, verify=self.verify_ssl)
+                nonlocal request_clock
+                with self._metrics_lock:
+                    self.generation_metrics["api_calls"] += 1
+                    self.generation_metrics["active"] = True
+                    self.generation_metrics["status"] = "generating"
+                    self.generation_metrics["request_started_at"] = datetime.now().isoformat()
+                    self._write_liveness()
+                request_clock = time.perf_counter()
+                request_timeout = (
+                    (30, None)
+                    if phase and phase.startswith("finish_game_source:")
+                    else self.timeout
+                )
+                request_arguments = {
+                    "headers": headers,
+                    "json": payload,
+                    "timeout": request_timeout,
+                    "verify": self.verify_ssl,
+                }
+                if stream_callback is not None:
+                    request_arguments["stream"] = True
+                resp = requests.post(api_url, **request_arguments)
                 resp.raise_for_status()
                 return resp
 
             response = retryer(do_post)
-            data = response.json()
+            data = (
+                self._read_streaming_response(response, stream_callback)
+                if stream_callback is not None
+                else response.json()
+            )
 
             # Extract response
             if "choices" in data and len(data["choices"]) > 0:
-                response_text = data["choices"][0].get("message", {}).get("content", "")
+                message = data["choices"][0].get("message", {})
+                tool_calls = message.get("tool_calls") or []
+                if tool_calls:
+                    function = tool_calls[0].get("function", {})
+                    arguments = function.get("arguments", "")
+                    response_text = arguments if isinstance(arguments, str) else json.dumps(arguments)
+                    self.last_response_metadata = {
+                        "structured_output_mode": "tool_call",
+                        "tool_name": function.get("name"),
+                    }
+                    with self._metrics_lock:
+                        self.generation_metrics["structured_tool_calls"] += 1
+                else:
+                    response_text = message.get("content") or ""
+                    self.last_response_metadata = {
+                        "structured_output_mode": "json_schema" if response_format else "plain_json",
+                        "tool_name": None,
+                    }
             else:
                 self.logger.warning("Unexpected Custom API response format")
                 response_text = ""
+                self.last_response_metadata = {
+                    "structured_output_mode": "plain_json",
+                    "tool_name": None,
+                }
+
+            duration_seconds = max(
+                time.perf_counter() - (request_clock or time.perf_counter()),
+                1e-9,
+            )
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+            completion_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+            token_source = "api"
+            if not isinstance(prompt_tokens, int):
+                prompt_tokens = self._estimate_tokens(f"{effective_system}\n{prompt}")
+                token_source = "estimated"
+            if not isinstance(completion_tokens, int):
+                completion_tokens = self._estimate_tokens(response_text)
+                token_source = "estimated"
+            tokens_per_second = completion_tokens / duration_seconds
+            self.last_response_metadata.update(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "duration_seconds": duration_seconds,
+                    "tokens_per_second": tokens_per_second,
+                    "token_source": token_source,
+                }
+            )
+            with self._metrics_lock:
+                self.generation_metrics["prompt_tokens"] += prompt_tokens
+                self.generation_metrics["completion_tokens"] += completion_tokens
+                self.generation_metrics["duration_seconds"] += duration_seconds
+                self.generation_metrics["tokens_per_second"] = (
+                    self.generation_metrics["completion_tokens"]
+                    / max(self.generation_metrics["duration_seconds"], 1e-9)
+                )
+                if (
+                    self.generation_metrics["token_source"] in {"unavailable", "api"}
+                    and token_source == "api"
+                ):
+                    self.generation_metrics["token_source"] = "api"
+                else:
+                    self.generation_metrics["token_source"] = "estimated"
+                self.generation_metrics["active"] = False
+                self.generation_metrics["status"] = "completed"
+                self._write_liveness()
 
             # Log success
             if self.llm_logging_enabled:
                 duration_ms = (time.time() - start_time) * 1000 if start_time else 0
-                usage = data.get("usage", {})
                 self._log_llm_interaction(
                     "generate_response",
                     {
@@ -549,6 +784,11 @@ class CustomAPIClient:
         except Exception as e:
             error_msg = str(e)
             self.logger.error(f"Error calling Custom API: {error_msg}")
+            with self._metrics_lock:
+                self.generation_metrics["active"] = False
+                self.generation_metrics["status"] = "failed"
+                self.generation_metrics["last_error"] = error_msg
+                self._write_liveness()
 
             # Enhanced error logging (HTTP errors)
             if isinstance(e, requests.exceptions.HTTPError) and getattr(e, "response", None) is not None:
@@ -590,6 +830,123 @@ class CustomAPIClient:
                 self._request_semaphore.release()
             except Exception:
                 pass
+
+    def generate_structured(
+        self,
+        *,
+        prompt: str,
+        schema: Dict[str, Any],
+        tool_name: str,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        phase: Optional[str] = None,
+        accept_plain_tool_response: bool = False,
+        prefer_json_schema: bool = False,
+        stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Tuple[str, str]:
+        """Generate schema-constrained JSON with observable compatibility fallbacks.
+
+        Preferred order is an explicit function/tool call, then OpenAI JSON Schema
+        response format, then a plain JSON response validated by the caller.
+        """
+        if prefer_json_schema:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": tool_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+            response = self.generate(
+                prompt=prompt,
+                model=model,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                phase=phase,
+                response_format=response_format,
+                stream_callback=stream_callback,
+            )
+            return response, "json_schema"
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "Submit one schema-valid source-derived port model.",
+                "parameters": schema,
+                "strict": True,
+            },
+        }
+        choice = {"type": "function", "function": {"name": tool_name}}
+
+        try:
+            response = self.generate(
+                prompt=prompt,
+                model=model,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                phase=phase,
+                tools=[tool],
+                tool_choice=choice,
+                stream_callback=stream_callback,
+            )
+            if self.last_response_metadata.get("structured_output_mode") == "tool_call":
+                return response, "tool_call"
+            if accept_plain_tool_response and response.strip():
+                self.logger.info(
+                    "Endpoint ignored forced tool_choice; returning plain response for caller validation"
+                )
+                return response, "plain_json"
+            self.logger.info(
+                "Endpoint ignored forced tool_choice; trying JSON Schema before accepting plain JSON"
+            )
+        except requests.exceptions.HTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+            if status not in {400, 404, 415, 422}:
+                raise
+            self.logger.info("Structured tool calls unsupported by endpoint; trying JSON Schema")
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": tool_name,
+                "strict": True,
+                "schema": schema,
+            },
+        }
+        try:
+            response = self.generate(
+                prompt=prompt,
+                model=model,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                phase=phase,
+                response_format=response_format,
+                stream_callback=stream_callback,
+            )
+            return response, "json_schema"
+        except requests.exceptions.HTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+            if status not in {400, 404, 415, 422}:
+                raise
+            self.logger.info("JSON Schema response format unsupported by endpoint; using validated plain JSON")
+
+        response = self.generate(
+            prompt=prompt,
+            model=model,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            phase=phase,
+            stream_callback=stream_callback,
+        )
+        return response, "plain_json"
 
     def generate_with_phase(self, prompt: str, phase: Optional[str] = None, system_prompt: Optional[str] = None) -> str:
         """Generate using phase-specific model configuration."""

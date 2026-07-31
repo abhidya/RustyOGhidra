@@ -8,6 +8,29 @@ For the version using a Claude-inspired Orchestrator, see https://github.com/lln
 
 **OGhidra** bridges Large Language Models with Ghidra's reverse engineering platform, enabling AI-driven binary analysis through natural language. Analyze binaries conversationally, automate complex workflows, and maintain complete privacy with local AI models.
 
+### Evidence-first function export
+
+`export-port` turns one Ghidra function into a versioned, evidence-linked artifact suitable for
+downstream compiler pipelines. It uses Pydantic v2 for syntax and control-flow validation,
+preserves every raw model response, and allows at most two model repairs.
+
+```powershell
+.\.venv\Scripts\python.exe main.py export-port `
+  --address 0x8012b458 `
+  --ghidra-backend http `
+  --output port_artifacts/8012b458.port.json
+```
+
+The custom API client supports forced model tool calls, strict JSON Schema, and validated plain
+JSON. The function-port exporter requests JSON Schema directly because the tested local
+llama-server accepts `tools` but ignores the forced call; this avoids spending a full generation
+on degraded tool-shaped output. The artifact records the selected mode. Mechanical claims are
+retained only when correlated Ghidra evidence contains their addresses, offsets, constants,
+masks, and numeric call arguments.
+
+See [the 1:1 port workflow](docs/port-1to1-workflow.md) and
+[artifact pipeline specification](docs/port-artifact-pipeline-spec.md).
+
 YouTube Setup Tutorial
 
 [![OGhidra Introduction](https://img.youtube.com/vi/hBD92FUgR0Y/0.jpg)](https://www.youtube.com/watch?v=hBD92FUgR0Y)
@@ -172,6 +195,51 @@ uv run main.py --interactive
 # Test connection
 health
 ```
+
+### Finish Game Port
+
+With the Ghidra CodeBrowser/MCP service and local model API running, choose:
+
+```text
+Analysis → Finish Game Port
+```
+
+This selects the **Finish Game Port** tab in the main OGhidra window and starts or attaches to
+the durable controller. The live workspace shows:
+
+- The active Ghidra function before Qwen begins processing it.
+- A readable evidence prompt without repeated system templates or full source-context dumps.
+- Streaming Qwen text and structured `submit_browser_source_patch` tool-call arguments.
+- Live compile, test, browser-smoke, retry, Git commit, and push events.
+- **Pause after function**, **Resume**, and **Stop after function** controls.
+- A production browser-preview launcher.
+- Elapsed time, calibrated ETA, functions/second, Qwen tokens/second, and API/structured/Ghidra
+  call counts.
+
+The single-threaded loop is:
+
+```text
+extract one function -> Qwen edits browser source -> six automatic gates
+-> retry with errors or commit and push -> next function
+```
+
+It does not wait for whole-program extraction before starting Qwen. Long Finish Game Port
+generations retain a 30-second connection timeout but have no response deadline; streamed tokens
+provide liveness while the local model works.
+
+Progress is the honest count of terminal functions divided by the 11,972-function Ghidra
+inventory. ETA says **Calibrating** until at least three functions finish, then uses observed
+completed-function throughput. Token throughput uses endpoint usage when available and otherwise
+uses a deterministic estimate.
+
+The run automatically includes the currently loaded saved OGhidra session as **advisory**
+historical context. It does not require RAG vectors to be loaded. Vectors remain useful for
+semantic discovery, while exact port decisions continue to require fresh Ghidra evidence and
+deterministic verification.
+
+All 11,972 inventory addresses are scheduled durably. Exact fingerprints suppress duplicate Qwen
+work as functions arrive. A function is terminal only after it is integrated and pushed, excluded
+as non-browser platform code, deduplicated exactly, or recorded as a blocking extraction failure.
 
 ---
 
