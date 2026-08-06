@@ -6,6 +6,7 @@ numpy>=1.24.0             # Required: for vector operations with Ollama embeddin
 psutil>=5.9.0             # For system memory and CPU statistics in system information
 pydantic-settings>=2.2.1
 pydantic>=2.7.1
+pydantic-ai-slim[openai]>=2.21.0,<3
 python-dotenv>=1.0.0
 requests>=2.26.0
 rich>=13.7.1              # For enhanced terminal output in interactive mode

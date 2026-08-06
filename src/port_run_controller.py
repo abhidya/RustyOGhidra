@@ -125,6 +125,9 @@ class PortRunSnapshot:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     tokens_per_second: float = 0.0
+    current_prompt_tokens: int = 0
+    current_completion_tokens: int = 0
+    current_request_elapsed_seconds: float = 0.0
     token_source: str = "unavailable"
     llm_api_calls: int = 0
     structured_tool_calls: int = 0
@@ -524,6 +527,22 @@ class PortRunController:
         session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
         session_path = session.get("path") or process_metadata.get("session_path")
         session_role = session.get("role") or process_metadata.get("session_role") or "none"
+        request_elapsed = float(
+            liveness.get("current_request_elapsed_seconds", 0.0) or 0.0
+        )
+        request_started_text = str(liveness.get("request_started_at") or "")
+        has_explicit_timezone = request_started_text.endswith("Z") or (
+            len(request_started_text) >= 6
+            and request_started_text[-6] in "+-"
+            and request_started_text[-3] == ":"
+        )
+        if bool(liveness.get("active", False)) and has_explicit_timezone:
+            request_started = _parse_timestamp(request_started_text)
+            if request_started is not None:
+                request_elapsed = max(
+                    request_elapsed,
+                    (datetime.now(timezone.utc) - request_started).total_seconds(),
+                )
         return PortRunSnapshot(
             status=str(payload.get("status", "not_started")),
             run_mode=str(payload.get("run_mode", "unknown")),
@@ -555,6 +574,11 @@ class PortRunController:
             prompt_tokens=int(liveness.get("prompt_tokens", 0) or 0),
             completion_tokens=int(liveness.get("completion_tokens", 0) or 0),
             tokens_per_second=float(liveness.get("tokens_per_second", 0.0) or 0.0),
+            current_prompt_tokens=int(liveness.get("current_prompt_tokens", 0) or 0),
+            current_completion_tokens=int(
+                liveness.get("current_completion_tokens", 0) or 0
+            ),
+            current_request_elapsed_seconds=request_elapsed,
             token_source=str(liveness.get("token_source", "unavailable")),
             llm_api_calls=int(liveness.get("api_calls", 0) or 0),
             structured_tool_calls=int(liveness.get("structured_tool_calls", 0) or 0),

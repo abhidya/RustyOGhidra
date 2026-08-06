@@ -1,6 +1,8 @@
 import json
+import os
 from types import SimpleNamespace
 
+import pytest
 import requests
 
 from src.custom_api_client import CustomAPIClient
@@ -39,10 +41,25 @@ class StreamResponse(Response):
         super().__init__({})
         self.chunks = chunks
 
-    def iter_lines(self, decode_unicode=True):
+    def iter_lines(self, chunk_size=512, decode_unicode=True):
         for chunk in self.chunks:
             yield f"data: {json.dumps(chunk)}"
         yield "data: [DONE]"
+
+
+class NonSSEStreamResponse(Response):
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.consumed = False
+
+    def iter_lines(self, chunk_size=512, decode_unicode=True):
+        self.consumed = True
+        yield self.text
+
+    def json(self):
+        if self.consumed:
+            raise RuntimeError("The content for this response was already consumed")
+        return self.payload
 
 
 def test_generate_structured_uses_tool_call_arguments(monkeypatch):
@@ -81,6 +98,30 @@ def test_generate_structured_uses_tool_call_arguments(monkeypatch):
     assert json.loads(text)["port_ir"] is None
     assert requests_seen[0]["tool_choice"]["function"]["name"] == "submit_port_model"
     assert requests_seen[0]["tools"][0]["function"]["strict"] is True
+
+
+def test_liveness_file_lock_never_aborts_model_generation(monkeypatch, tmp_path):
+    monkeypatch.setenv("OGHIDRA_PORT_LIVENESS_PATH", str(tmp_path / "llm-liveness.json"))
+    monkeypatch.setenv("OGHIDRA_PORT_RUN_ID", "telemetry-lock-test")
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda *_args, **_kwargs: Response(
+            {"choices": [{"message": {"content": "model result"}}]}
+        ),
+    )
+
+    real_replace = os.replace
+
+    def locked_replace(source, target):
+        if str(target).endswith("llm-liveness.json"):
+            raise PermissionError(5, "file temporarily locked", str(target))
+        return real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", locked_replace)
+    client = CustomAPIClient(config())
+
+    assert client.generate("prompt") == "model result"
 
 
 def test_generate_structured_falls_back_to_json_schema(monkeypatch):
@@ -195,6 +236,8 @@ def test_generate_tracks_api_token_usage_and_throughput(monkeypatch, tmp_path):
     assert metrics["prompt_tokens"] == 40
     assert metrics["completion_tokens"] == 10
     assert metrics["tokens_per_second"] > 0
+    assert metrics["end_to_end_tokens_per_second"] > 0
+    assert metrics["throughput_scope"] == "end_to_end_fallback"
     assert metrics["token_source"] == "api"
     assert metrics["active"] is False
 
@@ -220,9 +263,14 @@ def test_generate_estimates_tokens_when_api_omits_usage(monkeypatch, tmp_path):
     assert metrics["token_source"] == "estimated"
 
 
-def test_finish_game_structured_call_streams_tool_arguments_without_read_timeout(monkeypatch):
+def test_finish_game_structured_call_streams_tool_arguments_without_read_timeout(
+    monkeypatch,
+    tmp_path,
+):
     request_seen = {}
     events = []
+    liveness = tmp_path / "llm-liveness.json"
+    monkeypatch.setenv("OGHIDRA_PORT_LIVENESS_PATH", str(liveness))
 
     def post(url, **kwargs):
         request_seen.update(kwargs)
@@ -232,6 +280,7 @@ def test_finish_game_structured_call_streams_tool_arguments_without_read_timeout
                     "choices": [
                         {
                             "delta": {
+                                "reasoning_content": "inspect original evidence before patching",
                                 "tool_calls": [
                                     {
                                         "function": {
@@ -278,10 +327,129 @@ def test_finish_game_structured_call_streams_tool_arguments_without_read_timeout
     assert request_seen["stream"] is True
     assert request_seen["json"]["stream"] is True
     assert [kind for kind, _ in events] == [
+        "assistant_delta",
         "tool_call_start",
         "tool_call_delta",
         "tool_call_delta",
     ]
+    metrics = json.loads(liveness.read_text())
+    assert metrics["throughput_scope"] == "stream_generation_window"
+    assert metrics["generation_duration_seconds"] > 0
+    assert metrics["tokens_per_second"] > 0
+    assert metrics["completion_tokens"] > client._estimate_tokens(text)
+
+
+def test_streaming_finishes_on_finish_reason_without_done_sentinel(monkeypatch):
+    request_seen = {}
+
+    class FinishReasonResponse(Response):
+        def iter_lines(self, chunk_size=512, decode_unicode=True):
+            request_seen["chunk_size"] = chunk_size
+            yield "data: " + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "submit_browser_source_patch",
+                                            "arguments": (
+                                                '{"summary":"done","action":"exclude","files":[]}'
+                                            ),
+                                        }
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            )
+            raise AssertionError("client waited beyond the completed choice")
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FinishReasonResponse({}))
+    client = CustomAPIClient(config())
+    text, mode = client.generate_structured(
+        prompt="port",
+        schema={"type": "object"},
+        tool_name="submit_browser_source_patch",
+        phase="finish_game_source:0x800055e0:attempt_1",
+        stream_callback=lambda *_args: None,
+    )
+
+    assert mode == "tool_call"
+    assert json.loads(text)["action"] == "exclude"
+    assert request_seen["chunk_size"] == 1
+
+
+def test_streaming_request_accepts_non_sse_json_without_reading_body_twice(monkeypatch):
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda *args, **kwargs: NonSSEStreamResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "submit_browser_source_patch",
+                                        "arguments": (
+                                            '{"summary":"runtime","action":"exclude","files":[]}'
+                                        ),
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+    )
+    client = CustomAPIClient(config())
+
+    text, mode = client.generate_structured(
+        prompt="port",
+        schema={"type": "object"},
+        tool_name="submit_browser_source_patch",
+        phase="finish_game_source:0x80003340:attempt_1",
+        stream_callback=lambda *_args: None,
+    )
+
+    assert mode == "tool_call"
+    assert json.loads(text)["action"] == "exclude"
+
+
+def test_streaming_request_surfaces_sse_error_payload(monkeypatch):
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda *args, **kwargs: StreamResponse(
+            [{"error": {"message": "context length exceeded"}}]
+        ),
+    )
+    client = CustomAPIClient(config())
+
+    with pytest.raises(RuntimeError, match="context length exceeded"):
+        client.generate(
+            "port",
+            phase="finish_game_source:0x80003340:attempt_1",
+            stream_callback=lambda *_args: None,
+        )
+
+
+def test_streaming_request_rejects_empty_success(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: StreamResponse([]))
+    client = CustomAPIClient(config())
+
+    with pytest.raises(RuntimeError, match="no assistant content or tool call"):
+        client.generate(
+            "port",
+            phase="finish_game_source:0x80003340:attempt_1",
+            stream_callback=lambda *_args: None,
+        )
 
 
 def test_liveness_accumulates_across_clients_in_the_same_port_run(monkeypatch, tmp_path):

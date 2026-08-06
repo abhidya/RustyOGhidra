@@ -7,6 +7,7 @@ Handles communication with OpenAI-compatible APIs (GPT-5, custom endpoints, etc.
 
 import json
 import logging
+import logging.handlers
 import os
 import requests
 import re
@@ -16,7 +17,7 @@ import warnings
 import threading
 import email.utils
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Any, List, Optional, Union, Tuple
 from tenacity import Retrying, stop_after_attempt, wait_exponential, retry_if_exception
@@ -27,6 +28,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Also suppress requests warnings
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+# Bounds for the dedicated LLM-interaction log. Overridable via env so a debug
+# session can widen them without editing code.
+_LLM_LOG_MAX_BYTES = int(os.getenv("LLM_LOG_MAX_BYTES", str(50 * 1024 * 1024)))
+_LLM_LOG_BACKUP_COUNT = int(os.getenv("LLM_LOG_BACKUP_COUNT", "5"))
+
+
+class APIResponseError(RuntimeError):
+    """The API returned a response that cannot produce a model result."""
 
 
 def is_retryable_exception(e):
@@ -115,6 +125,13 @@ class CustomAPIClient:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "duration_seconds": 0.0,
+            "generation_duration_seconds": 0.0,
+            "tokens_per_second": 0.0,
+            "end_to_end_tokens_per_second": 0.0,
+            "throughput_scope": "unavailable",
+            "current_prompt_tokens": 0,
+            "current_completion_tokens": 0,
+            "current_request_elapsed_seconds": 0.0,
             "token_source": "unavailable",
             "active": False,
             "status": "idle",
@@ -135,6 +152,9 @@ class CustomAPIClient:
                     "prompt_tokens",
                     "completion_tokens",
                     "duration_seconds",
+                    "generation_duration_seconds",
+                    "tokens_per_second",
+                    "end_to_end_tokens_per_second",
                 ):
                     if isinstance(previous_metrics.get(key), (int, float)):
                         self.generation_metrics[key] = previous_metrics[key]
@@ -142,11 +162,10 @@ class CustomAPIClient:
                     "token_source",
                     "unavailable",
                 )
-                if self.generation_metrics["duration_seconds"]:
-                    self.generation_metrics["tokens_per_second"] = (
-                        self.generation_metrics["completion_tokens"]
-                        / self.generation_metrics["duration_seconds"]
-                    )
+                self.generation_metrics["throughput_scope"] = previous_metrics.get(
+                    "throughput_scope",
+                    "legacy_end_to_end",
+                )
 
         print(f"[Custom API] Initialized: url={self.base_url} model={self.default_model} delay={self.request_delay}s")
 
@@ -173,9 +192,128 @@ class CustomAPIClient:
             "updated_at": datetime.now().isoformat(),
         }
         self._liveness_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._liveness_path.with_suffix(f"{self._liveness_path.suffix}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, self._liveness_path)
+        temporary = self._liveness_path.with_suffix(
+            f"{self._liveness_path.suffix}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            for retry_index in range(5):
+                try:
+                    os.replace(temporary, self._liveness_path)
+                    return
+                except PermissionError:
+                    if retry_index == 4:
+                        raise
+                    time.sleep(0.02 * (retry_index + 1))
+        except OSError as error:
+            # Dashboard telemetry is diagnostic only. A transient Windows file
+            # lock must never abort or replay an otherwise valid model turn.
+            self.logger.warning(f"Could not update port liveness telemetry: {error}")
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def begin_managed_generation(self, prompt: str) -> None:
+        """Expose a PydanticAI-owned model run through the existing GUI telemetry."""
+        self._managed_generation_started = time.perf_counter()
+        self._managed_generation_first_output = None
+        self._managed_generation_output = []
+        self._managed_generation_counted_requests = 1
+        with self._metrics_lock:
+            self.generation_metrics["api_calls"] += 1
+            self.generation_metrics["active"] = True
+            self.generation_metrics["status"] = "awaiting_provider_output"
+            self.generation_metrics["tokens_per_second"] = 0.0
+            self.generation_metrics["throughput_scope"] = "pending"
+            self.generation_metrics["current_prompt_tokens"] = self._estimate_tokens(prompt)
+            self.generation_metrics["current_completion_tokens"] = 0
+            self.generation_metrics["current_request_elapsed_seconds"] = 0.0
+            self.generation_metrics["request_started_at"] = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
+            self._write_liveness()
+
+    def advance_managed_generation_request(self) -> None:
+        """Expose the continuation request after a PydanticAI workspace tool."""
+        self._managed_generation_started = time.perf_counter()
+        self._managed_generation_first_output = None
+        self._managed_generation_output = []
+        self._managed_generation_counted_requests = (
+            int(getattr(self, "_managed_generation_counted_requests", 0)) + 1
+        )
+        with self._metrics_lock:
+            self.generation_metrics["api_calls"] += 1
+            self.generation_metrics["active"] = True
+            self.generation_metrics["status"] = "awaiting_provider_output"
+            self.generation_metrics["tokens_per_second"] = 0.0
+            self.generation_metrics["throughput_scope"] = "pending"
+            self.generation_metrics["current_completion_tokens"] = 0
+            self.generation_metrics["current_request_elapsed_seconds"] = 0.0
+            self.generation_metrics["request_started_at"] = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
+            self._write_liveness()
+
+    def observe_managed_generation(self, text: str) -> None:
+        """Record text/tool argument deltas emitted by PydanticAI."""
+        if not text:
+            return
+        now = time.perf_counter()
+        if self._managed_generation_first_output is None:
+            self._managed_generation_first_output = now
+        self._managed_generation_output.append(text)
+        completion_tokens = self._estimate_tokens(
+            "".join(self._managed_generation_output)
+        )
+        generation_elapsed = max(
+            now - self._managed_generation_first_output,
+            1e-9,
+        )
+        request_elapsed = max(
+            now - self._managed_generation_started,
+            0.0,
+        )
+        with self._metrics_lock:
+            self.generation_metrics["status"] = "streaming"
+            self.generation_metrics["current_completion_tokens"] = completion_tokens
+            self.generation_metrics["current_request_elapsed_seconds"] = request_elapsed
+            self.generation_metrics["tokens_per_second"] = (
+                completion_tokens / generation_elapsed
+            )
+            self.generation_metrics["throughput_scope"] = (
+                "live_stream_generation_window"
+            )
+            self._write_liveness()
+
+    def end_managed_generation(self, *, usage: Any = None, error: str | None = None) -> None:
+        """Close GUI telemetry for a PydanticAI-owned run."""
+        requests_count = int(getattr(usage, "requests", 0) or 0)
+        prompt_tokens = int(
+            getattr(usage, "input_tokens", 0)
+            or getattr(usage, "request_tokens", 0)
+            or 0
+        )
+        completion_tokens = int(
+            getattr(usage, "output_tokens", 0)
+            or getattr(usage, "response_tokens", 0)
+            or 0
+        )
+        counted_requests = int(
+            getattr(self, "_managed_generation_counted_requests", 0)
+        )
+        with self._metrics_lock:
+            self.generation_metrics["api_calls"] += max(
+                0, requests_count - counted_requests
+            )
+            self.generation_metrics["prompt_tokens"] += prompt_tokens
+            self.generation_metrics["completion_tokens"] += completion_tokens
+            self.generation_metrics["active"] = False
+            self.generation_metrics["status"] = "failed" if error else "completed"
+            self.generation_metrics["current_prompt_tokens"] = 0
+            self.generation_metrics["current_completion_tokens"] = 0
+            self.generation_metrics["current_request_elapsed_seconds"] = 0.0
+            if error:
+                self.generation_metrics["last_error"] = error
+            self._write_liveness()
 
     def _log_throttle_state(self) -> None:
         state = {
@@ -212,7 +350,15 @@ class CustomAPIClient:
         self.llm_logger.propagate = False
         self.llm_logger.handlers.clear()
 
-        file_handler = logging.FileHandler(self.llm_log_file, encoding="utf-8")
+        # Rotating, not plain: llm_log_prompts writes full prompts, and a single
+        # port run can carry 240k-char prompts. The previous FileHandler grew
+        # logs/llm_interactions_lmstudio_nemotron3.json to 443 MB unbounded.
+        file_handler = logging.handlers.RotatingFileHandler(
+            self.llm_log_file,
+            maxBytes=_LLM_LOG_MAX_BYTES,
+            backupCount=_LLM_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         file_handler.setLevel(logging.INFO)
 
         if self.llm_log_format == "json":
@@ -262,12 +408,17 @@ class CustomAPIClient:
         tool_arguments: List[str] = []
         usage: Dict[str, Any] = {}
         saw_sse = False
+        raw_lines: List[str] = []
 
-        for raw_line in response.iter_lines(decode_unicode=True):
+        # A one-byte read chunk prevents small final tool calls from sitting in
+        # urllib3's default 512-byte buffer while an imperfect SSE server keeps
+        # the HTTP connection open after generation has already finished.
+        for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
             if not raw_line:
                 continue
             line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
             if not line.startswith("data:"):
+                raw_lines.append(line)
                 continue
             saw_sse = True
             payload = line[5:].strip()
@@ -277,12 +428,20 @@ class CustomAPIClient:
                 chunk = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if chunk.get("error"):
+                error = chunk["error"]
+                if isinstance(error, dict):
+                    detail = error.get("message") or error.get("code") or json.dumps(error)
+                else:
+                    detail = str(error)
+                raise APIResponseError(f"Custom API stream error: {detail}")
             if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]
             choices = chunk.get("choices") or []
             if not choices:
                 continue
-            delta = choices[0].get("delta") or {}
+            choice = choices[0]
+            delta = choice.get("delta") or choice.get("message") or {}
             content = delta.get("content")
             if isinstance(content, str) and content:
                 content_parts.append(content)
@@ -301,9 +460,31 @@ class CustomAPIClient:
                 if isinstance(arguments, str) and arguments:
                     tool_arguments.append(arguments)
                     callback("tool_call_delta", {"name": tool_name, "text": arguments})
+            # OpenAI-compatible servers are allowed to finish with a
+            # finish_reason chunk. Do not require a subsequent [DONE] sentinel
+            # from local servers that leave the SSE socket open.
+            if choice.get("finish_reason") is not None:
+                break
 
         if not saw_sse:
-            return response.json()
+            raw_body = "\n".join(raw_lines).strip()
+            if not raw_body:
+                raise APIResponseError("Custom API returned an empty non-SSE response")
+            try:
+                data = json.loads(raw_body)
+            except json.JSONDecodeError as error:
+                raise APIResponseError(
+                    "Custom API returned neither SSE nor a valid JSON response"
+                ) from error
+            if isinstance(data, dict) and data.get("error"):
+                api_error = data["error"]
+                detail = (
+                    api_error.get("message") or api_error.get("code") or json.dumps(api_error)
+                    if isinstance(api_error, dict)
+                    else str(api_error)
+                )
+                raise APIResponseError(f"Custom API error: {detail}")
+            return data
 
         message: Dict[str, Any] = {"content": "".join(content_parts)}
         if reasoning_parts:
@@ -318,6 +499,10 @@ class CustomAPIClient:
                     },
                 }
             ]
+        if not message["content"] and "tool_calls" not in message:
+            raise APIResponseError(
+                "Custom API stream contained no assistant content or tool call"
+            )
         return {"choices": [{"message": message}], "usage": usage}
 
     def _apply_global_throttle(self) -> None:
@@ -527,12 +712,16 @@ class CustomAPIClient:
         tool_choice: Optional[Dict[str, Any] | str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Generate a response from the Custom API.
         Supports OpenAI-compatible chat completions format.
         """
         request_clock: float | None = None
+        first_output_clock: float | None = None
+        streamed_output: List[str] = []
+        last_liveness_clock: float | None = None
         start_time = time.time() if self.llm_log_timing else None
 
         # Request Delay
@@ -546,11 +735,13 @@ class CustomAPIClient:
         effective_temperature = temperature if temperature is not None else self.temperature
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
 
-        # Build messages array
-        messages = []
-        if effective_system:
-            messages.append({"role": "system", "content": effective_system})
-        messages.append({"role": "user", "content": prompt})
+        # Build the conversation. Explicit messages preserve standard assistant/tool
+        # turns so compatible servers can reuse the long prompt prefix.
+        conversation = list(messages) if messages is not None else []
+        if not conversation:
+            if effective_system:
+                conversation.append({"role": "system", "content": effective_system})
+            conversation.append({"role": "user", "content": prompt})
 
         # Headers
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -575,7 +766,7 @@ class CustomAPIClient:
         # Build payload
         payload = {
             "model": effective_model,
-            "messages": messages,
+            "messages": conversation,
             "temperature": effective_temperature,
         }
 
@@ -659,17 +850,33 @@ class CustomAPIClient:
             )
 
             def do_post():
-                nonlocal request_clock
+                nonlocal request_clock, first_output_clock
                 with self._metrics_lock:
                     self.generation_metrics["api_calls"] += 1
                     self.generation_metrics["active"] = True
                     self.generation_metrics["status"] = "generating"
-                    self.generation_metrics["request_started_at"] = datetime.now().isoformat()
+                    self.generation_metrics["tokens_per_second"] = 0.0
+                    self.generation_metrics["throughput_scope"] = "pending"
+                    self.generation_metrics["current_prompt_tokens"] = self._estimate_tokens(
+                        json.dumps(conversation, ensure_ascii=False, default=str)
+                    )
+                    self.generation_metrics["current_completion_tokens"] = 0
+                    self.generation_metrics["current_request_elapsed_seconds"] = 0.0
+                    self.generation_metrics["request_started_at"] = (
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    )
                     self._write_liveness()
                 request_clock = time.perf_counter()
+                first_output_clock = None
+                # No read timeout for port-work phases: an 81k-token prompt can
+                # spend 30-60 min in prefill on this hardware with zero bytes
+                # on the wire, and requests' read timeout is time-between-bytes
+                # -- it would kill a healthy request. Hang detection belongs to
+                # the supervisor's stall/liveness probes, not the socket.
+                _no_read_timeout_phases = ("finish_game_source:", "chunk_analysis:")
                 request_timeout = (
                     (30, None)
-                    if phase and phase.startswith("finish_game_source:")
+                    if phase and phase.startswith(_no_read_timeout_phases)
                     else self.timeout
                 )
                 request_arguments = {
@@ -684,9 +891,43 @@ class CustomAPIClient:
                 resp.raise_for_status()
                 return resp
 
+            def observed_stream_callback(event_type: str, event: Dict[str, Any]) -> None:
+                nonlocal first_output_clock, last_liveness_clock
+                now = time.perf_counter()
+                if (
+                    first_output_clock is None
+                    and event_type in {"assistant_delta", "tool_call_delta"}
+                    and event.get("text")
+                ):
+                    first_output_clock = now
+                text = event.get("text")
+                if event_type in {"assistant_delta", "tool_call_delta"} and isinstance(text, str):
+                    streamed_output.append(text)
+                    if last_liveness_clock is None or now - last_liveness_clock >= 0.5:
+                        current_tokens = self._estimate_tokens("".join(streamed_output))
+                        generation_elapsed = max(
+                            now - (first_output_clock or now),
+                            1e-9,
+                        )
+                        request_elapsed = max(now - (request_clock or now), 0.0)
+                        with self._metrics_lock:
+                            self.generation_metrics["status"] = "streaming"
+                            self.generation_metrics["current_completion_tokens"] = current_tokens
+                            self.generation_metrics["current_request_elapsed_seconds"] = request_elapsed
+                            self.generation_metrics["tokens_per_second"] = (
+                                current_tokens / generation_elapsed
+                            )
+                            self.generation_metrics["throughput_scope"] = (
+                                "live_stream_generation_window"
+                            )
+                            self._write_liveness()
+                        last_liveness_clock = now
+                if stream_callback is not None:
+                    stream_callback(event_type, event)
+
             response = retryer(do_post)
             data = (
-                self._read_streaming_response(response, stream_callback)
+                self._read_streaming_response(response, observed_stream_callback)
                 if stream_callback is not None
                 else response.json()
             )
@@ -694,14 +935,24 @@ class CustomAPIClient:
             # Extract response
             if "choices" in data and len(data["choices"]) > 0:
                 message = data["choices"][0].get("message", {})
+                reasoning_text = message.get("reasoning_content") or ""
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
-                    function = tool_calls[0].get("function", {})
+                    tool_call = tool_calls[0]
+                    if not tool_call.get("id"):
+                        tool_call = {**tool_call, "id": f"call_{request_id}"}
+                    function = tool_call.get("function", {})
                     arguments = function.get("arguments", "")
                     response_text = arguments if isinstance(arguments, str) else json.dumps(arguments)
                     self.last_response_metadata = {
                         "structured_output_mode": "tool_call",
                         "tool_name": function.get("name"),
+                        "tool_call": tool_call,
+                        "assistant_message": {
+                            "role": "assistant",
+                            "content": message.get("content"),
+                            "tool_calls": [tool_call],
+                        },
                     }
                     with self._metrics_lock:
                         self.generation_metrics["structured_tool_calls"] += 1
@@ -714,13 +965,20 @@ class CustomAPIClient:
             else:
                 self.logger.warning("Unexpected Custom API response format")
                 response_text = ""
+                reasoning_text = ""
                 self.last_response_metadata = {
                     "structured_output_mode": "plain_json",
                     "tool_name": None,
                 }
 
+            if not response_text.strip():
+                raise APIResponseError(
+                    "Custom API returned no assistant content or tool-call arguments"
+                )
+
+            completed_clock = time.perf_counter()
             duration_seconds = max(
-                time.perf_counter() - (request_clock or time.perf_counter()),
+                completed_clock - (request_clock or completed_clock),
                 1e-9,
             )
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -728,18 +986,35 @@ class CustomAPIClient:
             completion_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
             token_source = "api"
             if not isinstance(prompt_tokens, int):
-                prompt_tokens = self._estimate_tokens(f"{effective_system}\n{prompt}")
+                prompt_tokens = self._estimate_tokens(
+                    json.dumps(conversation, ensure_ascii=False, default=str)
+                )
                 token_source = "estimated"
             if not isinstance(completion_tokens, int):
-                completion_tokens = self._estimate_tokens(response_text)
+                completion_tokens = self._estimate_tokens(
+                    f"{reasoning_text}\n{response_text}"
+                )
                 token_source = "estimated"
-            tokens_per_second = completion_tokens / duration_seconds
+            if first_output_clock is not None:
+                generation_duration_seconds = max(
+                    completed_clock - first_output_clock,
+                    1e-9,
+                )
+                throughput_scope = "stream_generation_window"
+            else:
+                generation_duration_seconds = duration_seconds
+                throughput_scope = "end_to_end_fallback"
+            tokens_per_second = completion_tokens / generation_duration_seconds
+            end_to_end_tokens_per_second = completion_tokens / duration_seconds
             self.last_response_metadata.update(
                 {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "duration_seconds": duration_seconds,
+                    "generation_duration_seconds": generation_duration_seconds,
                     "tokens_per_second": tokens_per_second,
+                    "end_to_end_tokens_per_second": end_to_end_tokens_per_second,
+                    "throughput_scope": throughput_scope,
                     "token_source": token_source,
                 }
             )
@@ -747,10 +1022,17 @@ class CustomAPIClient:
                 self.generation_metrics["prompt_tokens"] += prompt_tokens
                 self.generation_metrics["completion_tokens"] += completion_tokens
                 self.generation_metrics["duration_seconds"] += duration_seconds
-                self.generation_metrics["tokens_per_second"] = (
-                    self.generation_metrics["completion_tokens"]
-                    / max(self.generation_metrics["duration_seconds"], 1e-9)
+                self.generation_metrics["generation_duration_seconds"] = (
+                    generation_duration_seconds
                 )
+                self.generation_metrics["tokens_per_second"] = tokens_per_second
+                self.generation_metrics["end_to_end_tokens_per_second"] = (
+                    end_to_end_tokens_per_second
+                )
+                self.generation_metrics["throughput_scope"] = throughput_scope
+                self.generation_metrics["current_prompt_tokens"] = 0
+                self.generation_metrics["current_completion_tokens"] = 0
+                self.generation_metrics["current_request_elapsed_seconds"] = 0.0
                 if (
                     self.generation_metrics["token_source"] in {"unavailable", "api"}
                     and token_source == "api"
@@ -787,6 +1069,8 @@ class CustomAPIClient:
             with self._metrics_lock:
                 self.generation_metrics["active"] = False
                 self.generation_metrics["status"] = "failed"
+                self.generation_metrics["current_prompt_tokens"] = 0
+                self.generation_metrics["current_completion_tokens"] = 0
                 self.generation_metrics["last_error"] = error_msg
                 self._write_liveness()
 

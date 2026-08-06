@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,9 +13,10 @@ from typing import Any
 class PortActivity:
     """Small JSONL event sink shared by the detached worker and GUI."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, run_id: str | None = None):
         self.path = Path(path)
         self._lock = threading.Lock()
+        self.run_id = run_id or os.getenv("OGHIDRA_PORT_RUN_ID") or f"manual:{os.getpid()}"
 
     def emit(
         self,
@@ -28,6 +30,7 @@ class PortActivity:
     ) -> None:
         event = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
             "kind": kind,
             "title": title,
             "content": content,

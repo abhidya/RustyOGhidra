@@ -10,6 +10,7 @@ from src.port_scheduler import (
     exact_groups,
     extract_direct_calls,
     fingerprint_instructions,
+    focus_decompile_call_sites,
     normalize_instruction_lines,
     parse_function_line,
     platform_exclusion_reason,
@@ -83,6 +84,30 @@ def test_function_parsing_fingerprints_and_calls_are_address_stable():
     assert extract_direct_calls(first, "0x80001000") == ["0x80003000"]
 
 
+def test_caller_context_keeps_call_site_instead_of_entire_decompile():
+    filler = [f"  value_{index} = {index};" for index in range(200)]
+    lines = [
+        "[Total Lines: 205]",
+        "void initializeActor(void)",
+        "{",
+        *filler,
+        "  result = zz_0005630_() & 7;",
+        "}",
+    ]
+
+    focused = focus_decompile_call_sites(
+        "\n".join(lines),
+        ["zz_0005630_", "80005630"],
+        max_chars=1800,
+        radius_lines=5,
+    )
+
+    assert "void initializeActor" in focused
+    assert "zz_0005630_() & 7" in focused
+    assert "value_0 = 0" not in focused
+    assert len(focused) <= 1800
+
+
 def test_discovers_most_complete_saved_analysis(tmp_path):
     sessions = tmp_path / "analysis_sessions"
     small = sessions / "small" / "session.json"
@@ -102,7 +127,7 @@ def test_platform_exclusion_is_conservative_and_pre_model():
     assert platform_exclusion_reason(
         {"identity": {"name": "FUN_80001000", "thunk": False}},
         {"behavior_summary": "MetroTRK debug monitor initialization"},
-    )
+    ) is None
     assert platform_exclusion_reason(
         {"identity": {"name": "stepCombat", "thunk": False}},
         {"behavior_summary": "updates player combat state"},
@@ -184,7 +209,12 @@ def test_scheduler_sends_first_bundle_to_qwen_before_extracting_the_rest(tmp_pat
                         "caller_count": len(analysis_context["sibling_functions"]["callers"]),
                     }
             )
-            return SourceLoopResult(passed=True, attempts=1, action="exclude")
+            return SourceLoopResult(
+                passed=True,
+                attempts=1,
+                action="edit",
+                files=["apps/game/src/runtime.ts"],
+            )
 
     session = tmp_path / "session.json"
     session.write_text(
@@ -224,9 +254,88 @@ def test_scheduler_sends_first_bundle_to_qwen_before_extracting_the_rest(tmp_pat
             "caller_count": 1,
         }
     ]
-    assert manifest["functions"]["0x80001000"]["port_status"] == "excluded"
+    assert manifest["functions"]["0x80001000"]["port_status"] == "integrated"
     assert manifest["functions"]["0x80002000"]["status"] == "discovered"
     assert manifest["bundles_complete"] is False
+
+
+def test_resume_requeues_old_model_exclusion_and_pre_semantic_integration(tmp_path):
+    root = fake_repo(tmp_path)
+    run_root = root / "research/decomp/generated/finish-game-port"
+    bundle_root = run_root / "bundles"
+    bundle_root.mkdir(parents=True)
+    for address in ("80001000", "80002000"):
+        (bundle_root / f"{address}.bundle.json").write_text(
+            json.dumps(
+                {
+                    "bundle_schema": 1,
+                    "identity": {
+                        "address": address,
+                        "name": f"FUN_{address}",
+                        "thunk": False,
+                    },
+                    "decompiler": {"c": "void gameplay(void) {}"},
+                    "calls": [],
+                    "fingerprints": {"normalized_pcode": address},
+                }
+            ),
+            encoding="utf-8",
+        )
+    manifest = {
+        "manifest_schema": 1,
+        "program": {},
+        "inventory_complete": True,
+        "bundles_complete": False,
+        "groups_complete": False,
+        "functions": {
+            "0x80001000": {
+                "name": "FUN_80001000",
+                "address": "0x80001000",
+                "status": "bundled",
+                "bundle_path": str(bundle_root / "80001000.bundle.json"),
+                "port_status": "excluded",
+            },
+            "0x80002000": {
+                "name": "FUN_80002000",
+                "address": "0x80002000",
+                "status": "bundled",
+                "bundle_path": str(bundle_root / "80002000.bundle.json"),
+                "port_status": "integrated",
+            },
+        },
+        "groups": {
+            "stream-80001000": {
+                "id": "stream-80001000",
+                "canonical_address": "0x80001000",
+                "member_addresses": ["0x80001000"],
+                "status": "excluded",
+            },
+            "stream-80002000": {
+                "id": "stream-80002000",
+                "canonical_address": "0x80002000",
+                "member_addresses": ["0x80002000"],
+                "status": "integrated",
+            },
+        },
+        "schedule": [],
+    }
+    (run_root / "whole-program-manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    scheduler = PortScheduler(
+        repo_root=root,
+        mode="resume",
+        ghidra=FakeGhidra(),
+        llm_factory=lambda: (_ for _ in ()).throw(AssertionError("not called")),
+        max_units=0,
+    )
+
+    assert scheduler.manifest["groups"]["stream-80001000"]["status"] == "queued"
+    assert scheduler.manifest["groups"]["stream-80002000"]["status"] == "queued"
+    assert "port_status" not in scheduler.manifest["functions"]["0x80001000"]
+    assert "port_status" not in scheduler.manifest["functions"]["0x80002000"]
 
 
 def test_scheduler_does_not_turn_service_outage_into_bundle_failures(tmp_path):

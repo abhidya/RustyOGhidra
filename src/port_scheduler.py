@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections import defaultdict, deque
@@ -20,7 +21,7 @@ from src.port_cli import _ghidra_for_config, _llm_for_config
 from src.port_evidence import collect_function_evidence
 from src.port_exporter import export_port_artifact, historical_summary
 from src.port_run_controller import find_gotyaforce_root
-from src.port_source_loop import SequentialSourcePortLoop
+from src.port_source_loop import SequentialSourcePortLoop, VERIFY_COMMANDS
 from src.port_workflow import atomic_write_json
 
 
@@ -41,11 +42,7 @@ TERMINAL_UNIT_STATES = {
     "missing_profile",
     "needs_oracle",
     "bundle_failed",
-    "model_invalid",
-    "evidence_rejected",
 }
-
-
 def discover_analysis_session(oghidra_root: Path) -> Path | None:
     """Use the most complete saved analysis when the GUI has none explicitly loaded."""
     candidates = list((oghidra_root / "analysis_sessions").glob("*/session.json"))
@@ -134,7 +131,8 @@ def platform_exclusion_reason(
     bundle: dict[str, Any],
     session_analysis: dict[str, Any] | None = None,
 ) -> str | None:
-    """Conservatively remove proven non-browser platform/runtime functions before Qwen."""
+    """Conservatively remove proven non-browser functions from fresh identity evidence."""
+    del session_analysis  # Saved analysis is advisory and cannot make terminal decisions.
     identity = bundle.get("identity", {})
     name = str(identity.get("name") or "").strip()
     lowered = name.lower()
@@ -173,24 +171,40 @@ def platform_exclusion_reason(
     if lowered in exact_names or lowered in runtime_names or lowered.startswith(platform_prefixes):
         return f"{name} is a known SDK, toolchain, debug-monitor, or runtime function"
 
-    summary = ""
-    if session_analysis:
-        summary = str(
-            session_analysis.get("behavior_summary")
-            or session_analysis.get("summary")
-            or ""
-        ).lower()
-    strong_markers = (
-        "metrotrk",
-        "debug monitor",
-        "platform-only",
-        "toolchain runtime",
-        "compiler runtime",
-        "standard library implementation",
-    )
-    if any(marker in summary for marker in strong_markers):
-        return "saved analysis classifies this as platform/toolchain/runtime behavior"
     return None
+
+
+def focus_decompile_call_sites(
+    text: str,
+    needles: Iterable[str],
+    *,
+    max_chars: int = 3500,
+    radius_lines: int = 18,
+) -> str:
+    """Keep a caller signature and bounded windows around calls to the target."""
+    lines = text.splitlines()
+    lowered_needles = [needle.lower() for needle in needles if needle]
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if any(needle in line.lower() for needle in lowered_needles)
+    ]
+    if not matches:
+        return text[:max_chars]
+
+    ranges: list[tuple[int, int]] = []
+    for index in matches:
+        start = max(0, index - radius_lines)
+        end = min(len(lines), index + radius_lines + 1)
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+        else:
+            ranges.append((start, end))
+
+    sections = ["\n".join(lines[: min(3, len(lines))])]
+    for start, end in ranges:
+        sections.append(f"[call-site lines {start + 1}-{end}]\n" + "\n".join(lines[start:end]))
+    return "\n\n".join(sections)[:max_chars]
 
 
 def exact_groups(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -293,9 +307,14 @@ class StopRequested(RuntimeError):
     pass
 
 
+class ProviderUnavailable(RuntimeError):
+    pass
+
+
 class PortScheduler:
-    MANIFEST_SCHEMA = 1
+    MANIFEST_SCHEMA = 2
     BUNDLE_SCHEMA = 1
+    PORT_POLICY_VERSION = 2
 
     def __init__(
         self,
@@ -364,6 +383,7 @@ class PortScheduler:
             llm_factory=self.llm_factory,
         )
         self.manifest = self._load_or_create_manifest()
+        self._reconcile_manifest_policy()
         self.state = self._new_state()
         self._save_all()
 
@@ -386,6 +406,96 @@ class PortScheduler:
             "created_at": utc_now(),
             "updated_at": utc_now(),
         }
+
+    def _reconcile_manifest_policy(self) -> None:
+        """Requeue checkpoints accepted under weaker exclusion/integration rules."""
+        self.manifest["manifest_schema"] = self.MANIFEST_SCHEMA
+        if self.mode == "fresh":
+            self.manifest["port_policy_version"] = self.PORT_POLICY_VERSION
+            return
+        groups = self.manifest.get("groups", {})
+        functions = self.manifest.get("functions", {})
+        for group in groups.values():
+            status = group.get("status")
+            address = group.get("canonical_address")
+            preserve = False
+            if status == "model_running" and isinstance(address, str):
+                self._restore_interrupted_source(address)
+            if status == "excluded" and isinstance(address, str):
+                function = functions.get(address, {})
+                bundle_path = function.get("bundle_path")
+                if bundle_path and Path(bundle_path).is_file():
+                    try:
+                        bundle = json.loads(Path(bundle_path).read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        bundle = {}
+                    reason = platform_exclusion_reason(bundle)
+                    if reason:
+                        group["verification"] = reason
+                        group["exclusion_source"] = "deterministic_pre_model"
+                        group["port_policy_version"] = self.PORT_POLICY_VERSION
+                        preserve = True
+            elif (
+                status == "integrated"
+                and group.get("port_policy_version") == self.PORT_POLICY_VERSION
+            ):
+                preserve = True
+            elif status in TERMINAL_UNIT_STATES and status not in {"integrated", "excluded"}:
+                preserve = True
+
+            if status in {
+                "integrated",
+                "excluded",
+                "model_running",
+                "model_invalid",
+                "provider_unavailable",
+            } and not preserve:
+                group["status"] = "queued"
+                group["invalidated_reason"] = (
+                    "checkpoint predates deterministic exclusions and semantic integration gates"
+                )
+                group.pop("error", None)
+                for member in group.get("member_addresses", []):
+                    record = functions.get(member)
+                    if isinstance(record, dict):
+                        record.pop("port_status", None)
+                        record.pop("group_id", None)
+                        record.pop("canonical_address", None)
+        self.manifest["port_policy_version"] = self.PORT_POLICY_VERSION
+
+    def _restore_interrupted_source(self, address: str) -> None:
+        """Restore the pre-attempt files recorded before an interrupted model run."""
+        checkpoint_root = (
+            self.run_root / "source-checkpoints" / address.removeprefix("0x")
+        ).resolve()
+        manifest_path = checkpoint_root / "original-source.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        files = payload.get("files")
+        if not isinstance(files, dict):
+            return
+        repo_root = self.repo_root.resolve()
+        for relative, original in files.items():
+            if not isinstance(relative, str) or not isinstance(original, dict):
+                continue
+            target = (repo_root / relative).resolve()
+            if target != repo_root and repo_root not in target.parents:
+                continue
+            if original.get("existed"):
+                backup_value = original.get("backup")
+                if not isinstance(backup_value, str):
+                    continue
+                backup = Path(backup_value).resolve()
+                if (
+                    backup.is_file()
+                    and (backup == checkpoint_root or checkpoint_root in backup.parents)
+                ):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(backup, target)
+            elif target.is_file():
+                target.unlink()
 
     def _restore_inventory_from_export(self) -> int:
         export_root = self.repo_root / "research" / "decomp" / "ghidra-export"
@@ -895,19 +1005,35 @@ class PortScheduler:
                 callees.append(normalized)
 
         siblings = {"callers": [], "callees": []}
+        identity = bundle.get("identity", {})
+        target_needles = [
+            str(identity.get("name") or ""),
+            address.removeprefix("0x"),
+        ]
+        seen_sibling_code: set[str] = set()
         for direction, addresses in (("callers", callers), ("callees", callees)):
             for sibling_address in addresses[:3]:
                 code = self._decompile_sibling(sibling_address)
                 if code:
+                    focused = focus_decompile_call_sites(code, target_needles)
+                    fingerprint = hashlib.sha256(
+                        focused.encode("utf-8", errors="replace")
+                    ).hexdigest()
+                    if fingerprint in seen_sibling_code:
+                        continue
+                    seen_sibling_code.add(fingerprint)
                     siblings[direction].append(
-                        {"address": sibling_address, "decompiler": code[:6000]}
+                        {"address": sibling_address, "decompiler": focused}
                     )
 
         decompiled = str(bundle.get("decompiler", {}).get("c") or "")
         context = {
             "saved_session_analysis": session_analysis,
             "sibling_functions": siblings,
-            "research_corpus": self._research_context(address, decompiled),
+            "research_corpus": {
+                key: value[:4000]
+                for key, value in self._research_context(address, decompiled).items()
+            },
             "evidence_tools_used": [
                 "get_xrefs_to",
                 "get_xrefs_from",
@@ -933,7 +1059,8 @@ class PortScheduler:
 
     def _process_group(self, group: dict[str, Any]) -> None:
         address = group["canonical_address"]
-        group["attempts"] = int(group.get("attempts", 0)) + 1
+        prior_attempts = int(group.get("attempts", 0))
+        group["attempts"] = prior_attempts + 1
         if self._known_integrated(address):
             group["status"] = "integrated"
             group["verification"] = "existing verified importer profile"
@@ -951,6 +1078,7 @@ class PortScheduler:
             group["status"] = "excluded"
             group["verification"] = exclusion
             group["exclusion_source"] = "deterministic_pre_model"
+            group["port_policy_version"] = self.PORT_POLICY_VERSION
             self._queue_view(group)
             self._save_all()
             self.source_loop.activity.emit(
@@ -978,18 +1106,22 @@ class PortScheduler:
             group["error"] = str(error)
             return
         group["source_files"] = result.files
-        group["attempts"] = result.attempts
+        group["source_repair_attempts"] = int(group.get("source_repair_attempts", 0)) + result.attempts
         group["git_checkpoint"] = result.checkpoint
         if not result.passed:
             group["status"] = "model_invalid"
             group["error"] = result.error
             return
         if result.action == "exclude":
-            group["status"] = "excluded"
-            group["verification"] = "Qwen classified platform/toolchain code outside browser runtime"
+            group["status"] = "model_invalid"
+            group["error"] = (
+                "Model attempted to exclude a scheduler-assigned source unit; "
+                "only deterministic pre-model rules may exclude functions."
+            )
             return
         group["status"] = "integrated"
         group["verification"] = "typecheck, combat build, ROM, game-session, and browser build passed"
+        group["port_policy_version"] = self.PORT_POLICY_VERSION
 
     def process_units(self) -> None:
         self._stage("units", "running")
@@ -1120,7 +1252,45 @@ class PortScheduler:
                     "attempts": 0,
                 },
             )
-            self._process_group(group)
+            while True:
+                self._process_group(group)
+                error_text = str(group.get("error") or "")
+                lowered_error = error_text.lower()
+                transient_model_failure = group.get("status") == "model_invalid" and any(
+                    marker in lowered_error
+                    for marker in (
+                        "connection",
+                        "readerror",
+                        "remoteprotocolerror",
+                        "timed out",
+                        "timeout",
+                        "empty stream",
+                        "service unavailable",
+                        "no model loaded",
+                        "status_code: 429",
+                        "status_code: 500",
+                        "status_code: 502",
+                        "status_code: 503",
+                        "status_code: 504",
+                    )
+                )
+                if transient_model_failure:
+                    group["status"] = "provider_unavailable"
+                    record["port_status"] = "provider_unavailable"
+                    self._queue_view(group)
+                    self.state["status"] = "paused_provider_unavailable"
+                    self.state["pause_reason"] = error_text
+                    self._save_all()
+                    self.source_loop.activity.emit(
+                        "pause",
+                        f"Provider unavailable for {record['address']}",
+                        "Generation paused after one failed request. Resume after the provider health check passes.\n"
+                        + error_text,
+                        address=record["address"],
+                        status="paused",
+                    )
+                    raise ProviderUnavailable(error_text)
+                break
             record["port_status"] = group["status"]
             record["group_id"] = group_id
             record["canonical_address"] = record["address"]
@@ -1188,12 +1358,8 @@ class PortScheduler:
             self._save_all()
             return
         self._stage("acceptance", "running")
-        commands = [
-            ["pnpm", "--filter", "@gf/combat", "build"],
-            ["pnpm", "selfcheck:rom"],
-            ["pnpm", "--filter", "game", "build"],
-        ]
-        for command in commands:
+        for command_tuple in VERIFY_COMMANDS:
+            command = list(command_tuple)
             result = subprocess.run(
                 command,
                 cwd=self.repo_root,
@@ -1206,7 +1372,11 @@ class PortScheduler:
                 self.state["status"] = "failed"
                 self._save_all()
                 return
-        self._stage("acceptance", "passed", "combat, ROM, and browser builds passed")
+        self._stage(
+            "acceptance",
+            "passed",
+            "typecheck, combat, ROM, game-session, browser build, and browser smoke passed",
+        )
         self.state["status"] = "completed"
         self.state["completed_at"] = utc_now()
         self._save_all()
@@ -1223,6 +1393,12 @@ class PortScheduler:
             self.state["stopped_at"] = utc_now()
             self._save_all()
             return 2
+        except ProviderUnavailable as error:
+            self.state["status"] = "paused_provider_unavailable"
+            self.state["pause_reason"] = str(error)
+            self.state["paused_at"] = utc_now()
+            self._save_all()
+            return 4
         except Exception as error:
             self.state["status"] = "failed"
             self.state["error"] = str(error)
@@ -1238,7 +1414,57 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--session")
     parser.add_argument("--max-bundles", type=int)
     parser.add_argument("--max-units", type=int)
+    parser.add_argument("--chunk")
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--analyze-chunk", action="store_true")
+    operation.add_argument("--list-units", action="store_true")
+    operation.add_argument("--port-unit")
+    parser.add_argument("--model-response")
+    parser.add_argument("--deterministic-analysis", action="store_true")
+    parser.add_argument(
+        "--legacy-address-stream",
+        action="store_true",
+        help="Explicitly run the deprecated address-by-address whole-program walker",
+    )
     args = parser.parse_args(argv)
+    if not args.legacy_address_stream:
+        from src.port_chunk_workflow import (
+            ChunkPortWorkflow,
+            ProviderUnavailable as ChunkProviderUnavailable,
+        )
+
+        # Mirror PortScheduler.__init__ (lines ~339-342): the LLM client reads
+        # these at construction to publish llm-liveness.json. Without them the
+        # chunk path runs with liveness reporting silently disabled, which left
+        # api_calls/structured_tool_calls frozen at their 2026-08-01 values
+        # while the workflow was actually running.
+        chunk_run_root = (
+            find_gotyaforce_root(None) / "research" / "decomp" / "generated" / "finish-game-port"
+        )
+        os.environ.setdefault("OGHIDRA_PORT_LIVENESS_PATH", str(chunk_run_root / "llm-liveness.json"))
+        os.environ.setdefault("OGHIDRA_PORT_RUN_ID", utc_now())
+
+        chunk = args.chunk or "chunk_0048"
+        workflow = ChunkPortWorkflow()
+        try:
+            if args.list_units:
+                units = workflow.list_units(chunk)
+                print(json.dumps([unit.model_dump(mode="json") for unit in units], indent=2))
+                return 0
+            if args.port_unit:
+                result = workflow.port_unit(chunk, args.port_unit)
+                print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
+                return 0 if result.passed else 3
+            analysis = workflow.analyze(
+                chunk,
+                model_response=args.model_response,
+                deterministic_only=args.deterministic_analysis,
+            )
+            print(json.dumps(analysis.model_dump(mode="json"), indent=2))
+            return 0
+        except ChunkProviderUnavailable as error:
+            print(f"Chunk analysis paused: {error}")
+            return 4
     scheduler = PortScheduler(
         mode=args.mode,
         session_path=args.session or os.getenv("OGHIDRA_ACTIVE_SESSION"),

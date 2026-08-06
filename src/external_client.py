@@ -8,6 +8,8 @@ Currently implements Google Gemini v1beta interface.
 
 import json
 import logging
+import logging.handlers
+import os
 import requests
 import time
 from datetime import datetime
@@ -95,8 +97,14 @@ class ExternalClient:
         # Remove any existing handlers
         self.llm_logger.handlers.clear()
 
-        # Add file handler
-        file_handler = logging.FileHandler(self.llm_log_file, encoding="utf-8")
+        # Add file handler (rotating: llm_log_prompts writes full prompts, which
+        # grew an unbounded FileHandler log to 443 MB)
+        file_handler = logging.handlers.RotatingFileHandler(
+            self.llm_log_file,
+            maxBytes=int(os.getenv("LLM_LOG_MAX_BYTES", str(50 * 1024 * 1024))),
+            backupCount=int(os.getenv("LLM_LOG_BACKUP_COUNT", "5")),
+            encoding="utf-8",
+        )
         file_handler.setLevel(logging.INFO)
 
         # Format depends on log format setting

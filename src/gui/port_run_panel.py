@@ -360,7 +360,19 @@ class PortRunPanel:
             else f"{snapshot.stages_per_minute:.2f} stages/min"
         )
         if snapshot.model_active:
-            throughput = "measuring active response"
+            if snapshot.current_completion_tokens:
+                throughput = (
+                    f"Streaming · {snapshot.tokens_per_second:.1f} tok/s · "
+                    f"{snapshot.current_prompt_tokens:,} prompt / "
+                    f"{snapshot.current_completion_tokens:,} generated · "
+                    f"{format_duration(snapshot.current_request_elapsed_seconds)} elapsed"
+                )
+            else:
+                throughput = (
+                    f"Model request active · {snapshot.current_prompt_tokens:,} estimated prompt tokens · "
+                    "awaiting first provider event · "
+                    f"{format_duration(snapshot.current_request_elapsed_seconds)} elapsed"
+                )
         elif snapshot.completion_tokens:
             source = "API usage" if snapshot.token_source == "api" else "estimated tokens"
             throughput = (
