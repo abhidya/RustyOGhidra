@@ -267,13 +267,17 @@ def parse_chunk_export(
             target = name_to_address.get(call.group("name"))
             if target and target != address and target not in direct_calls:
                 direct_calls.append(target)
+        marker_name = marker.group("name").strip()
+        if SESSION_NAME_JUNK.match(marker_name):
+            # Session-rename enrichment (R23): the session corpus supplies real
+            # names where the export only has FUN_/LAB_/zz_ placeholders. Real
+            # export names are never overridden -- they are themselves curated
+            # (e.g. dispatch_challenge_flow_state) and anchor product priorities.
+            marker_name = (rename_map or {}).get(address) or marker_name
         functions.append(
             ChunkFunction(
                 address=address,
-                # Session-rename enrichment (R23): the 6,580-function session
-                # corpus supplies real names where the export only has FUN_/zz_
-                # placeholders; entry symbols and prompts inherit them.
-                name=(rename_map or {}).get(address) or marker.group("name").strip(),
+                name=marker_name,
                 source_start_line=text.count("\n", 0, marker.start()) + 1,
                 source_end_line=(
                     text.count("\n", 0, end)
@@ -528,11 +532,16 @@ class ChunkPortWorkflow:
         for function in analysis.functions:
             if isinstance(function, dict):
                 address = str(function.get("address"))
-                if address in rename:
+                if address in rename and SESSION_NAME_JUNK.match(str(function.get("name") or "")):
                     function["name"] = rename[address]
         for unit in analysis.units:
             enriched = []
             for symbol in unit.runtime_entry_symbols:
+                if not SESSION_NAME_JUNK.match(symbol):
+                    # Real export names are authoritative; only placeholders
+                    # (FUN_/LAB_/zz_) are eligible for substitution.
+                    enriched.append(symbol)
+                    continue
                 address = address_by_name.get(symbol)
                 if address is None:
                     # FUN_/LAB_ placeholders literally encode their address.
