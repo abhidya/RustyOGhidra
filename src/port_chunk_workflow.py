@@ -33,6 +33,9 @@ ANALYSIS_PROVENANCE_RANK = {"deterministic": 0, "saved_model_response": 1, "mode
 # Entry symbols that are raw decompiler placeholders cannot pass the runtime
 # reachability gate, so generating for them is guaranteed waste (G10/R13).
 PLACEHOLDER_ENTRY_SYMBOL = re.compile(r"^(?:FUN|LAB)_[0-9a-fA-F]{8}$")
+# Session-corpus names that are themselves placeholders (zz_ mangles included)
+# carry no naming signal and must not be used for enrichment.
+SESSION_NAME_JUNK = re.compile(r"^(?:FUN|LAB)_[0-9a-fA-F]{8}$|^zz_[0-9a-fA-F]+_?$")
 PORTABLE_CLASSIFICATIONS = {"game_owned", "shared_runtime"}
 CHUNK_MARKER = re.compile(
     r"^// ==== (?P<address>[0-9a-fA-F]{8})\s+(?P<name>.+?) ====$",
@@ -237,7 +240,12 @@ def _index_names(export_root: Path) -> dict[str, str]:
     return result
 
 
-def parse_chunk_export(repo_root: str | Path, chunk: str) -> ParsedChunk:
+def parse_chunk_export(
+    repo_root: str | Path,
+    chunk: str,
+    *,
+    rename_map: dict[str, str] | None = None,
+) -> ParsedChunk:
     root = Path(repo_root).resolve()
     export_root = root / "research" / "decomp" / "ghidra-export"
     name = normalize_chunk_name(chunk)
@@ -262,7 +270,10 @@ def parse_chunk_export(repo_root: str | Path, chunk: str) -> ParsedChunk:
         functions.append(
             ChunkFunction(
                 address=address,
-                name=marker.group("name").strip(),
+                # Session-rename enrichment (R23): the 6,580-function session
+                # corpus supplies real names where the export only has FUN_/zz_
+                # placeholders; entry symbols and prompts inherit them.
+                name=(rename_map or {}).get(address) or marker.group("name").strip(),
                 source_start_line=text.count("\n", 0, marker.start()) + 1,
                 source_end_line=(
                     text.count("\n", 0, end)
@@ -471,6 +482,65 @@ class ChunkPortWorkflow:
         self.run_id = os.getenv("OGHIDRA_PORT_RUN_ID") or utc_now()
         self.llm_factory = llm_factory or self._default_llm_factory
         self.state_path = self.run_root.parent / "run-state.json"
+        self.session_index_path = self.run_root.parent / "session-index.json"
+        self._session_functions_cache: dict[str, dict[str, Any]] | None = None
+
+    def _session_functions(self) -> dict[str, dict[str, Any]]:
+        """Address-keyed {name, summary} view of session-index.json; {} when absent."""
+        if self._session_functions_cache is None:
+            functions: dict[str, dict[str, Any]] = {}
+            try:
+                payload = json.loads(self.session_index_path.read_text(encoding="utf-8"))
+                raw = payload.get("functions", {})
+                if isinstance(raw, dict):
+                    functions = {
+                        address: entry
+                        for address, entry in raw.items()
+                        if isinstance(entry, dict)
+                    }
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                functions = {}
+            self._session_functions_cache = functions
+        return self._session_functions_cache
+
+    def _rename_map(self) -> dict[str, str]:
+        return {
+            address: name
+            for address, entry in self._session_functions().items()
+            if (name := str(entry.get("name") or "")) and not SESSION_NAME_JUNK.match(name)
+        }
+
+    def _enrich_units(self, analysis: ChunkAnalysis) -> ChunkAnalysis:
+        """Apply session renames to an already-saved analysis, in memory only.
+
+        Analyses written before the session index existed carry FUN_/zz_
+        placeholder entry symbols; substituting the corpus names here unlocks
+        eligibility (G10) without touching the paid-for artifact on disk.
+        """
+        rename = self._rename_map()
+        if not rename:
+            return analysis
+        address_by_name = {
+            str(function.get("name")): str(function.get("address"))
+            for function in analysis.functions
+            if isinstance(function, dict)
+        }
+        for function in analysis.functions:
+            if isinstance(function, dict):
+                address = str(function.get("address"))
+                if address in rename:
+                    function["name"] = rename[address]
+        for unit in analysis.units:
+            enriched = []
+            for symbol in unit.runtime_entry_symbols:
+                address = address_by_name.get(symbol)
+                if address is None:
+                    # FUN_/LAB_ placeholders literally encode their address.
+                    placeholder = re.fullmatch(r"(?:FUN|LAB)_([0-9a-fA-F]{8})", symbol)
+                    address = f"0x{placeholder.group(1).lower()}" if placeholder else None
+                enriched.append((rename.get(address) if address else None) or symbol)
+            unit.runtime_entry_symbols = list(dict.fromkeys(enriched))
+        return analysis
 
     @staticmethod
     def _default_llm_factory() -> tuple[Any, str, str]:
@@ -553,7 +623,7 @@ class ChunkPortWorkflow:
         deterministic_only: bool = False,
         force: bool = False,
     ) -> ChunkAnalysis:
-        chunk = parse_chunk_export(self.repo_root, chunk_name)
+        chunk = parse_chunk_export(self.repo_root, chunk_name, rename_map=self._rename_map())
         # Reuse instead of re-analyzing (G3/G5): a matching sha means the on-disk
         # artifact is still valid, so re-running must cost zero model requests (R7).
         # Provenance upgrades (deterministic -> model) are the driver's decision;
@@ -569,7 +639,7 @@ class ChunkPortWorkflow:
                 units=len(existing.units),
                 analysis=str(self.analysis_path(chunk.name)),
             )
-            return existing
+            return self._enrich_units(existing)
         deterministic = build_deterministic_analysis(chunk)
         self._write_state(chunk.name, status="analyzing", model_requests=0)
         if deterministic_only:
@@ -657,14 +727,14 @@ class ChunkPortWorkflow:
         parsed = parse_chunk_export(self.repo_root, chunk)
         if analysis.chunk_sha256 != parsed.sha256:
             raise ValueError("chunk export changed after analysis; rerun --analyze-chunk")
-        return analysis
+        return self._enrich_units(analysis)
 
     def list_units(self, chunk: str) -> list[ExecutionUnit]:
         return self.load_analysis(chunk).units
 
     def port_unit(self, chunk_name: str, unit_id: str) -> SourceLoopResult | UnitSkipResult:
         analysis = self.load_analysis(chunk_name)
-        chunk = parse_chunk_export(self.repo_root, chunk_name)
+        chunk = parse_chunk_export(self.repo_root, chunk_name, rename_map=self._rename_map())
         unit = next((candidate for candidate in analysis.units if candidate.id == unit_id), None)
         if unit is None:
             raise KeyError(f"unknown execution unit {unit_id!r}")
@@ -713,6 +783,15 @@ class ChunkPortWorkflow:
             "fingerprints": {"chunk": chunk.sha256},
         }
         self._write_state(chunk.name, status="porting", unit=unit.id, model_requests=0)
+        session = self._session_functions()
+        session_summaries = {
+            address: {
+                "name": session[address].get("name"),
+                "summary": session[address].get("summary"),
+            }
+            for address in unit.function_addresses
+            if address in session
+        }
         result = source_loop.run(
             address=entry_address,
             aliases=unit.function_addresses,
@@ -721,6 +800,9 @@ class ChunkPortWorkflow:
                 "execution_unit": unit.model_dump(mode="json"),
                 "chunk": chunk.name,
                 "cross_chunk_dependencies": unit.external_dependencies,
+                # Advisory grounding from the curated session corpus (R23);
+                # the source loop frames it as saved analysis, fresh evidence wins.
+                "saved_session_analysis": session_summaries,
             },
             required_context_paths=set(unit.target_source_paths),
             required_runtime_symbols=unit.runtime_entry_symbols,

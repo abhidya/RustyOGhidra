@@ -1419,6 +1419,22 @@ def main(argv: list[str] | None = None) -> int:
     operation.add_argument("--analyze-chunk", action="store_true")
     operation.add_argument("--list-units", action="store_true")
     operation.add_argument("--port-unit")
+    operation.add_argument(
+        "--drive",
+        action="store_true",
+        help="Autonomous driver: one durable step (analyze or port one unit) per --units",
+    )
+    operation.add_argument(
+        "--build-session-index",
+        action="store_true",
+        help="Merge analysis_sessions/*/session.json into session-index.json (latest wins)",
+    )
+    parser.add_argument("--units", type=int, default=1, help="Durable steps per --drive run")
+    parser.add_argument(
+        "--until-blocked",
+        action="store_true",
+        help="Keep driving until no work remains or the provider pauses",
+    )
     parser.add_argument("--model-response")
     parser.add_argument("--deterministic-analysis", action="store_true")
     parser.add_argument(
@@ -1480,6 +1496,30 @@ def main(argv: list[str] | None = None) -> int:
         if control_command in {"stop_after_stage", "pause_after_stage"}:
             print(f"control.json requests {control_command}; not starting chunk work")
             return 2
+
+        if args.build_session_index:
+            from src.port_driver import build_session_index
+
+            sessions_root = Path(__file__).resolve().parent.parent / "analysis_sessions"
+            index = build_session_index(
+                sessions_root, chunk_run_root / "session-index.json"
+            )
+            print(
+                json.dumps(
+                    {
+                        "sessions_merged": index["sessions_merged"],
+                        "function_count": index["function_count"],
+                        "output": str(chunk_run_root / "session-index.json"),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        if args.drive:
+            from src.port_driver import PortDriver
+
+            driver = PortDriver(units_budget=args.units, until_blocked=args.until_blocked)
+            return driver.run()
 
         chunk = args.chunk or "chunk_0048"
         workflow = ChunkPortWorkflow()

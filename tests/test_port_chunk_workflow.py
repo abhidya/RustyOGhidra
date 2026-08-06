@@ -221,6 +221,39 @@ def test_port_unit_skips_placeholder_only_entry_symbols_without_model_calls(tmp_
     assert result.eligibility == "ineligible_fun_entry"
 
 
+def test_session_index_enrichment_unlocks_placeholder_entry_symbols(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    run_root = root / "research/decomp/generated/finish-game-port"
+    run_root.mkdir(parents=True)
+    (run_root / "session-index.json").write_text(
+        json.dumps(
+            {
+                "index_schema": 1,
+                "functions": {
+                    "0x80001000": {
+                        "name": "dispatch_challenge_flow_state",
+                        "summary": "Drives the challenge flow state machine.",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    workflow.analyze(
+        "chunk_0048",
+        model_response=write_saved_response(tmp_path, entry_symbols=["FUN_80001000"]),
+    )
+
+    listed = workflow.list_units("chunk_0048")
+
+    controller = next(item for item in listed if item.id == "challenge-controller")
+    assert controller.runtime_entry_symbols == ["dispatch_challenge_flow_state"]
+    from src.port_chunk_workflow import unit_eligibility as eligibility
+
+    assert eligibility(controller) == ("eligible", "")
+
+
 def test_unit_eligibility_accepts_named_game_entry():
     from src.port_chunk_workflow import ExecutionUnit
 

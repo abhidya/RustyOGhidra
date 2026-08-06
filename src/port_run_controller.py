@@ -188,12 +188,14 @@ class PortRunController:
         python = self.oghidra_root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         if not python.is_file():
             python = Path(sys.executable)
+        # Every mode maps to the driver: it resumes from the durable ledger, so
+        # "fresh" (which once wiped 1,105 bundle registrations) no longer exists
+        # as a launch concept (G2/G3/G4/D9).
         return [
             str(python),
             str(self.oghidra_root / "main.py"),
             "finish-port",
-            "--mode",
-            mode,
+            "--drive",
         ]
 
     def process_pid(self) -> int | None:
@@ -496,16 +498,10 @@ class PortRunController:
             if isinstance(configured_total, int) and configured_total >= len(stages)
             else len(stages)
         )
-        scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
         queue_payload = payload.get("queue")
         if not isinstance(queue_payload, list):
-            queue_payload = [
-                {
-                    "address": scope.get("function_address", "0x8012b458"),
-                    "family": scope.get("production_family", "Eagle Jet"),
-                    "status": payload.get("promotion", {}).get("status", payload.get("status", "queued")),
-                }
-            ] if payload else []
+            # No fabricated placeholder rows (G24/R21): an absent queue renders empty.
+            queue_payload = []
         elapsed, eta, eta_source = self._elapsed_and_eta(payload, stages)
         work_progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
         if isinstance(work_progress.get("percent"), (int, float)):
