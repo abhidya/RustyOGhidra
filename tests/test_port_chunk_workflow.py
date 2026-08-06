@@ -7,8 +7,10 @@ from src.port_activity import PortActivity
 from src.port_chunk_workflow import (
     ChunkPortWorkflow,
     ProviderUnavailable,
+    UnitSkipResult,
     build_deterministic_analysis,
     parse_chunk_export,
+    unit_eligibility,
 )
 
 
@@ -123,6 +125,140 @@ def test_analysis_from_saved_model_response_is_one_shot_and_list_is_offline(tmp_
     assert analysis.generated_by == "saved_model_response"
     assert [unit.id for unit in listed] == ["challenge-controller", "gx-host"]
     assert workflow.analysis_path("chunk_0048").is_file()
+
+
+def write_saved_response(tmp_path: Path, *, entry_symbols: list[str]) -> Path:
+    response = tmp_path / "analysis-response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "units": [
+                    {
+                        "id": "challenge-controller",
+                        "label": "Challenge controller",
+                        "classification": "game_owned",
+                        "summary": "Owns challenge selection state.",
+                        "function_addresses": ["0x80001000", "0x80001020"],
+                        "runtime_entry_symbols": entry_symbols,
+                    },
+                    {
+                        "id": "gx-host",
+                        "label": "GX host boundary",
+                        "classification": "hardware_or_sdk",
+                        "summary": "Host graphics initialization.",
+                        "function_addresses": ["0x80002000"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return response
+
+
+def test_analyze_reuses_matching_analysis_with_zero_model_requests(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    seeded = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    seeded.analyze(
+        "chunk_0048",
+        model_response=write_saved_response(tmp_path, entry_symbols=["challenge_root"]),
+    )
+
+    rerun = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    analysis = rerun.analyze("chunk_0048")
+
+    assert analysis.generated_by == "saved_model_response"
+    state = json.loads(rerun.state_path.read_text(encoding="utf-8"))
+    assert state["model_requests"] == 0
+    assert state["reused_existing_analysis"] is True
+
+
+def test_analyze_never_downgrades_existing_analysis_unless_forced(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    workflow.analyze(
+        "chunk_0048",
+        model_response=write_saved_response(tmp_path, entry_symbols=["challenge_root"]),
+    )
+
+    kept = workflow.analyze("chunk_0048", deterministic_only=True)
+    forced = workflow.analyze("chunk_0048", deterministic_only=True, force=True)
+
+    assert kept.generated_by == "saved_model_response"
+    assert forced.generated_by == "deterministic"
+
+
+def test_port_unit_skips_non_portable_classification_without_model_calls(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    workflow.analyze(
+        "chunk_0048",
+        model_response=write_saved_response(tmp_path, entry_symbols=["challenge_root"]),
+    )
+
+    result = workflow.port_unit("chunk_0048", "gx-host")
+
+    assert isinstance(result, UnitSkipResult)
+    assert result.eligibility == "ineligible_classification"
+    assert result.model_requests == 0
+    state = json.loads(workflow.state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "unit_skipped"
+
+
+def test_port_unit_skips_placeholder_only_entry_symbols_without_model_calls(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    workflow.analyze(
+        "chunk_0048",
+        model_response=write_saved_response(
+            tmp_path, entry_symbols=["FUN_80001000", "LAB_80001020"]
+        ),
+    )
+
+    result = workflow.port_unit("chunk_0048", "challenge-controller")
+
+    assert isinstance(result, UnitSkipResult)
+    assert result.eligibility == "ineligible_fun_entry"
+
+
+def test_unit_eligibility_accepts_named_game_entry():
+    from src.port_chunk_workflow import ExecutionUnit
+
+    unit = ExecutionUnit(
+        id="challenge-controller",
+        label="Challenge controller",
+        classification="game_owned",
+        summary="",
+        function_addresses=["0x80001000"],
+        runtime_entry_symbols=["FUN_80001000", "dispatch_challenge_flow_state"],
+    )
+
+    assert unit_eligibility(unit) == ("eligible", "")
+
+
+def test_cli_rejects_legacy_only_flags_on_chunk_path():
+    from src.port_scheduler import main
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--mode", "resume"])
+
+    assert excinfo.value.code == 2
+
+
+def test_cli_honors_control_stop_before_any_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import src.port_scheduler as port_scheduler
+
+    root = fixture_repo(tmp_path)
+    run_root = root / "research/decomp/generated/finish-game-port"
+    run_root.mkdir(parents=True)
+    (run_root / "control.json").write_text(
+        json.dumps({"command": "stop_after_stage"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(port_scheduler, "find_gotyaforce_root", lambda _=None: root)
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    monkeypatch.delenv("OGHIDRA_PORT_RUN_ID", raising=False)
+
+    assert port_scheduler.main(["--chunk", "chunk_0048"]) == 2
 
 
 def test_provider_failure_pauses_after_one_analysis_request(tmp_path: Path):

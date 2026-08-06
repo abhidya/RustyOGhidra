@@ -28,6 +28,12 @@ from src.port_source_loop import (
 
 
 CHUNK_ANALYSIS_SCHEMA = 1
+# Rank provenance so a cheap re-run can never clobber a paid-for artifact (G6/R8).
+ANALYSIS_PROVENANCE_RANK = {"deterministic": 0, "saved_model_response": 1, "model": 2}
+# Entry symbols that are raw decompiler placeholders cannot pass the runtime
+# reachability gate, so generating for them is guaranteed waste (G10/R13).
+PLACEHOLDER_ENTRY_SYMBOL = re.compile(r"^(?:FUN|LAB)_[0-9a-fA-F]{8}$")
+PORTABLE_CLASSIFICATIONS = {"game_owned", "shared_runtime"}
 CHUNK_MARKER = re.compile(
     r"^// ==== (?P<address>[0-9a-fA-F]{8})\s+(?P<name>.+?) ====$",
     re.MULTILINE,
@@ -91,6 +97,43 @@ def slug(value: str) -> str:
 
 class ProviderUnavailable(RuntimeError):
     """The external model provider is offline; callers must pause, not retry generation."""
+
+
+class UnitSkipResult(BaseModel):
+    """Typed no-work outcome: the unit cannot pass validation, so nothing was generated (R13)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skipped: Literal[True] = True
+    passed: Literal[False] = False
+    unit_id: str
+    eligibility: Literal["ineligible_classification", "ineligible_fun_entry"]
+    reason: str
+    model_requests: Literal[0] = 0
+
+
+def unit_eligibility(unit: "ExecutionUnit") -> tuple[str, str]:
+    """Decide before any generation whether a unit can possibly pass the gates.
+
+    Returns ("eligible", "") or an (eligibility, reason) pair matching UnitSkipResult.
+    """
+    if unit.classification not in PORTABLE_CLASSIFICATIONS:
+        return (
+            "ineligible_classification",
+            f"classification {unit.classification!r} is implemented as a host/data adapter, not a source port",
+        )
+    named_entries = [
+        symbol
+        for symbol in unit.runtime_entry_symbols
+        if not PLACEHOLDER_ENTRY_SYMBOL.match(symbol)
+    ]
+    if not named_entries:
+        return (
+            "ineligible_fun_entry",
+            "no runtime entry symbol survives the FUN_/LAB_ placeholder filter; "
+            "the reachability gate would reject the port after paying full generation",
+        )
+    return ("eligible", "")
 
 
 class ChunkFunction(BaseModel):
@@ -489,14 +532,44 @@ class ChunkPortWorkflow:
             units=payload.units,
         )
 
+    def _existing_analysis(self, chunk: ParsedChunk) -> ChunkAnalysis | None:
+        """Return the on-disk analysis when it still matches the chunk export, else None."""
+        path = self.analysis_path(chunk.name)
+        if not path.is_file():
+            return None
+        try:
+            analysis = ChunkAnalysis.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if analysis.chunk_sha256 != chunk.sha256:
+            return None
+        return analysis
+
     def analyze(
         self,
         chunk_name: str,
         *,
         model_response: str | Path | None = None,
         deterministic_only: bool = False,
+        force: bool = False,
     ) -> ChunkAnalysis:
         chunk = parse_chunk_export(self.repo_root, chunk_name)
+        # Reuse instead of re-analyzing (G3/G5): a matching sha means the on-disk
+        # artifact is still valid, so re-running must cost zero model requests (R7).
+        # Provenance upgrades (deterministic -> model) are the driver's decision;
+        # --force-reanalyze is the owner's override.
+        existing = None if force else self._existing_analysis(chunk)
+        if existing is not None:
+            self._write_state(
+                chunk.name,
+                status="analyzed",
+                model_requests=0,
+                reused_existing_analysis=True,
+                generated_by=existing.generated_by,
+                units=len(existing.units),
+                analysis=str(self.analysis_path(chunk.name)),
+            )
+            return existing
         deterministic = build_deterministic_analysis(chunk)
         self._write_state(chunk.name, status="analyzing", model_requests=0)
         if deterministic_only:
@@ -589,16 +662,24 @@ class ChunkPortWorkflow:
     def list_units(self, chunk: str) -> list[ExecutionUnit]:
         return self.load_analysis(chunk).units
 
-    def port_unit(self, chunk_name: str, unit_id: str) -> SourceLoopResult:
+    def port_unit(self, chunk_name: str, unit_id: str) -> SourceLoopResult | UnitSkipResult:
         analysis = self.load_analysis(chunk_name)
         chunk = parse_chunk_export(self.repo_root, chunk_name)
         unit = next((candidate for candidate in analysis.units if candidate.id == unit_id), None)
         if unit is None:
             raise KeyError(f"unknown execution unit {unit_id!r}")
-        if unit.classification in {"hardware_or_sdk", "data_or_table"}:
-            raise ValueError(
-                f"unit {unit.id} is classified {unit.classification}; implement it as a host/data adapter, not a source port"
+        eligibility, reason = unit_eligibility(unit)
+        if eligibility != "eligible":
+            # Skip before any generation (G10/G15/R13): an ineligible unit is a
+            # recorded outcome, not a crash, and must cost zero model requests.
+            self._write_state(
+                chunk.name,
+                status="unit_skipped",
+                unit=unit.id,
+                eligibility=eligibility,
+                model_requests=0,
             )
+            return UnitSkipResult(unit_id=unit.id, eligibility=eligibility, reason=reason)
         selected = {
             function.address: function
             for function in chunk.functions

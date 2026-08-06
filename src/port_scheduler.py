@@ -1410,7 +1410,7 @@ class PortScheduler:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["fresh", "resume", "replay"], default="fresh")
+    parser.add_argument("--mode", choices=["fresh", "resume", "replay"], default=None)
     parser.add_argument("--session")
     parser.add_argument("--max-bundles", type=int)
     parser.add_argument("--max-units", type=int)
@@ -1422,15 +1422,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-response")
     parser.add_argument("--deterministic-analysis", action="store_true")
     parser.add_argument(
+        "--force-reanalyze",
+        action="store_true",
+        help="Re-run chunk analysis even when a matching analysis.json already exists",
+    )
+    parser.add_argument(
         "--legacy-address-stream",
         action="store_true",
         help="Explicitly run the deprecated address-by-address whole-program walker",
     )
     args = parser.parse_args(argv)
     if not args.legacy_address_stream:
+        # Flags below only drive the legacy scheduler. Silently accepting them
+        # here is how the supervisor believed it was resuming a whole-program
+        # run while actually re-analyzing one chunk (G2/R2): fail loudly.
+        ignored = [
+            flag
+            for flag, value in (
+                ("--mode", args.mode),
+                ("--session", args.session),
+                ("--max-bundles", args.max_bundles),
+                ("--max-units", args.max_units),
+            )
+            if value is not None
+        ]
+        if ignored:
+            parser.error(
+                f"{', '.join(ignored)} only affect the legacy scheduler and would be "
+                "ignored on the chunk path; pass --legacy-address-stream to use them, "
+                "or drop them for chunk operations"
+            )
         from src.port_chunk_workflow import (
             ChunkPortWorkflow,
             ProviderUnavailable as ChunkProviderUnavailable,
+            UnitSkipResult,
         )
 
         # Mirror PortScheduler.__init__ (lines ~339-342): the LLM client reads
@@ -1444,6 +1469,18 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.setdefault("OGHIDRA_PORT_LIVENESS_PATH", str(chunk_run_root / "llm-liveness.json"))
         os.environ.setdefault("OGHIDRA_PORT_RUN_ID", utc_now())
 
+        # One control check before any work (subset of PortScheduler._check_control):
+        # the chunk path previously honored stop requests only via SIGKILL.
+        try:
+            control_command = json.loads(
+                (chunk_run_root / "control.json").read_text(encoding="utf-8")
+            ).get("command", "run")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            control_command = "run"
+        if control_command in {"stop_after_stage", "pause_after_stage"}:
+            print(f"control.json requests {control_command}; not starting chunk work")
+            return 2
+
         chunk = args.chunk or "chunk_0048"
         workflow = ChunkPortWorkflow()
         try:
@@ -1454,11 +1491,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.port_unit:
                 result = workflow.port_unit(chunk, args.port_unit)
                 print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
+                if isinstance(result, UnitSkipResult):
+                    return 0
                 return 0 if result.passed else 3
             analysis = workflow.analyze(
                 chunk,
                 model_response=args.model_response,
                 deterministic_only=args.deterministic_analysis,
+                force=args.force_reanalyze,
             )
             print(json.dumps(analysis.model_dump(mode="json"), indent=2))
             return 0
@@ -1466,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Chunk analysis paused: {error}")
             return 4
     scheduler = PortScheduler(
-        mode=args.mode,
+        mode=args.mode or "fresh",
         session_path=args.session or os.getenv("OGHIDRA_ACTIVE_SESSION"),
         max_bundles=args.max_bundles,
         max_units=args.max_units,
