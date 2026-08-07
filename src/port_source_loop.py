@@ -24,6 +24,7 @@ from pydantic_ai import (
     TextPartDelta,
     ThinkingPartDelta,
     PromptedOutput,
+    TextOutput,
     ToolCallPartDelta,
     ToolOutput,
     UsageLimits,
