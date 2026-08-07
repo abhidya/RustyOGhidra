@@ -1394,6 +1394,59 @@ class SequentialSourcePortLoop:
         return patch.model_dump_json(), "pydantic_ai_tool", transcript
 
     @staticmethod
+    def _load_previous_patch(checkpoint_root: Path) -> dict[str, Any] | None:
+        """Seed the cross-run ratchet from the newest archived attempt.
+
+        Prefers the newest validated patch.json; falls back to parsing the
+        newest response.txt tolerantly (malformed edits dropped -- the result
+        is advisory prompt context, never applied directly).
+        """
+        attempts = sorted(
+            (d for d in checkpoint_root.glob("attempt-*") if d.is_dir()),
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        for attempt_dir in attempts:
+            patch_path = attempt_dir / "patch.json"
+            if patch_path.is_file():
+                try:
+                    payload = json.loads(patch_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key in {"summary", "action", "files"}
+                }
+                try:
+                    return BrowserSourcePatch.model_validate(payload).model_dump(mode="json")
+                except ValidationError:
+                    continue
+        for attempt_dir in attempts:
+            response_path = attempt_dir / "response.txt"
+            if not response_path.is_file():
+                continue
+            try:
+                raw = response_path.read_text(encoding="utf-8")
+                payload = _json_payload(raw)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            files = payload.get("files")
+            if isinstance(files, list):
+                for entry in files:
+                    if isinstance(entry, dict) and isinstance(entry.get("edits"), list):
+                        entry["edits"] = [
+                            edit
+                            for edit in entry["edits"]
+                            if isinstance(edit, dict) and (edit.get("find") or "").strip()
+                        ]
+            try:
+                return BrowserSourcePatch.model_validate(payload).model_dump(mode="json")
+            except ValidationError:
+                continue
+        return None
+
+    @staticmethod
     def _readable_prompt(
         address: str,
         aliases: list[str],
@@ -1634,8 +1687,11 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
         # regenerating from scratch. Without this, a near-passing attempt
         # (applied + one gate from green) was discarded and the next attempt
         # rolled new dice on file placement, wiring, and aliases -- observed
-        # repeatedly on challenge_menu_objects 2026-08-07.
-        previous_patch: dict[str, Any] | None = None
+        # repeatedly on challenge_menu_objects 2026-08-07. Seeded from the
+        # newest on-disk attempt so the ratchet survives the driver's
+        # one-run-per-process design (a per-run ratchet only helps within a
+        # single 3-attempt cycle and loses everything on relaunch).
+        previous_patch: dict[str, Any] | None = self._load_previous_patch(checkpoint_root)
 
         first_checkpoint_attempt = _next_attempt_number(checkpoint_root)
         for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
