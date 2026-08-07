@@ -1167,12 +1167,20 @@ class SequentialSourcePortLoop:
                 prompt,
                 usage_limits=UsageLimits(
                     # One initial request, one continuation per workspace tool
-                    # result, and one FINAL request to emit the patch after the
-                    # last tool result. +1 killed every attempt that spent all
-                    # its tool calls: UsageLimitExceeded at request_limit=4 was
-                    # the rejection cause of the first live driver unit
-                    # (fun-80195d8c, 2026-08-06), after full generation cost.
-                    request_limit=MAX_WORKSPACE_TOOL_CALLS + 2,
+                    # result, one FINAL request for the patch -- plus headroom:
+                    # PydanticAI retries of malformed tool calls consume
+                    # requests too, so the exact-fit budgets kept killing
+                    # attempts AFTER paying full generation (request_limit=4
+                    # rejected fun-80195d8c 2026-08-06; the +2 fix at 5 still
+                    # rejected challenge_flow_state_controller 2026-08-07).
+                    # The attempt loop already bounds total cost; a generous
+                    # limit only pays for requests actually made.
+                    request_limit=int(
+                        os.getenv(
+                            "OGHIDRA_PORT_REQUEST_LIMIT",
+                            str(MAX_WORKSPACE_TOOL_CALLS * 2 + 4),
+                        )
+                    ),
                 ),
             ) as agent_run:
                 async for node in agent_run:
