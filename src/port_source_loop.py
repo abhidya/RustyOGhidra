@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import (
     Agent,
     FunctionToolCallEvent,
@@ -1678,14 +1678,52 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                     "workspace tool, ending with submit_browser_source_patch."
                     + (" /no_think" if PORT_DISABLE_THINKING else "")
                 )
-                raw, structured_mode, workspace_trace = self._generate_with_workspace_tools(
-                    llm=llm,
-                    prompt=prompt,
-                    model_name=model_name,
-                    phase=f"finish_game_source:{address}:attempt_{attempt}",
-                    system_prompt=system_prompt,
-                    stream_event=stream_event,
-                )
+                try:
+                    raw, structured_mode, workspace_trace = self._generate_with_workspace_tools(
+                        llm=llm,
+                        prompt=prompt,
+                        model_name=model_name,
+                        phase=f"finish_game_source:{address}:attempt_{attempt}",
+                        system_prompt=system_prompt,
+                        stream_event=stream_event,
+                    )
+                except Exception as agent_error:
+                    # Composition fallback: when the agent explores itself to
+                    # death (request limit), the model demonstrably retries
+                    # refused reads instead of composing -- 72 gate refusals
+                    # in one run. One final TOOLLESS structured request, the
+                    # exact call shape the (working) analysis phase uses,
+                    # turns every exhausted attempt into a composition shot:
+                    # with no tools attached, emitting the patch is the only
+                    # possible action.
+                    if "request_limit" not in str(agent_error):
+                        raise
+                    self.activity.emit(
+                        "tool",
+                        "Composition fallback",
+                        "Agent request budget exhausted; issuing one toolless "
+                        "structured request for the final patch.",
+                        address=address,
+                        status="running",
+                    )
+                    raw, structured_mode = llm.generate_structured(
+                        prompt=(
+                            prompt
+                            + "\n\nWorkspace tools are NO LONGER AVAILABLE. Using only the "
+                            "evidence above, emit the complete browser source patch as a "
+                            "single JSON object now. No prose."
+                        ),
+                        schema=BrowserSourcePatch.model_json_schema(),
+                        tool_name="submit_browser_source_patch",
+                        model=model_name,
+                        system_prompt=system_prompt,
+                        temperature=0.1,
+                        max_tokens=MODEL_MAX_OUTPUT_TOKENS,
+                        phase=f"finish_game_source:{address}:attempt_{attempt}:compose",
+                        accept_plain_tool_response=True,
+                        stream_callback=stream_event,
+                    )
+                    workspace_trace = []
                 (attempt_root / "response.txt").write_text(raw, encoding="utf-8")
                 if workspace_trace:
                     atomic_write_json(
@@ -1700,7 +1738,10 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                         address=address,
                         status="complete",
                     )
-                patch = BrowserSourcePatch.model_validate(_json_payload(raw))
+                try:
+                    patch = BrowserSourcePatch.model_validate(_json_payload(raw))
+                except (ValueError, ValidationError):
+                    patch = _extract_browser_source_patch(raw)
                 previous_patch = patch.model_dump(mode="json")
                 attempted_paths.update(file.path for file in patch.files)
                 atomic_write_json(
