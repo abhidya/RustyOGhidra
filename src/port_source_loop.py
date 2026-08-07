@@ -44,7 +44,12 @@ from src.port_activity import PortActivity
 from src.custom_api_client import APIResponseError
 
 
-MODEL_MAX_OUTPUT_TOKENS = int(os.getenv("OGHIDRA_PORT_MAX_TOKENS", "32768"))
+# 65536, not 32768: the thinking model's reasoning spends from this same
+# budget, and borg_action_state_machine attempt 1 (2026-08-07 05:26Z) burned
+# all 32,768 tokens on chain-of-thought and died with "token limit exceeded
+# before any response was generated". The serving context (~131k) minus the
+# ~10-14k unit prompt leaves ample room.
+MODEL_MAX_OUTPUT_TOKENS = int(os.getenv("OGHIDRA_PORT_MAX_TOKENS", "65536"))
 MAX_REPAIR_ATTEMPTS = int(os.getenv("OGHIDRA_PORT_REPAIR_ATTEMPTS", "3"))
 SOURCE_CONTEXT_FILE_LIMIT = int(os.getenv("OGHIDRA_PORT_SOURCE_FILE_LIMIT", "4"))
 SOURCE_CONTEXT_FILE_CHAR_LIMIT = int(
