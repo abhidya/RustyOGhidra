@@ -1581,15 +1581,27 @@ class SequentialSourcePortLoop:
         }
         # Real extracted ROM data lives in *.generated.ts modules; the model
         # cannot import what it does not know exists (observed: a grounded
-        # patch fabricated nothing but also found nothing, 2026-08-07).
-        generated_modules = "\n".join(
-            sorted(
-                path.relative_to(self.repo_root).as_posix()
-                for root in (self.repo_root / "apps", self.repo_root / "packages")
-                if root.is_dir()
-                for path in root.rglob("*.generated.ts")
-            )
-        ) or "(none)"
+        # patch fabricated nothing but also found nothing, 2026-08-07), and
+        # listing paths without export names made it GUESS names/modules
+        # (invented ./styles.generated.js for the obj0 floats). List both.
+        generated_lines: list[str] = []
+        for root in (self.repo_root / "apps", self.repo_root / "packages"):
+            if not root.is_dir():
+                continue
+            for module_path in sorted(root.rglob("*.generated.ts")):
+                try:
+                    exports = re.findall(
+                        r"^export const (\w+)",
+                        module_path.read_text(encoding="utf-8"),
+                        re.MULTILINE,
+                    )
+                except (OSError, UnicodeDecodeError):
+                    exports = []
+                generated_lines.append(
+                    f"{module_path.relative_to(self.repo_root).as_posix()}"
+                    f" -- exports: {', '.join(exports) or '(none)'}"
+                )
+        generated_modules = "\n".join(generated_lines) or "(none)"
         return f"""Implement this original GameCube function 1:1 in the existing GotYaForce browser game.
 
 Product result:
@@ -1632,8 +1644,9 @@ Patch protocol:
   the table address, e.g. challengeFlowTables.generated); import from those. If a table you
   need has no generated module, state the missing address in the patch summary and port only
   the functions whose data is available.
-Available generated ROM-table modules (real extracted DOL data -- import from these,
-never fabricate; read one with read_browser_source before using it):
+Available generated ROM-table modules (real extracted DOL data -- import from these
+using EXACTLY the export names listed; generated files are READ-ONLY and any patch
+touching a *.generated.ts file is rejected):
 {generated_modules}
 This exact body also represents these original addresses: {aliases}
 Repair attempt: {attempt}/{MAX_REPAIR_ATTEMPTS}
@@ -1883,6 +1896,11 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                     raise ValueError("Qwen selected action=edit without returning source files")
                 for file_patch in patch.files:
                     target = _safe_source_path(self.repo_root, file_patch.path)
+                    if file_patch.path.endswith(".generated.ts"):
+                        raise ValueError(
+                            f"{file_patch.path} is generator-owned (scripts/gen-*.mjs); "
+                            "import from it instead of patching it"
+                        )
                     if (file_patch.content is None) == (not file_patch.edits):
                         raise ValueError(
                             f"{file_patch.path} must provide either new-file content or existing-file edits"
