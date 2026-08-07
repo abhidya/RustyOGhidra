@@ -414,23 +414,32 @@ class PortDriver:
 
     # ------------------------------------------------------------------ steps
 
+    def _record_analysis_spend(self, ledger: dict[str, Any], record: dict[str, Any]) -> None:
+        requests_used = max(1, getattr(self.workflow, "last_analyze_requests", 1))
+        record["model_requests_spent"] = record.get("model_requests_spent", 0) + requests_used
+        ledger["counters"]["model_requests_total"] = (
+            ledger["counters"].get("model_requests_total", 0) + requests_used
+        )
+
     def _run_analysis(self, ledger: dict[str, Any], chunk: str) -> str:
         record = self._chunk_record(ledger, chunk)["analysis"]
         record["status"] = "analyzing"
-        record["model_requests_spent"] = record.get("model_requests_spent", 0) + 1
-        ledger["counters"]["model_requests_total"] = (
-            ledger["counters"].get("model_requests_total", 0) + 1
-        )
         self._save_ledger(ledger, reason=f"analysis_started:{chunk}")
-        self.events.emit("analysis_started", chunk=chunk, attempt=record["model_requests_spent"])
+        self.events.emit(
+            "analysis_started",
+            chunk=chunk,
+            requests_already_spent=record.get("model_requests_spent", 0),
+        )
         try:
             analysis = self.workflow.analyze(chunk, force=True)
         except ProviderUnavailable:
+            self._record_analysis_spend(ledger, record)
             record["status"] = "paused_provider"
             self._save_ledger(ledger, reason=f"provider_paused:{chunk}")
             self.events.emit("provider_paused", chunk=chunk)
             raise
         except Exception as error:
+            self._record_analysis_spend(ledger, record)
             record["status"] = "analysis_failed"
             record["error"] = f"{type(error).__name__}: {error}"
             if record["model_requests_spent"] >= ANALYSIS_REQUEST_BUDGET:
@@ -439,6 +448,7 @@ class PortDriver:
                 self.events.emit("analysis_blocked", chunk=chunk, error=record["error"])
             self._save_ledger(ledger, reason=f"analysis_failed:{chunk}")
             return "analysis_failed"
+        self._record_analysis_spend(ledger, record)
         record["status"] = "analyzed"
         record["generated_by"] = analysis.generated_by
         record["chunk_sha256"] = analysis.chunk_sha256

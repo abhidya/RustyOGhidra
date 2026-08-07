@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from src.port_run_controller import find_gotyaforce_root
 from src.port_source_loop import (
@@ -30,6 +30,8 @@ from src.port_source_loop import (
 CHUNK_ANALYSIS_SCHEMA = 1
 # Rank provenance so a cheap re-run can never clobber a paid-for artifact (G6/R8).
 ANALYSIS_PROVENANCE_RANK = {"deterministic": 0, "saved_model_response": 1, "model": 2}
+# Total structured requests per chunk analysis, repairs included (R11).
+ANALYSIS_MAX_REQUESTS = int(os.getenv("OGHIDRA_CHUNK_ANALYSIS_MAX_REQUESTS", "3"))
 # Entry symbols that are raw decompiler placeholders cannot pass the runtime
 # reachability gate, so generating for them is guaranteed waste (G10/R13).
 PLACEHOLDER_ENTRY_SYMBOL = re.compile(r"^(?:FUN|LAB)_[0-9a-fA-F]{8}$")
@@ -445,13 +447,28 @@ def build_deterministic_analysis(chunk: ParsedChunk) -> ChunkAnalysis:
     )
 
 
-def _model_prompt(chunk: ParsedChunk, deterministic: ChunkAnalysis) -> str:
+def _model_prompt(
+    chunk: ParsedChunk,
+    deterministic: ChunkAnalysis,
+    *,
+    repair_feedback: str | None = None,
+) -> str:
     facts = {
         "chunk": chunk.name,
         "function_count": len(chunk.functions),
         "functions": deterministic.functions,
         "candidate_units": [unit.model_dump(mode="json") for unit in deterministic.units],
     }
+    repair_section = (
+        f"""
+
+A previous attempt at this exact task was rejected. Fix ONLY the reported problem and
+return the complete corrected assignment (the validator re-checks full coverage):
+{repair_feedback}
+"""
+        if repair_feedback
+        else ""
+    )
     return f"""Analyze this complete Ghidra export chunk as shared translation context.
 
 Return execution units, not one TypeScript file and not one unit per function. Every original
@@ -460,7 +477,9 @@ game-owned state controllers. A generation unit should normally contain 2-40 tig
 functions. Record cross-chunk calls as external dependencies. runtime_entry_symbols must be exact
 function names from the chunk that a production caller must reach. target_source_paths may name
 only likely existing browser source integration files; use an empty list when unresolved.
-
+To conserve output, leave hardware_or_sdk_functions and game_owned_functions as empty lists --
+they are derived from your units' classifications; do not repeat per-function metadata.
+{repair_section}
 Deterministic evidence:
 {json.dumps(facts, indent=2)}
 
@@ -488,6 +507,9 @@ class ChunkPortWorkflow:
         self.state_path = self.run_root.parent / "run-state.json"
         self.session_index_path = self.run_root.parent / "session-index.json"
         self._session_functions_cache: dict[str, dict[str, Any]] | None = None
+        # Structured requests spent by the most recent analyze(); drivers use
+        # this for per-chunk request accounting (R11).
+        self.last_analyze_requests = 0
 
     def _session_functions(self) -> dict[str, dict[str, Any]]:
         """Address-keyed {name, summary} view of session-index.json; {} when absent."""
@@ -594,6 +616,18 @@ class ChunkPortWorkflow:
             raise ValueError(
                 f"invalid unit coverage: unknown={unknown}, duplicate={duplicate}, missing={missing}"
             )
+        hardware = payload.hardware_or_sdk_functions or [
+            address
+            for unit in payload.units
+            if unit.classification == "hardware_or_sdk"
+            for address in unit.function_addresses
+        ]
+        game = payload.game_owned_functions or [
+            address
+            for unit in payload.units
+            if unit.classification == "game_owned"
+            for address in unit.function_addresses
+        ]
         return ChunkAnalysis(
             chunk=chunk.name,
             chunk_sha256=chunk.sha256,
@@ -605,11 +639,109 @@ class ChunkPortWorkflow:
             callback_tables=payload.callback_tables,
             shared_globals=payload.shared_globals,
             external_dependencies=[normalize_address(value) for value in payload.external_dependencies],
-            hardware_or_sdk_functions=[normalize_address(value) for value in payload.hardware_or_sdk_functions],
-            game_owned_functions=[normalize_address(value) for value in payload.game_owned_functions],
+            hardware_or_sdk_functions=[normalize_address(value) for value in hardware],
+            game_owned_functions=[normalize_address(value) for value in game],
             functions=build_deterministic_analysis(chunk).functions,
             units=payload.units,
         )
+
+    def _model_analyze_with_repair(
+        self, chunk: ParsedChunk, deterministic: ChunkAnalysis
+    ) -> ChunkAnalysis:
+        """One structured analysis with bounded delta-repair (D4, R11/R12/R14).
+
+        Output budget scales with the chunk (90 tok/function + headroom): the
+        historical flat 32,768 silently truncated 150-address partitions and
+        every request was wasted (G11). Coverage/parse failures feed the exact
+        violations back for at most ``ANALYSIS_MAX_REQUESTS - 1`` repair rounds.
+        Every raw response is archived before validation so a failed run no
+        longer discards a 20-minute generation.
+        """
+        fn_count = len(chunk.functions)
+        max_tokens = int(
+            os.getenv(
+                "OGHIDRA_CHUNK_ANALYSIS_MAX_TOKENS",
+                str(max(4096, min(90 * fn_count + 2048, 28672))),
+            )
+        )
+        llm, provider, model_name = self.llm_factory()
+        archive_root = self.chunk_root(chunk.name)
+        repair_feedback: str | None = None
+        last_error: Exception | None = None
+        self.last_analyze_requests = 0
+        for attempt in range(1, ANALYSIS_MAX_REQUESTS + 1):
+            self.last_analyze_requests = attempt
+            self._write_state(chunk.name, status="model_running", model_requests=attempt)
+            try:
+                raw, _mode = llm.generate_structured(
+                    prompt=_model_prompt(chunk, deterministic, repair_feedback=repair_feedback),
+                    schema=ChunkModelAnalysis.model_json_schema(),
+                    tool_name="submit_chunk_analysis",
+                    model=model_name,
+                    system_prompt=(
+                        "You partition complete Ghidra export chunks into coherent execution units. "
+                        "Return only the requested strict structured result; do not browse source or generate code."
+                    ),
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    phase=f"chunk_analysis:{chunk.name}:attempt{attempt}",
+                    accept_plain_tool_response=True,
+                    # Stream for two reasons, both learned the hard way:
+                    # 1. liveness telemetry (current_completion_tokens,
+                    #    tokens_per_second) only updates mid-request on the
+                    #    streaming path -- non-streamed, a 40-minute generation
+                    #    reports "out 0 tok, 0.0 tok/s" the whole time and is
+                    #    indistinguishable from a hang;
+                    # 2. requests' read timeout is time-between-BYTES; with no
+                    #    stream a generation longer than CUSTOM_API_TIMEOUT
+                    #    dies even though the server is healthy and working.
+                    # The callback itself has nothing to do -- the client's
+                    # metrics wrapper does the liveness accounting.
+                    stream_callback=lambda _event_type, _event: None,
+                )
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                if any(marker in message.lower() for marker in TRANSIENT_MARKERS):
+                    self._write_state(
+                        chunk.name,
+                        status="paused_provider_unavailable",
+                        model_requests=attempt,
+                        error=message,
+                    )
+                    raise ProviderUnavailable(message) from error
+                self._write_state(
+                    chunk.name, status="analysis_failed", model_requests=attempt, error=message
+                )
+                raise
+            archive = archive_root / f"analysis-attempt-{attempt}.raw.txt"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text(raw, encoding="utf-8")
+            try:
+                payload = ChunkModelAnalysis.model_validate(_json_payload(raw))
+                analysis = self._validate_model_analysis(chunk, payload, generated_by="model")
+            except (ValueError, ValidationError) as error:
+                # Truncated JSON parses fail here too -- both are repairable.
+                last_error = error
+                repair_feedback = str(error)[:4000]
+                continue
+            self._write_state(
+                chunk.name,
+                status="analyzed",
+                model_requests=attempt,
+                provider=provider,
+                model=model_name,
+            )
+            return analysis
+        message = (
+            f"model analysis failed after {ANALYSIS_MAX_REQUESTS} structured requests: {last_error}"
+        )
+        self._write_state(
+            chunk.name,
+            status="analysis_failed",
+            model_requests=ANALYSIS_MAX_REQUESTS,
+            error=message,
+        )
+        raise ValueError(message)
 
     def _existing_analysis(self, chunk: ParsedChunk) -> ChunkAnalysis | None:
         """Return the on-disk analysis when it still matches the chunk export, else None."""
@@ -660,62 +792,7 @@ class ChunkPortWorkflow:
                 chunk, payload, generated_by="saved_model_response"
             )
         else:
-            self._write_state(chunk.name, status="model_running", model_requests=1)
-            try:
-                llm, provider, model_name = self.llm_factory()
-                raw, _mode = llm.generate_structured(
-                    prompt=_model_prompt(chunk, deterministic),
-                    schema=ChunkModelAnalysis.model_json_schema(),
-                    tool_name="submit_chunk_analysis",
-                    model=model_name,
-                    system_prompt=(
-                        "You partition complete Ghidra export chunks into coherent execution units. "
-                        "Return only the requested strict structured result; do not browse source or generate code."
-                    ),
-                    temperature=0.1,
-                    max_tokens=int(os.getenv("OGHIDRA_CHUNK_ANALYSIS_MAX_TOKENS", "32768")),
-                    phase=f"chunk_analysis:{chunk.name}",
-                    accept_plain_tool_response=True,
-                    # Stream for two reasons, both learned the hard way:
-                    # 1. liveness telemetry (current_completion_tokens,
-                    #    tokens_per_second) only updates mid-request on the
-                    #    streaming path -- non-streamed, a 40-minute generation
-                    #    reports "out 0 tok, 0.0 tok/s" the whole time and is
-                    #    indistinguishable from a hang;
-                    # 2. requests' read timeout is time-between-BYTES; with no
-                    #    stream a generation longer than CUSTOM_API_TIMEOUT
-                    #    dies even though the server is healthy and working.
-                    # The callback itself has nothing to do -- the client's
-                    # metrics wrapper does the liveness accounting.
-                    stream_callback=lambda _event_type, _event: None,
-                )
-                payload = ChunkModelAnalysis.model_validate(_json_payload(raw))
-                analysis = self._validate_model_analysis(chunk, payload, generated_by="model")
-                self._write_state(
-                    chunk.name,
-                    status="analyzed",
-                    model_requests=1,
-                    provider=provider,
-                    model=model_name,
-                )
-            except Exception as error:
-                message = f"{type(error).__name__}: {error}"
-                lowered = message.lower()
-                if any(marker in lowered for marker in TRANSIENT_MARKERS):
-                    self._write_state(
-                        chunk.name,
-                        status="paused_provider_unavailable",
-                        model_requests=1,
-                        error=message,
-                    )
-                    raise ProviderUnavailable(message) from error
-                self._write_state(
-                    chunk.name,
-                    status="analysis_failed",
-                    model_requests=1,
-                    error=message,
-                )
-                raise
+            analysis = self._model_analyze_with_repair(chunk, deterministic)
         atomic_write_json(self.analysis_path(chunk.name), analysis.model_dump(mode="json"))
         self._write_state(
             chunk.name,

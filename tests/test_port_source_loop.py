@@ -304,6 +304,42 @@ def test_sequential_loop_writes_verifies_and_checkpoints(tmp_path: Path):
     assert commits == [("0x80000000", "port")]
 
 
+def test_combat_touching_patch_adds_family_audit_gates(tmp_path: Path):
+    source = tmp_path / "packages/combat/src"
+    source.mkdir(parents=True)
+
+    class FakeLLM:
+        def generate_structured(self, **_kwargs):
+            return (
+                '{"summary":"combat port","files":['
+                '{"path":"packages/combat/src/challenge.ts",'
+                '"content":"export const challengePorted = true;"}]}',
+                "tool_call",
+            )
+
+    gates = []
+    loop = SequentialSourcePortLoop(
+        repo_root=tmp_path,
+        run_root=tmp_path / ".run",
+        llm_factory=lambda: (FakeLLM(), "fake", "qwen"),
+        verify_runner=lambda _root, command: (gates.append(command) is None, "pass"),
+        git_checkpointer=lambda *_args: "deadbeef",
+        integration_checker=lambda *_args: (True, "reachable"),
+    )
+    result = loop.run(
+        address="0x80195d8c",
+        aliases=["0x80195d8c"],
+        bundle={"identity": {"name": "challenge"}, "decompiler": {"c": "void f(void) {}"}},
+    )
+
+    assert result.passed
+    assert len(gates) == 8
+    assert gates[-2:] == [
+        ("pnpm", "audit:family-state-machines"),
+        ("pnpm", "audit:move-wiring"),
+    ]
+
+
 def test_prompt_probe_validates_response_without_writes_gates_or_git(tmp_path: Path):
     source = tmp_path / "apps/game/src"
     source.mkdir(parents=True)

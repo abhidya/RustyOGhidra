@@ -294,6 +294,87 @@ def test_cli_honors_control_stop_before_any_work(tmp_path: Path, monkeypatch: py
     assert port_scheduler.main(["--chunk", "chunk_0048"]) == 2
 
 
+class ScriptedLlm:
+    """Returns queued structured responses and records every request's kwargs."""
+
+    def __init__(self, responses: list[str]):
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def generate_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0), "tool_call"
+
+
+def model_response_json(*, complete: bool) -> str:
+    units = [
+        {
+            "id": "challenge-controller",
+            "label": "Challenge controller",
+            "classification": "game_owned",
+            "summary": "",
+            "function_addresses": ["0x80001000", "0x80001020"],
+            "runtime_entry_symbols": ["challenge_root"],
+        }
+    ]
+    if complete:
+        units.append(
+            {
+                "id": "gx-host",
+                "label": "GX host",
+                "classification": "hardware_or_sdk",
+                "summary": "",
+                "function_addresses": ["0x80002000"],
+            }
+        )
+    return json.dumps({"units": units})
+
+
+def test_analyzer_repairs_coverage_violations_within_request_budget(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    llm = ScriptedLlm([model_response_json(complete=False), model_response_json(complete=True)])
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: (llm, "custom_api", "qwen"))
+
+    analysis = workflow.analyze("chunk_0048")
+
+    assert analysis.generated_by == "model"
+    assert workflow.last_analyze_requests == 2
+    assert len(llm.calls) == 2
+    assert "missing=['0x80002000']" in llm.calls[1]["prompt"]
+    # Output budget scales with the chunk instead of the flat 32768 (G11/R12).
+    assert llm.calls[0]["max_tokens"] == 4096
+    chunk_root = workflow.chunk_root("chunk_0048")
+    assert (chunk_root / "analysis-attempt-1.raw.txt").is_file()
+    assert (chunk_root / "analysis-attempt-2.raw.txt").is_file()
+
+
+def test_analyzer_gives_up_after_three_requests_and_archives_everything(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    llm = ScriptedLlm([model_response_json(complete=False)] * 3)
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: (llm, "custom_api", "qwen"))
+
+    with pytest.raises(ValueError, match="after 3 structured requests"):
+        workflow.analyze("chunk_0048")
+
+    assert len(llm.calls) == 3
+    state = json.loads(workflow.state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "analysis_failed"
+    assert state["model_requests"] == 3
+    chunk_root = workflow.chunk_root("chunk_0048")
+    assert (chunk_root / "analysis-attempt-3.raw.txt").is_file()
+
+
+def test_analyzer_derives_classification_lists_from_units(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    llm = ScriptedLlm([model_response_json(complete=True)])
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: (llm, "custom_api", "qwen"))
+
+    analysis = workflow.analyze("chunk_0048")
+
+    assert analysis.hardware_or_sdk_functions == ["0x80002000"]
+    assert analysis.game_owned_functions == ["0x80001000", "0x80001020"]
+
+
 def test_provider_failure_pauses_after_one_analysis_request(tmp_path: Path):
     root = fixture_repo(tmp_path)
 

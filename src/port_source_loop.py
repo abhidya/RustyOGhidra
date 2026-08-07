@@ -61,6 +61,7 @@ ADJACENT_CONTEXT_FILE_LIMIT = int(os.getenv("OGHIDRA_PORT_ADJACENT_FILES", "8"))
 EXCLUDED_CONTEXT_DIRECTORIES = {"node_modules", "dist", "build", "coverage", ".tmp"}
 ALLOWED_SOURCE_ROOTS = ("apps/game/", "packages/", "scripts/")
 ALLOWED_SUFFIXES = {".ts", ".tsx", ".js", ".mjs", ".json"}
+# Ordered cheap-first: typecheck fails in seconds, browser smoke costs minutes.
 VERIFY_COMMANDS = (
     ("pnpm", "typecheck"),
     ("pnpm", "--filter", "@gf/combat", "build"),
@@ -68,6 +69,13 @@ VERIFY_COMMANDS = (
     ("pnpm", "selfcheck:game-session"),
     ("pnpm", "--filter", "game", "build"),
     ("pnpm", "smoke:browser"),
+)
+# The unit of value is a combat-family state machine routed to the right
+# package (R27): patches touching packages/combat must also keep the family
+# audits green. Both pass on current main (verified 2026-08-06).
+COMBAT_AUDIT_COMMANDS = (
+    ("pnpm", "audit:family-state-machines"),
+    ("pnpm", "audit:move-wiring"),
 )
 TRANSIENT_PROVIDER_MARKERS = (
     "connection",
@@ -1583,7 +1591,12 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                     address=address,
                     status="passed" if semantic_passed else "failed",
                 )
-                for command in VERIFY_COMMANDS:
+                gate_commands = VERIFY_COMMANDS + (
+                    COMBAT_AUDIT_COMMANDS
+                    if any(path.startswith("packages/combat/") for path in touched)
+                    else ()
+                )
+                for command in gate_commands:
                     if not passed:
                         break
                     command_text = " ".join(command)
