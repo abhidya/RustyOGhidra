@@ -1526,6 +1526,17 @@ class SequentialSourcePortLoop:
             for key, value in (analysis_context or {}).items()
             if key != "saved_session_analysis"
         }
+        # Real extracted ROM data lives in *.generated.ts modules; the model
+        # cannot import what it does not know exists (observed: a grounded
+        # patch fabricated nothing but also found nothing, 2026-08-07).
+        generated_modules = "\n".join(
+            sorted(
+                path.relative_to(self.repo_root).as_posix()
+                for root in (self.repo_root / "apps", self.repo_root / "packages")
+                if root.is_dir()
+                for path in root.rglob("*.generated.ts")
+            )
+        ) or "(none)"
         return f"""Implement this original GameCube function 1:1 in the existing GotYaForce browser game.
 
 Product result:
@@ -1551,13 +1562,15 @@ Patch protocol:
   a production USE site -- a call (`spawn_challenge_menu_object_set(ctx)`) or a runtime
   dispatch-map registration (`{{ spawn_challenge_menu_object_set, ... }}`) in an existing
   gameplay file OTHER than where it is declared. Declarations, imports, alias exports,
-  and `export {{}}` re-exports are all IGNORED by the checker. Wire each entry symbol into
-  the real update/dispatch path of the scene or VM that owns this behavior.
+  and `export {{}}` re-exports are all IGNORED by the checker. A new wrapper function that
+  merely re-exposes the symbol does NOT count: the call must sit inside a code path the
+  game already executes (an existing update loop, VM mode handler, or dispatcher table
+  that existing code iterates). Wire each entry symbol into the real update/dispatch path
+  of the scene or VM that owns this behavior.
 - TypeScript conformance (typecheck gate is strict): prefix intentionally-unused
   parameters and locals with an underscore (`_param10`); declare any local you reassign
-  with `let`, never `const`; reference only globals that already exist in current source,
-  and define any missing ROM data constant at module level in your new file with its ROM
-  address in a comment.
+  with `let`, never `const`; reference only globals and constants that already exist in
+  current source or in the generated ROM-table modules listed below.
 - The scheduler already removed proven platform/runtime functions; do not exclude this unit.
 - Do not emit placeholders, TODOs, fallbacks, documentation, shell commands, or generated reports.
 - NEVER fabricate ROM data. Zero-filled arrays, null function-pointer tables, or guessed
@@ -1566,6 +1579,9 @@ Patch protocol:
   the table address, e.g. challengeFlowTables.generated); import from those. If a table you
   need has no generated module, state the missing address in the patch summary and port only
   the functions whose data is available.
+Available generated ROM-table modules (real extracted DOL data -- import from these,
+never fabricate; read one with read_browser_source before using it):
+{generated_modules}
 This exact body also represents these original addresses: {aliases}
 Repair attempt: {attempt}/{MAX_REPAIR_ATTEMPTS}
 {repair}
