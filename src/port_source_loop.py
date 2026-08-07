@@ -515,8 +515,21 @@ def _specific_symbol_reachability_check(
                 lines = path.read_text(encoding="utf-8").splitlines()
             except (OSError, UnicodeDecodeError):
                 continue
+            inside_import = False
             for line_number, line in enumerate(lines, start=1):
                 stripped = line.strip()
+                # Multi-line import blocks: symbol names on their own lines do
+                # not start with "import ", and counting them as use sites let
+                # a patch pass reachability with nothing but an import list
+                # (challenge_menu_objects, 2026-08-07 -- false positive at
+                # battleScene.ts:21-26).
+                if inside_import:
+                    if "from" in stripped or stripped.endswith((";", '";', "';")):
+                        inside_import = False
+                    continue
+                if stripped.startswith("import ") and "from" not in stripped and not stripped.endswith(";"):
+                    inside_import = True
+                    continue
                 if not pattern.search(line):
                     continue
                 if not stripped or stripped.startswith(("//", "*", "/*", "import ")):
@@ -1547,6 +1560,12 @@ Patch protocol:
   address in a comment.
 - The scheduler already removed proven platform/runtime functions; do not exclude this unit.
 - Do not emit placeholders, TODOs, fallbacks, documentation, shell commands, or generated reports.
+- NEVER fabricate ROM data. Zero-filled arrays, null function-pointer tables, or guessed
+  constants standing in for DAT_*/PTR_FUN_*/FLOAT_* contents are stub code and fail review.
+  Real table contents are extracted into *.generated.ts modules (search for "generated" or
+  the table address, e.g. challengeFlowTables.generated); import from those. If a table you
+  need has no generated module, state the missing address in the patch summary and port only
+  the functions whose data is available.
 This exact body also represents these original addresses: {aliases}
 Repair attempt: {attempt}/{MAX_REPAIR_ATTEMPTS}
 {repair}
