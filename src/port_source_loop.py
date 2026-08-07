@@ -60,6 +60,17 @@ SOURCE_CONTEXT_TOTAL_CHAR_LIMIT = int(
 )
 SOURCE_CONTEXT_WINDOW_LINES = int(os.getenv("OGHIDRA_PORT_SOURCE_WINDOW_LINES", "80"))
 MAX_WORKSPACE_TOOL_CALLS = int(os.getenv("OGHIDRA_PORT_WORKSPACE_TOOL_CALLS", "3"))
+# Port generation runs with model thinking DISABLED by default: the reasoning
+# channel spends from the same output budget, and borg_action_state_machine
+# (2026-08-07) burned 32,768 tokens of pure chain-of-thought across a
+# reasoning spiral (same file re-read 5x) without ever emitting a patch.
+# Applied as chat_template_kwargs.enable_thinking=false (vLLM/SGLang/llama.cpp
+# servers; ignored elsewhere) plus the Qwen /no_think soft switch in the
+# system prompt. Set OGHIDRA_PORT_DISABLE_THINKING=0 to re-enable thinking.
+PORT_DISABLE_THINKING = os.getenv("OGHIDRA_PORT_DISABLE_THINKING", "1").lower() not in (
+    "0",
+    "false",
+)
 SOURCE_READ_MAX_LINES = int(os.getenv("OGHIDRA_PORT_SOURCE_READ_MAX_LINES", "800"))
 SOURCE_SEARCH_RESULT_LIMIT = int(os.getenv("OGHIDRA_PORT_SOURCE_SEARCH_RESULTS", "40"))
 ADJACENT_CONTEXT_FILE_LIMIT = int(os.getenv("OGHIDRA_PORT_ADJACENT_FILES", "8"))
@@ -1087,14 +1098,26 @@ class SequentialSourcePortLoop:
                 max_tokens=MODEL_MAX_OUTPUT_TOKENS,
                 tool_choice="auto",
                 parallel_tool_calls=False,
-                extra_body={} if direct_llama_server else {
-                    # This is response-only normalization: it never executes a
-                    # tool or generates a hidden continuation. PydanticAI owns
-                    # validation, execution, retries, and every model request.
-                    "auto_heal_tool_calls": True,
-                    # Do not let the server issue a hidden retry behind the
-                    # PydanticAI agent loop.
-                    "nudge_tool_calls": False,
+                extra_body={
+                    **(
+                        {}
+                        if direct_llama_server
+                        else {
+                            # This is response-only normalization: it never
+                            # executes a tool or generates a hidden
+                            # continuation. PydanticAI owns validation,
+                            # execution, retries, and every model request.
+                            "auto_heal_tool_calls": True,
+                            # Do not let the server issue a hidden retry behind
+                            # the PydanticAI agent loop.
+                            "nudge_tool_calls": False,
+                        }
+                    ),
+                    **(
+                        {"chat_template_kwargs": {"enable_thinking": False}}
+                        if PORT_DISABLE_THINKING
+                        else {}
+                    ),
                 },
             ),
         )
@@ -1472,6 +1495,7 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                     "real browser runtime. You may not exclude the assigned unit. "
                     "Do not narrate a plan or analysis: every response must immediately call exactly one "
                     "workspace tool, ending with submit_browser_source_patch."
+                    + (" /no_think" if PORT_DISABLE_THINKING else "")
                 )
                 raw, structured_mode, workspace_trace = self._generate_with_workspace_tools(
                     llm=llm,
