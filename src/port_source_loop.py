@@ -1482,11 +1482,12 @@ Patch protocol:
   existing file is REJECTED automatically: you cannot reproduce it faithfully and the
   validator protects the parts you did not see.
 - Return action="edit" with at least one file and wire it into the existing runtime.
-- The unit's runtime_entry_symbols must exist VERBATIM as exported, reachable symbols.
-  ONLY IF your implementation uses a different idiomatic name, add an exact-name export
-  alias (`export const spawn_x = spawnX;`). If the function is already declared with the
-  exact name, exporting that declaration is sufficient -- an extra alias is a duplicate
-  identifier and fails typecheck.
+- REACHABILITY GATE (exact contract): every runtime_entry_symbol must appear VERBATIM at
+  a production USE site -- a call (`spawn_challenge_menu_object_set(ctx)`) or a runtime
+  dispatch-map registration (`{ spawn_challenge_menu_object_set, ... }`) in an existing
+  gameplay file OTHER than where it is declared. Declarations, imports, alias exports,
+  and `export {}` re-exports are all IGNORED by the checker. Wire each entry symbol into
+  the real update/dispatch path of the scene or VM that owns this behavior.
 - TypeScript conformance (typecheck gate is strict): prefix intentionally-unused
   parameters and locals with an underscore (`_param10`); declare any local you reassign
   with `let`, never `const`; reference only globals that already exist in current source,
