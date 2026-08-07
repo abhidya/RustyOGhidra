@@ -256,6 +256,59 @@ def _json_payload(raw: str) -> dict[str, Any]:
         return payload
 
 
+def _extract_browser_source_patch(text: str) -> BrowserSourcePatch:
+    """Lenient final-output parser: pull the LAST balanced JSON object from prose.
+
+    The model prefixes prose despite instructions; a strict parse burned the
+    request budget in validation retries while a complete valid patch sat in
+    the text (challenge_menu_objects, 2026-08-07). Scans string-aware from
+    the last plausible patch-object start.
+    """
+    candidate = text.strip()
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", candidate, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced[-1].strip()
+    starts = [
+        match.start()
+        for match in re.finditer(r'\{\s*"(?:summary|action|files)"', candidate)
+    ]
+    if not starts:
+        starts = [candidate.find("{")] if "{" in candidate else []
+    for start in reversed(starts):
+        if start < 0:
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(candidate)):
+            char = candidate[index]
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        payload = json.loads(candidate[start : index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    return BrowserSourcePatch.model_validate(payload)
+    raise ValueError(
+        "response contained no balanced JSON object matching the browser source "
+        "patch schema; emit the complete patch as a single JSON object"
+    )
+
+
 def _safe_source_path(repo_root: Path, relative: str) -> Path:
     normalized = relative.replace("\\", "/").lstrip("/")
     if (
@@ -1161,22 +1214,18 @@ class SequentialSourcePortLoop:
             model,
             instructions=system_prompt,
             tools=[read_browser_source, search_browser_source],
-            # PromptedOutput, not ToolOutput: the local server's tool-call
-            # JSON parser 500s on large patch arguments ("Failed to parse
-            # tool call arguments as JSON", observed hourly on
-            # challenge_menu_objects 2026-08-07) and the driver misread it as
-            # a provider outage. Plain-JSON final output is parsed client-side
-            # and bypasses the server's tool-call framing entirely -- the same
-            # path the (working) analysis phase uses. Workspace tools stay
-            # native; their arguments are tiny.
-            output_type=PromptedOutput(
-                BrowserSourcePatch,
-                name="submit_browser_source_patch",
-                description=(
-                    "Submit the browser source patch as a single JSON object "
-                    "matching the schema. Emit ONLY the JSON object, no prose."
-                ),
-            ),
+            # TextOutput with a lenient extractor, not ToolOutput and not
+            # strict PromptedOutput:
+            # - the local server's tool-call JSON parser 500s on large patch
+            #   arguments (observed hourly on challenge_menu_objects
+            #   2026-08-07), so the patch must NOT travel as a tool call;
+            # - the model prefixes prose despite instructions, and a strict
+            #   parse burned the whole request budget in validation retries
+            #   while a complete, valid patch sat in the stream. The
+            #   extractor pulls the last balanced JSON object out of the
+            #   text and validates it directly.
+            # Workspace tools stay native; their arguments are tiny.
+            output_type=TextOutput(_extract_browser_source_patch),
             retries={
                 "tools": MAX_REPAIR_ATTEMPTS,
                 "output": MAX_REPAIR_ATTEMPTS,
@@ -1424,7 +1473,9 @@ class SequentialSourcePortLoop:
         previous_patch_section = (
             "\nYour previous patch (JSON below). CORRECT THIS PATCH MINIMALLY to fix the"
             "\nreported failure -- keep the same files, structure, and naming; do not"
-            "\nredesign or relocate the implementation:\n"
+            "\nredesign or relocate the implementation. Return the COMPLETE corrected"
+            "\npatch with the FULL files array (every file, including unchanged new-file"
+            "\ncontent) -- a delta with only the changed parts is rejected:\n"
             + json.dumps(previous_patch, ensure_ascii=False)
             + "\n"
             if previous_patch
