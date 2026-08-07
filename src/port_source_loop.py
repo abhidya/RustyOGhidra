@@ -1374,6 +1374,7 @@ class SequentialSourcePortLoop:
         attempt: int,
         analysis_context: dict[str, Any] | None = None,
         required_context_paths: set[str] | None = None,
+        previous_patch: dict[str, Any] | None = None,
     ) -> str:
         research = (analysis_context or {}).get("research_corpus", {})
         ranking_bundle = {
@@ -1420,9 +1421,18 @@ class SequentialSourcePortLoop:
             entry = f"{header}{body}"
             contexts.append(entry)
             context_chars += separator_chars + len(entry)
+        previous_patch_section = (
+            "\nYour previous patch (JSON below). CORRECT THIS PATCH MINIMALLY to fix the"
+            "\nreported failure -- keep the same files, structure, and naming; do not"
+            "\nredesign or relocate the implementation:\n"
+            + json.dumps(previous_patch, ensure_ascii=False)
+            + "\n"
+            if previous_patch
+            else ""
+        )
         repair = (
             "\nThe previous patch failed these automatic gates. Modify the actual source to fix every error:\n"
-            f"{failure}\n"
+            f"{failure}\n" + previous_patch_section
             if failure
             else ""
         )
@@ -1465,6 +1475,8 @@ Patch protocol:
   target (complete content), then wire it into the existing file with ONE OR TWO tiny
   find/replace edits (an import plus a delegation call). Do not rewrite existing files.
 - For an existing file, return ordered exact find/replace edits. Each find string must occur exactly once.
+- Copy every find string BYTE-EXACT from read_browser_source output (same whitespace,
+  same line breaks). A find string composed from memory matches 0 times and fails.
 - Use complete content only when creating a new file.
 - Keep edits minimal; do not reproduce an entire existing file. Full content for an
   existing file is REJECTED automatically: you cannot reproduce it faithfully and the
@@ -1530,6 +1542,12 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
         failure: str | None = None
         touched: set[str] = set()
         attempted_paths: set[str] = set()
+        # Ratchet: repair attempts correct the PREVIOUS patch instead of
+        # regenerating from scratch. Without this, a near-passing attempt
+        # (applied + one gate from green) was discarded and the next attempt
+        # rolled new dice on file placement, wiring, and aliases -- observed
+        # repeatedly on challenge_menu_objects 2026-08-07.
+        previous_patch: dict[str, Any] | None = None
 
         first_checkpoint_attempt = _next_attempt_number(checkpoint_root)
         for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
@@ -1546,6 +1564,7 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                     *attempted_paths,
                     *(required_context_paths or set()),
                 },
+                previous_patch=previous_patch,
             )
             (attempt_root / "prompt.txt").write_text(prompt, encoding="utf-8")
             self.activity.emit(
@@ -1629,6 +1648,7 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                         status="complete",
                     )
                 patch = BrowserSourcePatch.model_validate(_json_payload(raw))
+                previous_patch = patch.model_dump(mode="json")
                 attempted_paths.update(file.path for file in patch.files)
                 atomic_write_json(
                     attempt_root / "patch.json",
