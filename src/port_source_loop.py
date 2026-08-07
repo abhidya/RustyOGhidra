@@ -1450,9 +1450,14 @@ Product result:
 - Add or update automatic tests when the supplied source shows an appropriate test surface.
 
 Patch protocol:
+- PREFERRED SHAPE: put the new implementation in a NEW file next to the integration
+  target (complete content), then wire it into the existing file with ONE OR TWO tiny
+  find/replace edits (an import plus a delegation call). Do not rewrite existing files.
 - For an existing file, return ordered exact find/replace edits. Each find string must occur exactly once.
 - Use complete content only when creating a new file.
-- Keep edits minimal; do not reproduce an entire existing file.
+- Keep edits minimal; do not reproduce an entire existing file. Full content for an
+  existing file is REJECTED automatically: you cannot reproduce it faithfully and the
+  validator protects the parts you did not see.
 - Return action="edit" with at least one file and wire it into the existing runtime.
 - The scheduler already removed proven platform/runtime functions; do not exclude this unit.
 - Do not emit placeholders, TODOs, fallbacks, documentation, shell commands, or generated reports.
