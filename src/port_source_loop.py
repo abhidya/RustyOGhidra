@@ -1824,11 +1824,34 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                         updated = target.read_text(encoding="utf-8")
                         for edit in file_patch.edits:
                             occurrences = updated.count(edit.find)
-                            if occurrences != 1:
-                                raise ValueError(
-                                    f"exact edit in {file_patch.path} matched {occurrences} times; expected 1"
+                            if occurrences == 1:
+                                updated = updated.replace(edit.find, edit.replace, 1)
+                                continue
+                            if occurrences == 0:
+                                # Whitespace-tolerant fallback: the compose
+                                # phase writes anchors from memory (tools are
+                                # closed), and indentation/whitespace drift is
+                                # the dominant mismatch. Only a UNIQUE
+                                # normalized match is spliced; git checkpoints
+                                # and every gate still stand behind this.
+                                pattern = re.compile(
+                                    r"\s+".join(
+                                        re.escape(part)
+                                        for part in edit.find.split()
+                                    )
                                 )
-                            updated = updated.replace(edit.find, edit.replace, 1)
+                                matches = list(pattern.finditer(updated))
+                                if len(matches) == 1:
+                                    span = matches[0]
+                                    updated = (
+                                        updated[: span.start()]
+                                        + edit.replace
+                                        + updated[span.end() :]
+                                    )
+                                    continue
+                            raise ValueError(
+                                f"exact edit in {file_patch.path} matched {occurrences} times; expected 1"
+                            )
                     else:
                         updated = file_patch.content or ""
                     target.parent.mkdir(parents=True, exist_ok=True)
