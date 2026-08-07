@@ -705,6 +705,9 @@ class SequentialSourcePortLoop:
         self.integration_checker = integration_checker
         self.activity = PortActivity(self.run_root / "activity.jsonl")
         self.adjacent_context_paths = self._load_adjacent_context_paths()
+        # Unit-scoped workspace-gate state; run() reseeds these per unit.
+        self._workspace_seen: set[str] = set()
+        self._workspace_served = 0
 
     def _load_adjacent_context_paths(self) -> list[str]:
         passed_files = sorted(
@@ -1000,23 +1003,24 @@ class SequentialSourcePortLoop:
         # reads past a hard budget, each refusal explicitly steering to
         # submit_browser_source_patch.
         workspace_call_budget = MAX_WORKSPACE_TOOL_CALLS * 4
-        workspace_calls = {"served": 0}
-        seen_workspace_calls: set[str] = set()
 
         def _workspace_gate(call_key: str, kind: str) -> str | None:
-            if call_key in seen_workspace_calls:
+            # State lives on self, seeded per UNIT in run(): repair attempts
+            # restart the agent, and attempt-scoped state let the model re-run
+            # its whole sweep every attempt.
+            if call_key in self._workspace_seen:
                 return json.dumps(
                     {
-                        "error": f"duplicate {kind}: this exact request was already answered in this attempt",
+                        "error": f"duplicate {kind}: this exact request was already answered for this unit",
                         "recoverable": True,
                         "instruction": (
-                            "The content is already in your context. Do not re-read. "
+                            "The content was already provided. Do not re-read. "
                             "Call submit_browser_source_patch with the edits now."
                         ),
                     },
                     ensure_ascii=False,
                 )
-            if workspace_calls["served"] >= workspace_call_budget:
+            if self._workspace_served >= workspace_call_budget:
                 return json.dumps(
                     {
                         "error": f"workspace budget exhausted ({workspace_call_budget} calls served)",
@@ -1028,8 +1032,8 @@ class SequentialSourcePortLoop:
                     },
                     ensure_ascii=False,
                 )
-            seen_workspace_calls.add(call_key)
-            workspace_calls["served"] += 1
+            self._workspace_seen.add(call_key)
+            self._workspace_served += 1
             return None
 
         def read_browser_source(
@@ -1489,6 +1493,12 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
     ) -> SourceLoopResult:
         checkpoint_root = self.run_root / "source-checkpoints" / address.removeprefix("0x")
         checkpoint_root.mkdir(parents=True, exist_ok=True)
+        # Unit-scoped, NOT attempt-scoped: repair attempts restart the agent,
+        # and with per-attempt state the model re-ran its whole read/search
+        # sweep every attempt (observed 3x on challenge_flow_state_controller,
+        # cross-attempt duplicates sailing through a fresh dedup set).
+        self._workspace_seen: set[str] = set()
+        self._workspace_served = 0
         originals: dict[Path, bytes | None] = {}
         original_manifest: dict[str, dict[str, Any]] = {}
         failure: str | None = None
