@@ -156,7 +156,9 @@ class DriverLock:
                 return True
             except FileExistsError:
                 try:
-                    holder = json.loads(self.path.read_text(encoding="utf-8"))
+                    # utf-8-sig: a BOM-prefixed lock (e.g. written by PowerShell)
+                    # must still be honored, not treated as corrupt and reclaimed.
+                    holder = json.loads(self.path.read_text(encoding="utf-8-sig"))
                     holder_pid = int(holder.get("pid", 0))
                 except (json.JSONDecodeError, OSError, ValueError):
                     holder_pid = 0
