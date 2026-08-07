@@ -1166,7 +1166,13 @@ class SequentialSourcePortLoop:
             async with agent.iter(
                 prompt,
                 usage_limits=UsageLimits(
-                    request_limit=MAX_WORKSPACE_TOOL_CALLS + 1,
+                    # One initial request, one continuation per workspace tool
+                    # result, and one FINAL request to emit the patch after the
+                    # last tool result. +1 killed every attempt that spent all
+                    # its tool calls: UsageLimitExceeded at request_limit=4 was
+                    # the rejection cause of the first live driver unit
+                    # (fun-80195d8c, 2026-08-06), after full generation cost.
+                    request_limit=MAX_WORKSPACE_TOOL_CALLS + 2,
                 ),
             ) as agent_run:
                 async for node in agent_run:
