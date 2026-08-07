@@ -1471,9 +1471,15 @@ Patch protocol:
   validator protects the parts you did not see.
 - Return action="edit" with at least one file and wire it into the existing runtime.
 - The unit's runtime_entry_symbols must exist VERBATIM as exported, reachable symbols.
-  When your implementation uses idiomatic names, add exact-name export aliases, e.g.
-  `export const spawn_challenge_menu_object_set = spawnChallengeMenuObjectSet;` --
-  the reachability gate matches the exact original names and fails anything else.
+  ONLY IF your implementation uses a different idiomatic name, add an exact-name export
+  alias (`export const spawn_x = spawnX;`). If the function is already declared with the
+  exact name, exporting that declaration is sufficient -- an extra alias is a duplicate
+  identifier and fails typecheck.
+- TypeScript conformance (typecheck gate is strict): prefix intentionally-unused
+  parameters and locals with an underscore (`_param10`); declare any local you reassign
+  with `let`, never `const`; reference only globals that already exist in current source,
+  and define any missing ROM data constant at module level in your new file with its ROM
+  address in a comment.
 - The scheduler already removed proven platform/runtime functions; do not exclude this unit.
 - Do not emit placeholders, TODOs, fallbacks, documentation, shell commands, or generated reports.
 This exact body also represents these original addresses: {aliases}
