@@ -82,6 +82,12 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def normalize_address(value: str) -> str:
     raw = str(value).strip().lower().removeprefix("0x")
+    # Model transcriptions drop a leading zero from the low digits often enough
+    # to matter (a single `0x80064d4` once discarded a full 150/150-coverage
+    # analysis): repair 7-digit 8xxxxxxx forms by re-padding the low digits
+    # instead of rejecting the whole structured response.
+    if re.fullmatch(r"8[0-9a-f]{6}", raw):
+        raw = "8" + raw[1:].zfill(7)
     if not re.fullmatch(r"[0-9a-f]{8}", raw):
         raise ValueError(f"invalid function address: {value}")
     return f"0x{raw}"
@@ -457,13 +463,25 @@ def _model_prompt(
         "chunk": chunk.name,
         "function_count": len(chunk.functions),
         "functions": deterministic.functions,
-        "candidate_units": [unit.model_dump(mode="json") for unit in deterministic.units],
+        # Membership only. A full schema-shaped candidate dump (labels,
+        # boilerplate summaries, dependency lists) is a copy-paste target:
+        # observed live, repair rounds degenerated into transcribing it
+        # verbatim until truncation instead of analyzing.
+        "candidate_groupings": [
+            {"id": unit.id, "function_addresses": unit.function_addresses}
+            for unit in deterministic.units
+        ],
     }
+    # Appended AFTER the static evidence: the evidence prefix is identical
+    # across attempts and prompt-caches at ~100% (measured 111,006/111,010
+    # cached tokens); injecting feedback ahead of it forced a full re-prefill
+    # (~10 min on this hardware) on every repair round.
     repair_section = (
         f"""
 
 A previous attempt at this exact task was rejected. Fix ONLY the reported problem and
-return the complete corrected assignment (the validator re-checks full coverage):
+return the complete corrected assignment (the validator re-checks full coverage). Do not
+copy candidate_groupings back as your answer; produce your own analysis:
 {repair_feedback}
 """
         if repair_feedback
@@ -479,13 +497,14 @@ function names from the chunk that a production caller must reach. target_source
 only likely existing browser source integration files; use an empty list when unresolved.
 To conserve output, leave hardware_or_sdk_functions and game_owned_functions as empty lists --
 they are derived from your units' classifications; do not repeat per-function metadata.
-{repair_section}
+Emit compact single-line JSON with no indentation or extra whitespace.
+
 Deterministic evidence:
 {json.dumps(facts, indent=2)}
 
 Complete decompiler chunk:
 {chr(10).join(function.c for function in chunk.functions)}
-"""
+{repair_section}"""
 
 
 class ChunkPortWorkflow:
@@ -650,18 +669,23 @@ class ChunkPortWorkflow:
     ) -> ChunkAnalysis:
         """One structured analysis with bounded delta-repair (D4, R11/R12/R14).
 
-        Output budget scales with the chunk (90 tok/function + headroom): the
-        historical flat 32,768 silently truncated 150-address partitions and
-        every request was wasted (G11). Coverage/parse failures feed the exact
-        violations back for at most ``ANALYSIS_MAX_REQUESTS - 1`` repair rounds.
-        Every raw response is archived before validation so a failed run no
-        longer discards a 20-minute generation.
+        Output budget scales with the chunk and is deliberately NOT ceiling-
+        clamped: the measured demand for a 150-function chunk is 123-134
+        tokens/function (~20k total), and the prior ``min(..., 28672)`` /
+        90 tok/fn heuristic sat BELOW that -- it guaranteed the truncation it
+        was meant to prevent while the flat 32,768 had parsed cleanly four
+        times in a row. Reasoning-model thinking tokens also spend from this
+        same budget. The serving context, not this client, is the real bound.
+        Coverage/parse failures feed the exact violations back for at most
+        ``ANALYSIS_MAX_REQUESTS - 1`` repair rounds. Every raw response is
+        archived before validation so a failed run no longer discards a
+        20-minute generation.
         """
         fn_count = len(chunk.functions)
         max_tokens = int(
             os.getenv(
                 "OGHIDRA_CHUNK_ANALYSIS_MAX_TOKENS",
-                str(max(4096, min(90 * fn_count + 2048, 28672))),
+                str(max(32768, 160 * fn_count + 4096)),
             )
         )
         llm, provider, model_name = self.llm_factory()

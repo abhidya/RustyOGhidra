@@ -341,8 +341,10 @@ def test_analyzer_repairs_coverage_violations_within_request_budget(tmp_path: Pa
     assert workflow.last_analyze_requests == 2
     assert len(llm.calls) == 2
     assert "missing=['0x80002000']" in llm.calls[1]["prompt"]
-    # Output budget scales with the chunk instead of the flat 32768 (G11/R12).
-    assert llm.calls[0]["max_tokens"] == 4096
+    # Output budget floors at 32768 and scales UP with the chunk, never
+    # ceiling-clamped: the 90 tok/fn + 28672 clamp sat below the measured
+    # 123-134 tok/fn demand and guaranteed truncation (chunk_0048, 2026-08-07).
+    assert llm.calls[0]["max_tokens"] == 32768
     chunk_root = workflow.chunk_root("chunk_0048")
     assert (chunk_root / "analysis-attempt-1.raw.txt").is_file()
     assert (chunk_root / "analysis-attempt-2.raw.txt").is_file()

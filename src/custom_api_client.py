@@ -407,6 +407,7 @@ class CustomAPIClient:
         tool_name: str | None = None
         tool_arguments: List[str] = []
         usage: Dict[str, Any] = {}
+        finish_reason: str | None = None
         saw_sse = False
         raw_lines: List[str] = []
 
@@ -464,6 +465,7 @@ class CustomAPIClient:
             # finish_reason chunk. Do not require a subsequent [DONE] sentinel
             # from local servers that leave the SSE socket open.
             if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
                 break
 
         if not saw_sse:
@@ -503,7 +505,14 @@ class CustomAPIClient:
             raise APIResponseError(
                 "Custom API stream contained no assistant content or tool call"
             )
-        return {"choices": [{"message": message}], "usage": usage}
+        # finish_reason None here means the stream ended WITHOUT the server
+        # declaring completion -- a dropped/aborted stream. Callers must be
+        # able to tell that apart from "stop": a truncated JSON body that
+        # logged as plain success cost three 22-minute analysis attempts.
+        return {
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+            "usage": usage,
+        }
 
     def _apply_global_throttle(self) -> None:
         """Enforce a global minimum interval between request starts."""
@@ -806,6 +815,11 @@ class CustomAPIClient:
             payload["response_format"] = response_format
         if stream_callback is not None:
             payload["stream"] = True
+            # Ask OpenAI-compatible servers to attach usage to the final
+            # stream chunk; servers that don't support it ignore the field.
+            # Without this the streaming path reports no token accounting at
+            # all ("tokens": {}) and truncation goes undetected.
+            payload["stream_options"] = {"include_usage": True}
 
         # Construct API endpoint URL
         if self.base_url.endswith("/chat/completions") or self.base_url.endswith("/v1/chat/completions"):
@@ -1054,6 +1068,7 @@ class CustomAPIClient:
                         "model": effective_model,
                         "phase": phase,
                         "status": "success",
+                        "finish_reason": (data.get("choices") or [{}])[0].get("finish_reason"),
                         "response": response_text if self.llm_log_responses else "[REDACTED]",
                         "tokens": usage if self.llm_log_tokens else None,
                         "duration_ms": duration_ms if self.llm_log_timing else None,
