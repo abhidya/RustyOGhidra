@@ -1484,9 +1484,9 @@ Patch protocol:
 - Return action="edit" with at least one file and wire it into the existing runtime.
 - REACHABILITY GATE (exact contract): every runtime_entry_symbol must appear VERBATIM at
   a production USE site -- a call (`spawn_challenge_menu_object_set(ctx)`) or a runtime
-  dispatch-map registration (`{ spawn_challenge_menu_object_set, ... }`) in an existing
+  dispatch-map registration (`{{ spawn_challenge_menu_object_set, ... }}`) in an existing
   gameplay file OTHER than where it is declared. Declarations, imports, alias exports,
-  and `export {}` re-exports are all IGNORED by the checker. Wire each entry symbol into
+  and `export {{}}` re-exports are all IGNORED by the checker. Wire each entry symbol into
   the real update/dispatch path of the scene or VM that owns this behavior.
 - TypeScript conformance (typecheck gate is strict): prefix intentionally-unused
   parameters and locals with an underscore (`_param10`); declare any local you reassign
