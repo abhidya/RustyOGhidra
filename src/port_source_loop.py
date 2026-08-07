@@ -23,6 +23,7 @@ from pydantic_ai import (
     PartStartEvent,
     TextPartDelta,
     ThinkingPartDelta,
+    PromptedOutput,
     ToolCallPartDelta,
     ToolOutput,
     UsageLimits,
@@ -1160,11 +1161,21 @@ class SequentialSourcePortLoop:
             model,
             instructions=system_prompt,
             tools=[read_browser_source, search_browser_source],
-            output_type=ToolOutput(
+            # PromptedOutput, not ToolOutput: the local server's tool-call
+            # JSON parser 500s on large patch arguments ("Failed to parse
+            # tool call arguments as JSON", observed hourly on
+            # challenge_menu_objects 2026-08-07) and the driver misread it as
+            # a provider outage. Plain-JSON final output is parsed client-side
+            # and bypasses the server's tool-call framing entirely -- the same
+            # path the (working) analysis phase uses. Workspace tools stay
+            # native; their arguments are tiny.
+            output_type=PromptedOutput(
                 BrowserSourcePatch,
                 name="submit_browser_source_patch",
-                strict=False,
-                max_retries=MAX_REPAIR_ATTEMPTS,
+                description=(
+                    "Submit the browser source patch as a single JSON object "
+                    "matching the schema. Emit ONLY the JSON object, no prose."
+                ),
             ),
             retries={
                 "tools": MAX_REPAIR_ATTEMPTS,
