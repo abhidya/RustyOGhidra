@@ -1096,7 +1096,13 @@ class SequentialSourcePortLoop:
             model_settings=OpenAIChatModelSettings(
                 temperature=0.1,
                 max_tokens=MODEL_MAX_OUTPUT_TOKENS,
-                tool_choice="auto",
+                # "required", not "auto": with thinking disabled the model
+                # moved its deliberation into plain assistant text instead
+                # (156k chars, zero patch bytes, borg_action_state_machine
+                # 2026-08-07). Requiring a tool call on every response makes
+                # narration impossible -- each turn is either a bounded
+                # workspace read or the patch submission itself.
+                tool_choice="required",
                 parallel_tool_calls=False,
                 extra_body={
                     **(
