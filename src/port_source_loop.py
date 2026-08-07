@@ -990,6 +990,47 @@ class SequentialSourcePortLoop:
             ),
         )
         transcript: list[dict[str, str]] = []
+        # Observed live (challenge_flow_state_controller, 2026-08-07): the
+        # model read the same two files in the same sequence three times over
+        # -- 30 workspace calls, zero patch -- because accumulated 800-line
+        # tool results overflow the serving context, earlier reads fall out,
+        # and the model re-reads what it forgot until the request limit kills
+        # the attempt. The tool layer is the only enforcement point the local
+        # server can't ignore: refuse exact-duplicate calls and stop serving
+        # reads past a hard budget, each refusal explicitly steering to
+        # submit_browser_source_patch.
+        workspace_call_budget = MAX_WORKSPACE_TOOL_CALLS * 4
+        workspace_calls = {"served": 0}
+        seen_workspace_calls: set[str] = set()
+
+        def _workspace_gate(call_key: str, kind: str) -> str | None:
+            if call_key in seen_workspace_calls:
+                return json.dumps(
+                    {
+                        "error": f"duplicate {kind}: this exact request was already answered in this attempt",
+                        "recoverable": True,
+                        "instruction": (
+                            "The content is already in your context. Do not re-read. "
+                            "Call submit_browser_source_patch with the edits now."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            if workspace_calls["served"] >= workspace_call_budget:
+                return json.dumps(
+                    {
+                        "error": f"workspace budget exhausted ({workspace_call_budget} calls served)",
+                        "recoverable": False,
+                        "instruction": (
+                            "No further reads will be served. "
+                            "Call submit_browser_source_patch with the edits now."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            seen_workspace_calls.add(call_key)
+            workspace_calls["served"] += 1
+            return None
 
         def read_browser_source(
             path: str,
@@ -1009,6 +1050,22 @@ class SequentialSourcePortLoop:
                 raw_arguments,
                 status="running",
             )
+            refusal = _workspace_gate(f"read:{path}:{start_line}:{end_line}", "read")
+            if refusal is not None:
+                transcript.append(
+                    {
+                        "name": "read_browser_source",
+                        "arguments": raw_arguments,
+                        "result": refusal,
+                    }
+                )
+                self.activity.emit(
+                    "tool",
+                    "Workspace result · read_browser_source",
+                    refusal,
+                    status="failed",
+                )
+                return refusal
             try:
                 result = _read_browser_source(self.repo_root, arguments)
             except Exception as error:
@@ -1050,6 +1107,22 @@ class SequentialSourcePortLoop:
                 raw_arguments,
                 status="running",
             )
+            refusal = _workspace_gate(f"search:{query}", "search")
+            if refusal is not None:
+                transcript.append(
+                    {
+                        "name": "search_browser_source",
+                        "arguments": raw_arguments,
+                        "result": refusal,
+                    }
+                )
+                self.activity.emit(
+                    "tool",
+                    "Workspace result · search_browser_source",
+                    refusal,
+                    status="failed",
+                )
+                return refusal
             try:
                 result = _search_browser_source(self.repo_root, arguments)
             except Exception as error:
