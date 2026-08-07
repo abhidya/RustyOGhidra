@@ -722,6 +722,7 @@ class CustomAPIClient:
         response_format: Optional[Dict[str, Any]] = None,
         stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Generate a response from the Custom API.
@@ -778,6 +779,11 @@ class CustomAPIClient:
             "messages": conversation,
             "temperature": effective_temperature,
         }
+        if chat_template_kwargs is not None:
+            # e.g. {"enable_thinking": False}: the server's launch default
+            # enables thinking, and a reasoning burn on a structured request
+            # can consume the whole output budget with zero content.
+            payload["chat_template_kwargs"] = chat_template_kwargs
 
         # Intelligent token limit adjustment based on model type
         if is_claude_model:
@@ -1144,6 +1150,7 @@ class CustomAPIClient:
         accept_plain_tool_response: bool = False,
         prefer_json_schema: bool = False,
         stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str]:
         """Generate schema-constrained JSON with observable compatibility fallbacks.
 
@@ -1168,6 +1175,7 @@ class CustomAPIClient:
                 phase=phase,
                 response_format=response_format,
                 stream_callback=stream_callback,
+                chat_template_kwargs=chat_template_kwargs,
             )
             return response, "json_schema"
 
@@ -1193,6 +1201,7 @@ class CustomAPIClient:
                 tools=[tool],
                 tool_choice=choice,
                 stream_callback=stream_callback,
+                chat_template_kwargs=chat_template_kwargs,
             )
             if self.last_response_metadata.get("structured_output_mode") == "tool_call":
                 return response, "tool_call"
@@ -1228,6 +1237,7 @@ class CustomAPIClient:
                 phase=phase,
                 response_format=response_format,
                 stream_callback=stream_callback,
+                chat_template_kwargs=chat_template_kwargs,
             )
             return response, "json_schema"
         except requests.exceptions.HTTPError as error:
@@ -1244,6 +1254,7 @@ class CustomAPIClient:
             max_tokens=max_tokens,
             phase=phase,
             stream_callback=stream_callback,
+            chat_template_kwargs=chat_template_kwargs,
         )
         return response, "plain_json"
 

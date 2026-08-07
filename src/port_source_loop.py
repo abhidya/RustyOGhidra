@@ -1722,6 +1722,12 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                         phase=f"finish_game_source:{address}:attempt_{attempt}:compose",
                         accept_plain_tool_response=True,
                         stream_callback=stream_event,
+                        # The server's launch default enables thinking; without
+                        # this the compose request burned its whole budget on
+                        # reasoning and returned zero content.
+                        chat_template_kwargs=(
+                            {"enable_thinking": False} if PORT_DISABLE_THINKING else None
+                        ),
                     )
                     workspace_trace = []
                 (attempt_root / "response.txt").write_text(raw, encoding="utf-8")
