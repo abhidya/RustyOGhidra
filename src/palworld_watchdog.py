@@ -787,13 +787,18 @@ def main() -> int:
     arguments = parser.parse_args()
     config = WatchdogConfig()
     config.state_dir.mkdir(parents=True, exist_ok=True)
+    # Under pythonw.exe (windowless -- the owner must never see a console
+    # window they could accidentally freeze or kill) sys.stdout is None, so
+    # attach a stream handler only when a real console exists.
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(config.state_dir / "watchdog.log", encoding="utf-8")
+    ]
+    if sys.stdout is not None:
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(config.state_dir / "watchdog.log", encoding="utf-8"),
-        ],
+        handlers=handlers,
     )
     lock = acquire_single_instance(config)
     if lock is None:
