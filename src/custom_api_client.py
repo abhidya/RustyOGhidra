@@ -908,7 +908,23 @@ class CustomAPIClient:
                 if stream_callback is not None:
                     request_arguments["stream"] = True
                 resp = requests.post(api_url, **request_arguments)
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as error:
+                    # Keep the response body in the message: the server's 400
+                    # for an unloaded model says "no model loaded" ONLY in the
+                    # body, and the workflow's TRANSIENT_MARKERS pause rule
+                    # matches on message text. Discarding the body turned
+                    # provider outages into permanent analysis_blocked /
+                    # rejected_final ledger verdicts (2026-08-08 storms).
+                    detail = ""
+                    try:
+                        detail = (resp.text or "").strip()[:300]
+                    except Exception:
+                        pass
+                    raise requests.exceptions.HTTPError(
+                        f"{error} | body: {detail}", response=resp
+                    ) from error
                 return resp
 
             def observed_stream_callback(event_type: str, event: Dict[str, Any]) -> None:

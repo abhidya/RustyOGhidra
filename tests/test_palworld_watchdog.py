@@ -135,6 +135,34 @@ def test_player_join_unloads_kills_and_protects(tmp_path: Path):
     assert control["command"] == "stop_after_stage"
 
 
+def test_protection_kills_workers_before_unloading_model(tmp_path: Path, monkeypatch):
+    # Ordering is load-bearing (owner decision 2026-08-08): a worker that
+    # outlives the model misreads the resulting 400s as permanent failures.
+    watchdog, palworld, unsloth, driver, _ = make_watchdog(tmp_path)
+    driver.alive = True
+    palworld.players = 1
+    sequence: list[str] = []
+    monkeypatch.setattr(driver, "kill_all", lambda: sequence.append("kill"))
+    monkeypatch.setattr(unsloth, "unload_force", lambda: sequence.append("unload"))
+
+    watchdog.iterate()
+
+    assert sequence == ["kill", "unload"]
+
+
+def test_http_error_body_reaches_transient_markers():
+    # The client now appends the response body to HTTPError messages; the
+    # workflow's pause rule must match the unloaded-model body text.
+    from src.port_chunk_workflow import TRANSIENT_MARKERS
+
+    message = (
+        "HTTPError: 400 Client Error: Bad Request for url: "
+        "http://127.0.0.1:8888/v1/chat/completions | body: "
+        '{"error": "No model loaded. Load a model first."}'
+    )
+    assert any(marker in message.lower() for marker in TRANSIENT_MARKERS)
+
+
 def test_protection_kills_even_when_control_write_fails(tmp_path: Path, monkeypatch):
     watchdog, palworld, _, driver, _ = make_watchdog(tmp_path)
     driver.alive = True

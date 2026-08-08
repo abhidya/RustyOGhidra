@@ -398,11 +398,15 @@ class Watchdog:
         self.last_protection_at: float | None = None
         self.last_embeddings_at: float | None = None
         self.last_sample_at: float | None = None
+        self.last_state_write: float | None = None
+        self.last_reason = "starting"
         self.consecutive_loop_failures = 0
 
     # ----------------------------------------------------------------- telemetry
 
     def write_state(self, reason: str, players: int | None = None) -> None:
+        self.last_state_write = self.clock()
+        self.last_reason = reason
         driver_pid = (
             self.driver.process.pid
             if self.driver.process and self.driver.process.poll() is None
@@ -503,17 +507,21 @@ class Watchdog:
     # ---------------------------------------------------------------- protection
 
     def protect(self, reason: str, players: int | None) -> None:
-        """Nothing before kill_all may abort protection."""
+        """Kill FIRST, unload SECOND. Nothing before kill_all may abort protection.
+
+        Ordering is load-bearing (owner decision 2026-08-08): a worker that
+        outlives the model by even seconds misclassifies the resulting 400s as
+        permanent failures and writes false verdicts into the ledger. Dead
+        workers write nothing, so the kill precedes the unload; players lose
+        no time because the kill is near-instant.
+        """
         self.mode = "protected"
         try:
             self.write_control("stop_after_stage")
         except OSError as error:
             logger.warning("control write failed during protection: %s", error)
-        self.unsloth.unload_force()  # swallows internally
-        deadline = self.clock() + self.config.stop_grace_seconds
-        while self.clock() < deadline and self.driver.any_driver_alive():
-            self.sleep(0.25)
         self.driver.kill_all()
+        self.unsloth.unload_force()  # swallows internally
         self.reset_liveness()
         self.short_run_count = 0
         self.locked_run_count = 0
@@ -754,6 +762,15 @@ class Watchdog:
         while True:
             try:
                 self.iterate()
+                # Heartbeat: the widget's oghidra card renders supervisor
+                # liveness from this file's freshness, so it must move even
+                # when nothing transitions (the windowless process has no
+                # other owner-facing signal).
+                if (
+                    self.last_state_write is None
+                    or self.clock() - self.last_state_write >= 10
+                ):
+                    self.write_state(self.last_reason)
                 self.consecutive_loop_failures = 0
             except Exception:  # one failed iteration may never kill protection
                 self.consecutive_loop_failures += 1
