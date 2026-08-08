@@ -523,7 +523,10 @@ class ChunkPortWorkflow:
         self.run_root = self.repo_root / "research/decomp/generated/finish-game-port/chunks"
         self.run_id = os.getenv("OGHIDRA_PORT_RUN_ID") or utc_now()
         self.llm_factory = llm_factory or self._default_llm_factory
-        self.state_path = self.run_root.parent / "run-state.json"
+        # unit-state.json, NOT run-state.json: run-state is driver-owned. Both
+        # writers previously shared run-state.json and raced mid-port, so the
+        # supervisor could not trust it while a step was in flight.
+        self.state_path = self.run_root.parent / "unit-state.json"
         self.session_index_path = self.run_root.parent / "session-index.json"
         self._session_functions_cache: dict[str, dict[str, Any]] | None = None
         # Structured requests spent by the most recent analyze(); drivers use

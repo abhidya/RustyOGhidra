@@ -280,6 +280,33 @@ def test_progress_mirrors_real_counts_into_run_state(tmp_path: Path):
     assert isinstance(state["queue"], list)
 
 
+def test_run_state_is_driver_owned_and_porting_names_the_unit(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    units = [unit("alpha", ["0x80001000", "0x80001004"], entry_symbols=["alpha_real"])]
+    workflow = StubWorkflow(root, analysis_with(units))
+    driver = make_driver(root, workflow)
+    state_path = root / "research/decomp/generated/finish-game-port/run-state.json"
+    porting_snapshots: list[dict] = []
+    original = workflow.port_unit
+
+    def capture(chunk: str, unit_id: str):
+        porting_snapshots.append(json.loads(state_path.read_text(encoding="utf-8")))
+        return original(chunk, unit_id)
+
+    workflow.port_unit = capture
+    driver.run()
+
+    # Mid-port, run-state must carry the driver's view including the unit.
+    assert porting_snapshots[0]["run_mode"] == "driver"
+    assert porting_snapshots[0]["status"] == "porting"
+    assert porting_snapshots[0]["chunk"] == "chunk_0048"
+    assert porting_snapshots[0]["unit"] == "alpha"
+    # The unit workflow writes its own file, never run-state.json.
+    from src.port_chunk_workflow import ChunkPortWorkflow
+
+    assert ChunkPortWorkflow(repo_root=root).state_path.name == "unit-state.json"
+
+
 def test_events_stream_records_the_step_with_run_ids(tmp_path: Path):
     root = fixture_repo(tmp_path)
     units = [unit("alpha", ["0x80001000"], entry_symbols=["alpha_real"])]

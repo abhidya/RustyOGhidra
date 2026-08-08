@@ -571,7 +571,14 @@ class PortDriver:
 
     # --------------------------------------------------------------- progress
 
-    def _write_progress(self, ledger: dict[str, Any], status: str) -> None:
+    def _write_progress(
+        self,
+        ledger: dict[str, Any],
+        status: str,
+        *,
+        chunk: str | None = None,
+        unit: str | None = None,
+    ) -> None:
         counters = ledger["counters"]
         units_known = sum(
             len(chunk_record.get("units", {})) for chunk_record in ledger["chunks"].values()
@@ -613,6 +620,13 @@ class PortDriver:
             },
             "queue": pending,
         }
+        # Driver is the SOLE writer of run-state.json (the unit workflow writes
+        # unit-state.json); chunk/unit here keep the dashboard's "state:" line
+        # informative now that the workflow no longer supplies them.
+        if chunk is not None:
+            state["chunk"] = chunk
+        if unit is not None:
+            state["unit"] = unit
         atomic_write_json(self.run_root / "run-state.json", state)
         self.events.emit("progress", **state["counters"])
 
@@ -646,10 +660,12 @@ class PortDriver:
                 )
                 try:
                     if action == "analyze":
-                        self._write_progress(ledger, "analyzing")
+                        self._write_progress(ledger, "analyzing", chunk=chunk)
                         self._run_analysis(ledger, chunk)
                     else:
-                        self._write_progress(ledger, "porting")
+                        self._write_progress(
+                            ledger, "porting", chunk=chunk, unit=unit.id
+                        )
                         self._run_port(ledger, chunk, unit)
                 except ProviderUnavailable as error:
                     self._write_progress(ledger, "paused_provider_unavailable")
