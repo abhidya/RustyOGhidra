@@ -43,7 +43,25 @@ SESSION_SUMMARY_CHARS = 600
 PLACEHOLDER_NAME = re.compile(r"^(?:FUN|LAB)_[0-9a-fA-F]{8}$|^zz_[0-9a-fA-F]+_?$")
 # Product ordering: faithful browser combat, family-by-family. The first ported
 # unit must be the chunk_0048 challenge-flow controller (session corpus names).
-DEFAULT_PRIORITY_CHUNKS = ["chunk_0048"]
+# Combat families first (project objective). Order: challenge flow, then the
+# combat core (decision brain, attack handlers, hit resolution, damage formula,
+# action VM), then support systems and decoded specials. Sources:
+# attack-mechanics-findings.md, action-vm-and-gcrash-decode-2026-07-05.md.
+DEFAULT_PRIORITY_CHUNKS = [
+    "chunk_0048",  # challenge flow
+    "chunk_0009",  # decision brain / command dispatch
+    "chunk_0007",  # attack handlers / per-frame combat state
+    "chunk_0003",  # collision / hit resolution
+    "chunk_0004",  # damage formula
+    "chunk_0006",  # action VM interpreter
+    "chunk_0002",  # ammo / infinite-ammo gates
+    "chunk_0013",  # hit-pair dispatch table
+    "chunk_0008",  # buff/debuff system
+    "chunk_0031",  # Star Hero X dash (decoded special)
+    "chunk_0047",  # G RED X-special state machine (decoded special)
+    "chunk_0029",  # deployed-object ammo return
+    "chunk_0036",  # deploy / ammo continuation
+]
 DEFAULT_PRIORITY_ENTRY_SYMBOLS = [
     "dispatch_challenge_flow_state",
     "init_challenge_flow_state",
@@ -207,7 +225,9 @@ class PortDriver:
 
     def _load_or_create_ledger(self) -> dict[str, Any]:
         if self.ledger_path.is_file():
-            return json.loads(self.ledger_path.read_text(encoding="utf-8"))
+            ledger = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+            self._reconcile_priorities(ledger)
+            return ledger
         manifest_path = self.run_root / "whole-program-manifest.json"
         integrated: list[str] = []
         fingerprints: dict[str, str] = {}
@@ -254,6 +274,34 @@ class PortDriver:
         }
         self._save_ledger(ledger, reason="created_with_legacy_import")
         return ledger
+
+    def _reconcile_priorities(self, ledger: dict[str, Any]) -> None:
+        """Code is the priority authority: merge DEFAULT_PRIORITY_CHUNKS /
+        DEFAULT_PRIORITY_ENTRY_SYMBOLS into an existing ledger at startup.
+
+        Defaults were previously applied only at ledger creation, so growing the
+        seed list required hand-editing a live state file (unsafe: the driver
+        flushes its in-memory ledger after every step and clobbers concurrent
+        edits). Default order wins; ledger-only extras are kept after it.
+        """
+        changed = False
+        for key, defaults in (
+            ("priority_chunks", DEFAULT_PRIORITY_CHUNKS),
+            ("priority_entry_symbols", DEFAULT_PRIORITY_ENTRY_SYMBOLS),
+        ):
+            current = list(ledger.get(key, []))
+            extras = [name for name in current if name not in defaults]
+            merged = list(defaults) + extras
+            if merged != current:
+                ledger[key] = merged
+                changed = True
+        if changed:
+            self._save_ledger(ledger, reason="priorities_reconciled_from_defaults")
+            self.events.emit(
+                "priorities_reconciled",
+                priority_chunks=ledger["priority_chunks"],
+                priority_entry_symbols=ledger["priority_entry_symbols"],
+            )
 
     def _save_ledger(self, ledger: dict[str, Any], *, reason: str) -> None:
         ledger["updated_at"] = utc_now()

@@ -149,6 +149,26 @@ def test_priority_combat_unit_ports_first_and_singletons_wait(tmp_path: Path):
     assert workflow.analyze_calls == 0
 
 
+def test_existing_ledger_priorities_reconcile_from_code_defaults(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    workflow = StubWorkflow(root, analysis_with([unit("gx", ["0x80002000"], classification="hardware_or_sdk")]))
+    # First run creates the ledger; simulate a stale seed list plus an
+    # owner-added extra that must survive after the code defaults.
+    make_driver(root, workflow).run()
+    path = root / "research/decomp/generated/finish-game-port/port-ledger.json"
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    ledger["priority_chunks"] = ["chunk_0048", "chunk_9999"]
+    path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    make_driver(root, workflow).run()
+
+    from src.port_driver import DEFAULT_PRIORITY_CHUNKS, DEFAULT_PRIORITY_ENTRY_SYMBOLS
+
+    ledger = read_ledger(root)
+    assert ledger["priority_chunks"] == list(DEFAULT_PRIORITY_CHUNKS) + ["chunk_9999"]
+    assert ledger["priority_entry_symbols"] == list(DEFAULT_PRIORITY_ENTRY_SYMBOLS)
+
+
 def test_all_terminal_run_exits_zero_with_no_requests_or_ports(tmp_path: Path):
     root = fixture_repo(tmp_path)
     units = [
