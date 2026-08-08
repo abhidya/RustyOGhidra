@@ -82,6 +82,14 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def normalize_address(value: str) -> str:
     raw = str(value).strip().lower().removeprefix("0x")
+    # Ghidra placeholder names literally encode their address; the model
+    # naturally writes them in address slots because they fill the prompt
+    # (`FUN_8006f0cc` in state_dispatchers rejected a second 150/150-coverage
+    # analysis on 2026-08-08). Decode instead of rejecting -- same rule the
+    # unit-symbol enrichment already applies.
+    placeholder = re.fullmatch(r"(?:fun|lab)_([0-9a-f]{8})", raw)
+    if placeholder:
+        raw = placeholder.group(1)
     # Model transcriptions drop a leading zero from the low digits often enough
     # to matter (a single `0x80064d4` once discarded a full 150/150-coverage
     # analysis): repair 7-digit 8xxxxxxx forms by re-padding the low digits

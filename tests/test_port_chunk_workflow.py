@@ -9,6 +9,7 @@ from src.port_chunk_workflow import (
     ProviderUnavailable,
     UnitSkipResult,
     build_deterministic_analysis,
+    normalize_address,
     parse_chunk_export,
     unit_eligibility,
 )
@@ -395,3 +396,18 @@ def test_provider_failure_pauses_after_one_analysis_request(tmp_path: Path):
     state = json.loads(workflow.state_path.read_text(encoding="utf-8"))
     assert state["status"] == "paused_provider_unavailable"
     assert state["model_requests"] == 1
+
+
+def test_normalize_address_decodes_ghidra_placeholder_names():
+    # 2026-08-08: `FUN_8006f0cc` in state_dispatchers rejected a full
+    # 150/150-coverage chunk_0009 analysis. Placeholder names encode their
+    # address; decode them like src.port_artifact.normalize_address does.
+    import pytest
+
+    assert normalize_address("FUN_8006f0cc") == "0x8006f0cc"
+    assert normalize_address("LAB_80195F2C") == "0x80195f2c"
+    assert normalize_address("0x80064d4") == "0x800064d4"  # 7-digit repair intact
+    with pytest.raises(ValueError):
+        normalize_address("zz_0055f90_")  # session junk names stay rejected
+    with pytest.raises(ValueError):
+        normalize_address("FUN_123")
