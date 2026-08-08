@@ -85,10 +85,12 @@ class WatchdogConfig:
     model_path: str = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
     gguf_variant: str = "UD-Q4_K_XL"
     # Native max (owner decision 2026-08-08: latency is acceptable, coverage is
-    # not negotiable -- four combat chunks need ~230k). q8_0 KV halves cache
-    # bytes, making 262k @ q8 roughly VRAM-equal to the old 131k @ fp16.
+    # not negotiable -- four combat chunks need ~230k). KV stays f16 (owner
+    # call, same evening: no cache quantization). If 262k f16 KV cannot fit
+    # alongside the weights, spill MoE experts to CPU via load_extras
+    # {"n_cpu_moe": N} rather than touching KV precision.
     max_seq_length: int = 262144
-    kv_cache_type: str | None = "q8_0"
+    kv_cache_type: str | None = None
     min_context: int = 80000
     lms_exe: Path = Path(r"C:\Users\manny\.lmstudio\bin\lms.exe")
     embed_probe_url: str = "http://127.0.0.1:1234/v1/models"
