@@ -65,6 +65,17 @@ class WatchdogConfig:
         r"\Config\WindowsServer\PalWorldSettings.ini"
     )
     pal_metrics_url: str = "http://127.0.0.1:8212/v1/api/metrics"
+    pal_players_url: str = "http://127.0.0.1:8212/v1/api/players"
+    # Rig dashboard contract (rig HANDOFF #15 + server.ps1 toast hook): the
+    # supervisor is the PRODUCER of the palworld time-series, the roster, and
+    # the legacy monitor-state file. Keep writing all three or the rig widget
+    # sparkline flatlines and "heavy work BLOCKED" toasts never fire.
+    rig_metrics_jsonl: Path = Path(r"D:\rig\state\palworld-metrics.jsonl")
+    rig_players_json: Path = Path(r"D:\rig\state\palworld-players.json")
+    reset_marker: Path = Path(r"D:\rig\state\reset-request.marker")
+    legacy_state_path: Path = Path(
+        r"D:\Palworld_Server_Setup\monitor\palworld-oghidra-monitor-state.json"
+    )
     unsloth_base: str = "http://127.0.0.1:8888"
     unsloth_exe: Path = Path(r"C:\Users\manny\.unsloth\studio\bin\unsloth.exe")
     unsloth_workdir: Path = Path(os.environ.get("USERPROFILE", r"C:\Users\manny"))
@@ -137,13 +148,18 @@ class PalworldApi:
             self._headers = {"Authorization": f"Basic {token}", "Accept": "application/json"}
         return self._headers
 
-    def player_count(self) -> int:
+    def metrics(self) -> dict[str, Any]:
         response = requests.get(self.config.pal_metrics_url, headers=self._auth(), timeout=2)
         response.raise_for_status()
-        players = response.json().get("currentplayernum")
-        if players is None:
+        body = response.json()
+        if body.get("currentplayernum") is None:
             raise RuntimeError("metrics response missing currentplayernum")
-        return int(players)
+        return body
+
+    def roster(self) -> list[dict[str, Any]]:
+        response = requests.get(self.config.pal_players_url, headers=self._auth(), timeout=3)
+        response.raise_for_status()
+        return list(response.json().get("players") or [])
 
     def server_running(self) -> bool:
         return any(
@@ -363,28 +379,78 @@ class Watchdog:
         self.locked_run_count = 0
         self.last_protection_at: float | None = None
         self.last_embeddings_at: float | None = None
+        self.last_sample_at: float | None = None
         self.consecutive_loop_failures = 0
 
     # ----------------------------------------------------------------- telemetry
 
     def write_state(self, reason: str, players: int | None = None) -> None:
+        driver_pid = (
+            self.driver.process.pid
+            if self.driver.process and self.driver.process.poll() is None
+            else None
+        )
+        state = {
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "mode": self.mode,
+            "players": players,
+            "reason": reason,
+            "api_failures": self.api_failures,
+            "blocked_reason": self.blocked_reason,
+            "driver_pid": driver_pid,
+        }
+        try:
+            atomic_write_json(self.config.state_dir / "watchdog-state.json", state)
+        except OSError as error:
+            logger.warning("state write failed: %s", error)  # telemetry never kills protection
+        # Legacy schema at the old monitor path: rig server.ps1 polls it for
+        # the "heavy work BLOCKED" toast (fields: blocked, blocked_reason).
         try:
             atomic_write_json(
-                self.config.state_dir / "watchdog-state.json",
+                self.config.legacy_state_path,
                 {
-                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "mode": self.mode,
-                    "players": players,
-                    "reason": reason,
-                    "api_failures": self.api_failures,
-                    "blocked_reason": self.blocked_reason,
-                    "driver_pid": self.driver.process.pid
-                    if self.driver.process and self.driver.process.poll() is None
-                    else None,
+                    **state,
+                    "blocked": self.blocked_reason is not None,
+                    "oghidra_pids": [driver_pid] if driver_pid else [],
+                    "last_error": self.blocked_reason or "",
                 },
             )
         except OSError as error:
-            logger.warning("state write failed: %s", error)  # telemetry never kills protection
+            logger.warning("legacy state write failed: %s", error)
+
+    def sample_palworld(self, metrics: dict[str, Any]) -> None:
+        """30s time-series + roster for the rig dashboard (HANDOFF #15).
+
+        Best-effort by contract: a sampling failure must never break gameplay
+        protection.
+        """
+        now = self.clock()
+        if self.last_sample_at is not None and now - self.last_sample_at < 30:
+            return
+        self.last_sample_at = now
+        try:
+            sample_path = self.config.rig_metrics_jsonl
+            sample_path.parent.mkdir(parents=True, exist_ok=True)
+            if sample_path.exists() and sample_path.stat().st_size > 5 * 1024 * 1024:
+                os.replace(sample_path, sample_path.with_name(sample_path.name + ".previous"))
+            sample = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "players": int(metrics["currentplayernum"]),
+                "fps": metrics.get("serverfps"),
+                "frametime": metrics.get("serverframetime"),
+                "uptime": metrics.get("uptime"),
+            }
+            with sample_path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(sample) + "\n")
+            atomic_write_json(
+                self.config.rig_players_json,
+                {
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "players": self.palworld.roster(),
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - sampling is never fatal
+            logger.warning("palworld sampling failed: %s", error)
 
     # ------------------------------------------------------------------- control
 
@@ -451,6 +517,17 @@ class Watchdog:
         if self.blocked_at is None:
             return True
         return (self.clock() - self.blocked_at) >= self.config.block_recheck_minutes * 60
+
+    def _reset_requested(self) -> bool:
+        """`rig reset` drops a marker file; consume it so the request fires once."""
+        marker = self.config.reset_marker
+        if not marker.exists():
+            return False
+        try:
+            marker.unlink()
+        except OSError:
+            return False
+        return True
 
     def _completed_latch_holds(self) -> bool:
         """True when run-state says completed AND the ledger has not moved since."""
@@ -557,10 +634,14 @@ class Watchdog:
         self.reset_liveness()
 
         if self.blocked_reason:
-            if not self._block_recheck_due():
+            if self._reset_requested():
+                logger.info("manual reset via rig reset; clearing block")
+                self.blocked_reason = None
+            elif self._block_recheck_due():
+                logger.info("re-evaluating block: %s", self.blocked_reason)
+                self.blocked_reason = None
+            else:
                 return
-            logger.info("re-evaluating block: %s", self.blocked_reason)
-            self.blocked_reason = None
 
         if self._provider_pause_holds():
             return
@@ -616,8 +697,10 @@ class Watchdog:
     def iterate(self) -> None:
         players: int | None = None
         try:
-            players = self.palworld.player_count()
+            metrics = self.palworld.metrics()
+            players = int(metrics["currentplayernum"])
             self.api_failures = 0
+            self.sample_palworld(metrics)
         except (requests.RequestException, RuntimeError, OSError) as error:
             self.api_failures += 1
             self.write_state("Palworld API unavailable.", players=None)

@@ -20,10 +20,18 @@ class FakePalworld:
         self.players = 0
         self.raises = False
 
-    def player_count(self) -> int:
+    def metrics(self) -> dict:
         if self.raises:
             raise RuntimeError("api down")
-        return self.players
+        return {
+            "currentplayernum": self.players,
+            "serverfps": 58,
+            "serverframetime": 17.0,
+            "uptime": 1234,
+        }
+
+    def roster(self) -> list[dict]:
+        return [{"name": "manny", "level": 42, "ping": 12}]
 
     def server_running(self) -> bool:
         return True
@@ -86,6 +94,10 @@ def make_watchdog(tmp_path: Path) -> tuple[Watchdog, FakePalworld, FakeUnsloth, 
     config = WatchdogConfig(
         repo_root=tmp_path / "repo",
         oghidra_root=tmp_path / "oghidra",
+        rig_metrics_jsonl=tmp_path / "rig-state/palworld-metrics.jsonl",
+        rig_players_json=tmp_path / "rig-state/palworld-players.json",
+        reset_marker=tmp_path / "rig-state/reset-request.marker",
+        legacy_state_path=tmp_path / "monitor/palworld-oghidra-monitor-state.json",
         empty_grace_seconds=60,
         stop_grace_seconds=0,
     )
@@ -220,6 +232,40 @@ def test_contract_failure_blocks_and_recheck_retries(tmp_path: Path):
     watchdog.iterate()
     assert driver.calls == ["launch"]
     assert watchdog.mode == "running"
+
+
+def test_rig_dashboard_contract_series_roster_and_legacy_state(tmp_path: Path):
+    # The watchdog is the producer of the rig widget's sparkline series, the
+    # roster, and the legacy monitor-state file server.ps1 polls for toasts.
+    watchdog, _, unsloth, _, clock = make_watchdog(tmp_path)
+    unsloth.contract = (False, "Invalid tool_choice type")
+
+    run_until_heavy(watchdog, clock)
+
+    sample = json.loads(
+        watchdog.config.rig_metrics_jsonl.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert sample["players"] == 0 and sample["fps"] == 58
+    roster = json.loads(watchdog.config.rig_players_json.read_text(encoding="utf-8"))
+    assert roster["players"][0]["name"] == "manny"
+    legacy = json.loads(watchdog.config.legacy_state_path.read_text(encoding="utf-8"))
+    assert legacy["blocked"] is True
+    assert "tool_choice" in legacy["blocked_reason"]
+
+
+def test_rig_reset_marker_clears_block_before_recheck_window(tmp_path: Path):
+    watchdog, _, unsloth, driver, clock = make_watchdog(tmp_path)
+    unsloth.contract = (False, "Invalid tool_choice type")
+    run_until_heavy(watchdog, clock)
+    assert watchdog.mode == "blocked"
+
+    unsloth.contract = (True, "ok")
+    watchdog.config.reset_marker.parent.mkdir(parents=True, exist_ok=True)
+    watchdog.config.reset_marker.write_text("", encoding="utf-8")
+    watchdog.iterate()  # well inside the recheck window: marker must override it
+
+    assert driver.calls == ["launch"]
+    assert not watchdog.config.reset_marker.exists()
 
 
 def test_provider_pause_holds_until_status_answers(tmp_path: Path):
