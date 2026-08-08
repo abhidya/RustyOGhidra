@@ -411,3 +411,18 @@ def test_normalize_address_decodes_ghidra_placeholder_names():
         normalize_address("zz_0055f90_")  # session junk names stay rejected
     with pytest.raises(ValueError):
         normalize_address("FUN_123")
+
+
+def test_oversized_chunk_prompt_raises_before_any_model_request(tmp_path, monkeypatch):
+    # 2026-08-08: five chunks larger than the 131k context burned their full
+    # 3-request budgets on deterministic 400s. The preflight must fire before
+    # the llm factory is even constructed.
+    from src.port_chunk_workflow import ChunkAnalysisOversized
+
+    root = fixture_repo(tmp_path)
+    monkeypatch.setenv("OGHIDRA_PORT_CONTEXT_TOKENS", "10")
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+
+    with pytest.raises(ChunkAnalysisOversized):
+        workflow.analyze("chunk_0048", force=True)
+    assert workflow.last_analyze_requests == 0

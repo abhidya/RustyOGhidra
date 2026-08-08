@@ -379,3 +379,26 @@ def test_session_index_refuses_to_write_below_floor(tmp_path: Path):
         build_session_index(tmp_path / "analysis_sessions", output, floor=10)
 
     assert not output.exists()
+
+
+def test_oversized_analysis_blocks_chunk_without_spending_budget(tmp_path: Path):
+    from src.port_chunk_workflow import ChunkAnalysisOversized
+
+    root = fixture_repo(tmp_path)
+    workflow = StubWorkflow(root, None)
+    workflow.last_analyze_requests = 0
+
+    def oversized(chunk: str, *, force: bool = False):
+        raise ChunkAnalysisOversized(f"{chunk}: too big for context")
+
+    workflow.analyze = oversized
+
+    exit_code = make_driver(root, workflow).run()
+
+    ledger = read_ledger(root)
+    analysis = ledger["chunks"]["chunk_0048"]["analysis"]
+    # The block is a durable state change, so it counts as the step.
+    assert exit_code == EXIT_PROGRESSED
+    assert analysis["status"] == "analysis_blocked"
+    assert "too big for context" in analysis["detail"]
+    assert analysis.get("model_requests_spent", 0) == 0

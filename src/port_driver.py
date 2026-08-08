@@ -20,6 +20,7 @@ from typing import Any
 
 from src.port_chunk_workflow import (
     ChunkAnalysis,
+    ChunkAnalysisOversized,
     ChunkPortWorkflow,
     ExecutionUnit,
     ProviderUnavailable,
@@ -486,6 +487,15 @@ class PortDriver:
             self._save_ledger(ledger, reason=f"provider_paused:{chunk}")
             self.events.emit("provider_paused", chunk=chunk)
             raise
+        except ChunkAnalysisOversized as error:
+            # Deterministic rejection before any generation: block the chunk
+            # WITHOUT spending budget, so a later context/splitting fix can
+            # simply clear the status and retry with the full allowance.
+            record["status"] = "analysis_blocked"
+            record["detail"] = str(error)
+            self._save_ledger(ledger, reason=f"analysis_oversized:{chunk}")
+            self.events.emit("analysis_oversized", chunk=chunk, detail=str(error))
+            return "analysis_oversized"
         except Exception as error:
             self._record_analysis_spend(ledger, record)
             record["status"] = "analysis_failed"

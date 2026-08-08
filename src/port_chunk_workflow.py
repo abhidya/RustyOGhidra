@@ -118,6 +118,14 @@ class ProviderUnavailable(RuntimeError):
     """The external model provider is offline; callers must pause, not retry generation."""
 
 
+class ChunkAnalysisOversized(RuntimeError):
+    """The chunk prompt cannot fit the model context; retrying cannot help.
+
+    Callers must not spend analysis budget on this -- the server rejects the
+    request deterministically before any generation happens.
+    """
+
+
 class UnitSkipResult(BaseModel):
     """Typed no-work outcome: the unit cannot pass validation, so nothing was generated (R13)."""
 
@@ -699,6 +707,23 @@ class ChunkPortWorkflow:
                 str(max(32768, 160 * fn_count + 4096)),
             )
         )
+        # Preflight BEFORE any request: the server rejects on prompt tokens
+        # alone, deterministically, at ~2.05 chars/token on these decompiler
+        # exports (observed: 289,876 chars -> 141,173 tokens). Retrying is a
+        # guaranteed 400 -- five chunks burned their full 3-request analysis
+        # budgets in minutes on 2026-08-08 before anyone looked. //2 slightly
+        # overestimates tokens, which is the safe direction.
+        context_limit = int(os.getenv("OGHIDRA_PORT_CONTEXT_TOKENS", "131072"))
+        estimated_prompt_tokens = (
+            len(_model_prompt(chunk, deterministic, repair_feedback=None)) // 2
+        )
+        if estimated_prompt_tokens > context_limit:
+            self._write_state(chunk.name, status="analysis_oversized", model_requests=0)
+            raise ChunkAnalysisOversized(
+                f"{chunk.name}: ~{estimated_prompt_tokens} prompt tokens exceeds the "
+                f"{context_limit}-token context window; split the chunk or raise the "
+                "served context before re-attempting"
+            )
         llm, provider, model_name = self.llm_factory()
         archive_root = self.chunk_root(chunk.name)
         repair_feedback: str | None = None
