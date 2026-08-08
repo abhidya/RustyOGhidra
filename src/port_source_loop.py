@@ -516,8 +516,19 @@ def _specific_symbol_reachability_check(
             except (OSError, UnicodeDecodeError):
                 continue
             inside_import = False
+            inside_comment = False
             for line_number, line in enumerate(lines, start=1):
                 stripped = line.strip()
+                # Block comments: continuation lines without a leading "*" are
+                # not caught by the prefix filter below, so a symbol mentioned
+                # in commented-out wiring plans would count as a use site.
+                if inside_comment:
+                    if "*/" in stripped:
+                        inside_comment = False
+                    continue
+                if stripped.startswith("/*") and "*/" not in stripped:
+                    inside_comment = True
+                    continue
                 # Multi-line import blocks: symbol names on their own lines do
                 # not start with "import ", and counting them as use sites let
                 # a patch pass reachability with nothing but an import list

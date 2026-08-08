@@ -80,6 +80,71 @@ def test_specific_symbol_reachability_accepts_executable_call_site(tmp_path: Pat
     assert "translatedEntry" in detail
 
 
+def reachability_fixture(tmp_path: Path, app_main_ts: str) -> tuple[bool, str]:
+    package = tmp_path / "packages/combat/src"
+    app = tmp_path / "apps/game/src"
+    package.mkdir(parents=True)
+    app.mkdir(parents=True)
+    (package / "runtime.ts").write_text(
+        "export function translatedEntry() { return 2; }\n", encoding="utf-8"
+    )
+    (app / "main.ts").write_text(app_main_ts, encoding="utf-8")
+    return _specific_symbol_reachability_check(
+        tmp_path, {"packages/combat/src/runtime.ts"}, ["translatedEntry"]
+    )
+
+
+def test_specific_symbol_reachability_rejects_multiline_import_only(tmp_path: Path):
+    # The 2026-08-07 challenge_menu_objects false positive: symbol present only
+    # inside a multi-line import block (battleScene.ts:21-26 shape).
+    passed, detail = reachability_fixture(
+        tmp_path,
+        "import {\n"
+        "  translatedEntry,\n"
+        "  somethingElse,\n"
+        '} from "../../../packages/combat/src/runtime";\n'
+        "somethingElse();\n",
+    )
+    assert passed is False
+    assert "translatedEntry" in detail
+
+
+def test_specific_symbol_reachability_accepts_call_after_multiline_import(tmp_path: Path):
+    passed, _ = reachability_fixture(
+        tmp_path,
+        "import {\n"
+        "  translatedEntry,\n"
+        '} from "../../../packages/combat/src/runtime";\n'
+        "translatedEntry();\n",
+    )
+    assert passed is True
+
+
+def test_specific_symbol_reachability_rejects_block_comment_mention(tmp_path: Path):
+    # Commented-out wiring plans must not count as production use sites, even
+    # when the continuation line has no leading "*".
+    passed, detail = reachability_fixture(
+        tmp_path,
+        "/*\n"
+        "TODO: wire translatedEntry() into the scene update loop\n"
+        "*/\n"
+        "export const scene = 1;\n",
+    )
+    assert passed is False
+    assert "translatedEntry" in detail
+
+
+def test_specific_symbol_reachability_rejects_definition_only(tmp_path: Path):
+    # A unit that defines its entry symbol in the app tree but never calls it
+    # is still unreachable.
+    passed, detail = reachability_fixture(
+        tmp_path,
+        "export function translatedEntry() { return 3; }\n",
+    )
+    assert passed is False
+    assert "translatedEntry" in detail
+
+
 def test_json_payload_accepts_tool_json_and_fence():
     payload = {"summary": "done", "files": [{"path": "apps/game/src/x.ts", "content": "x"}]}
     encoded = '{"summary":"done","files":[{"path":"apps/game/src/x.ts","content":"x"}]}'
