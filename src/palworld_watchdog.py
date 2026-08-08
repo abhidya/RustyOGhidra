@@ -84,7 +84,11 @@ class WatchdogConfig:
     # old PS control file still said ud-iq3_s @ 262144 -- do not copy it back.
     model_path: str = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
     gguf_variant: str = "UD-Q4_K_XL"
-    max_seq_length: int = 131072
+    # Native max (owner decision 2026-08-08: latency is acceptable, coverage is
+    # not negotiable -- four combat chunks need ~230k). q8_0 KV halves cache
+    # bytes, making 262k @ q8 roughly VRAM-equal to the old 131k @ fp16.
+    max_seq_length: int = 262144
+    kv_cache_type: str | None = "q8_0"
     min_context: int = 80000
     lms_exe: Path = Path(r"C:\Users\manny\.lmstudio\bin\lms.exe")
     embed_probe_url: str = "http://127.0.0.1:1234/v1/models"
@@ -205,15 +209,27 @@ class UnslothApi:
         return False
 
     def load(self) -> None:
-        requests.post(
+        body = {
+            "model_path": self.config.model_path,
+            "gguf_variant": self.config.gguf_variant,
+            "max_seq_length": self.config.max_seq_length,
+        }
+        if self.config.kv_cache_type:
+            body["cache_type_kv"] = self.config.kv_cache_type
+        response = requests.post(
             f"{self.config.unsloth_base}/api/inference/load",
-            headers=self._headers(), timeout=60,
-            json={
-                "model_path": self.config.model_path,
-                "gguf_variant": self.config.gguf_variant,
-                "max_seq_length": self.config.max_seq_length,
-            },
-        ).raise_for_status()
+            headers=self._headers(), timeout=60, json=body,
+        )
+        if response.status_code in (400, 422) and "cache_type_kv" in body:
+            # Older studio builds may not accept the KV knob; context alone
+            # still helps and the caller's readiness wait verifies the result.
+            logger.warning("load rejected cache_type_kv; retrying without it")
+            del body["cache_type_kv"]
+            response = requests.post(
+                f"{self.config.unsloth_base}/api/inference/load",
+                headers=self._headers(), timeout=60, json=body,
+            )
+        response.raise_for_status()
 
     def unload_force(self) -> None:
         try:
