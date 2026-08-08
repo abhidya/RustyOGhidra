@@ -1536,11 +1536,22 @@ def get_config() -> BridgeConfig:
     """Returns a singleton instance of the BridgeConfig."""
     global _config_instance
     if _config_instance is None:
-        # Explicitly load .env file before creating config
+        # Explicitly load .env file before creating config.
+        # Resolved against THIS package, never the caller's cwd: a relative
+        # ".env" silently loaded nothing whenever the process was launched
+        # from elsewhere, so LLM_PROVIDER=custom_api was lost and the config
+        # fell back to Ollama. On 2026-08-08 that turned every analysis into
+        # `OllamaClient has no attribute generate_structured` and every port
+        # into `generate() got an unexpected keyword argument 'tools'`,
+        # marking 11 chunks analysis_blocked and 10 units rejected_final in
+        # minutes -- an infrastructure fault recorded as per-item failure.
         try:
+            import os.path as _p
+
             from dotenv import load_dotenv
 
-            load_dotenv(".env", override=True)
+            _env = _p.join(_p.dirname(_p.dirname(_p.abspath(__file__))), ".env")
+            load_dotenv(_env if _p.isfile(_env) else ".env", override=True)
         except ImportError:
             # python-dotenv not available, try to continue without it
             pass
