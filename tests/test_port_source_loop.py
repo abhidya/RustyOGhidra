@@ -756,3 +756,32 @@ def test_closest_source_files_ranks_real_near_misses(tmp_path: Path):
 
     assert candidates[0] == "apps/game/src/ui/challengeFlowVm.ts"
     assert all(not c.endswith(".generated.ts") for c in candidates)
+
+
+def test_session_grounding_reaches_prompt_for_address_keyed_corpus(tmp_path: Path):
+    # Audit drift item 4: the chunk workflow sends {address: {name, summary}}
+    # and the old top-level field filter reduced it to {} in every port prompt.
+    loop = SequentialSourcePortLoop(
+        repo_root=tmp_path,
+        run_root=tmp_path / ".run",
+        llm_factory=lambda: (None, "fake", "qwen"),
+    )
+    bundle = {"identity": {"name": "fn"}, "decompiler": {"c": "void fn(void) {}"}}
+
+    prompt = loop._prompt(
+        bundle,
+        aliases=[],
+        failure=None,
+        attempt=1,
+        analysis_context={
+            "saved_session_analysis": {
+                "0x80001000": {
+                    "name": "dispatch_x",
+                    "summary": "Drives the X state machine.",
+                }
+            }
+        },
+    )
+
+    assert "Drives the X state machine." in prompt
+    assert "dispatch_x" in prompt

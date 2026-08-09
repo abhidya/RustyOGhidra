@@ -785,11 +785,10 @@ def _git_checkpoint(
         )
     message = f"port: integrate {address} {summary}"[:200]
     git("commit", "--only", "-m", message, "--", *files)
-    pushed = git("push", check=False)
-    if pushed.returncode != 0:
-        pushed = git("push", "-u", "origin", "HEAD", check=False)
-    if pushed.returncode != 0:
-        raise RuntimeError(f"git push failed:\n{pushed.stdout}\n{pushed.stderr}")
+    # D8 (driver design): push is REMOVED from the per-unit path. A failed
+    # push after a landed commit used to revert the worktree and reject a
+    # fully green unit (G16 reproduced) -- the driver batch-pushes at exit
+    # and tracks the outcome in the ledger instead.
     return git("rev-parse", "HEAD").stdout.strip()
 
 
@@ -1597,24 +1596,49 @@ class SequentialSourcePortLoop:
         )
         session_analysis = (analysis_context or {}).get("saved_session_analysis")
         if isinstance(session_analysis, dict):
-            session_analysis = {
-                key: (
-                    str(value)[:4000]
-                    if key in {"behavior_summary", "summary", "rationale"}
-                    else value
-                )
-                for key, value in session_analysis.items()
-                if key
-                in {
-                    "address",
-                    "old_name",
-                    "new_name",
-                    "behavior_summary",
-                    "summary",
-                    "rationale",
-                    "ai_confidence",
-                }
+            allowed_fields = {
+                "address",
+                "old_name",
+                "new_name",
+                "name",
+                "behavior_summary",
+                "summary",
+                "rationale",
+                "ai_confidence",
             }
+
+            def _trim_entry(entry: dict) -> dict:
+                return {
+                    key: (
+                        str(value)[:4000]
+                        if key in {"behavior_summary", "summary", "rationale"}
+                        else value
+                    )
+                    for key, value in entry.items()
+                    if key in allowed_fields and value is not None
+                }
+
+            if any(isinstance(value, dict) for value in session_analysis.values()):
+                # Address-keyed per-function corpus from the chunk workflow
+                # (R23/D5). The old top-level field filter dropped every
+                # address key, so 6,580 curated summaries reached this prompt
+                # as {} on every port (audit 2026-08-08, drift item 4). Trim
+                # per ENTRY and cap the total near D5's ~8k-token budget.
+                budget = 32000
+                trimmed: dict[str, dict] = {}
+                for address, entry in session_analysis.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    kept = _trim_entry(entry)
+                    if not kept:
+                        continue
+                    trimmed[address] = kept
+                    budget -= len(json.dumps(kept, ensure_ascii=False))
+                    if budget <= 0:
+                        break
+                session_analysis = trimmed
+            else:
+                session_analysis = _trim_entry(session_analysis)
         authoritative_context = {
             key: value
             for key, value in (analysis_context or {}).items()

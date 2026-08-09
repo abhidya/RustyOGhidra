@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,20 @@ DEFAULT_PRIORITY_ENTRY_SYMBOLS = [
 ]
 ANALYSIS_REQUEST_BUDGET = 3
 TERMINAL_UNIT_STATUSES = {"integrated", "rejected_final", "skipped", "alias"}
+# Harness/budget failures say nothing about port quality (R15 spirit): the
+# designated milestone unit was once terminally rejected by a request_limit
+# error. Such units stay retryable until the cumulative attempt budget runs
+# out; only gate/quality failures (or budget exhaustion) are final.
+HARNESS_ERROR_MARKERS = (
+    "usagelimitexceeded",
+    "request_limit",
+    "token limit",
+    "max_tokens",
+    "maximum output retries",
+    "apiresponseerror",
+    "unexpectedmodelbehavior",
+)
+UNIT_ATTEMPT_BUDGET = int(os.getenv("OGHIDRA_UNIT_ATTEMPT_BUDGET", "9"))
 
 EXIT_NO_WORK = 0
 EXIT_STOPPED = 2
@@ -221,6 +236,7 @@ class PortDriver:
         self.events = DriverEvents(self.run_root / "events.jsonl", self.run_id)
         self.units_budget = max(1, units_budget)
         self.until_blocked = until_blocked
+        self._integrations_this_run = 0
 
     # ------------------------------------------------------------------ ledger
 
@@ -442,11 +458,15 @@ class PortDriver:
         for chunk in self._chunk_order(ledger):
             chunk_record = self._chunk_record(ledger, chunk)
             analysis_record = chunk_record["analysis"]
-            if analysis_record.get("status") == "analysis_blocked":
-                continue
             try:
                 analysis = self.workflow.load_analysis(chunk)
             except (FileNotFoundError, ValueError):
+                # analysis_blocked is an ANALYSIS verdict, not a chunk death
+                # sentence (audit 2026-08-08 drift item 2): it only forbids
+                # spending more analysis requests. An on-disk analysis -- past
+                # or future -- still gets its units considered above.
+                if analysis_record.get("status") == "analysis_blocked":
+                    continue
                 if analysis_record.get("model_requests_spent", 0) >= ANALYSIS_REQUEST_BUDGET:
                     analysis_record["status"] = "analysis_blocked"
                     analysis_record["detail"] = "analysis request budget exhausted"
@@ -583,10 +603,28 @@ class PortDriver:
             counters["units_integrated"] = counters.get("units_integrated", 0) + 1
             counters["functions_integrated"] = len(integrated)
             self._save_ledger(ledger, reason=f"unit_integrated:{chunk}/{unit.id}")
+            self._integrations_this_run += 1
             self.events.emit(
                 "unit_integrated", chunk=chunk, unit=unit.id, files=result.files
             )
             return "integrated"
+        error_text = (result.error or "").lower()
+        attempts_total = record.get("attempts_spent", 0)
+        if (
+            any(marker in error_text for marker in HARNESS_ERROR_MARKERS)
+            and attempts_total < UNIT_ATTEMPT_BUDGET
+        ):
+            record.update(status="rejected_retryable", error=result.error)
+            self._save_ledger(ledger, reason=f"unit_retryable:{chunk}/{unit.id}")
+            self.events.emit(
+                "unit_retryable",
+                chunk=chunk,
+                unit=unit.id,
+                error=result.error,
+                attempts_spent=attempts_total,
+                attempt_budget=UNIT_ATTEMPT_BUDGET,
+            )
+            return "rejected_retryable"
         record.update(status="rejected_final", error=result.error)
         self._save_ledger(ledger, reason=f"unit_rejected:{chunk}/{unit.id}")
         self.events.emit("unit_rejected", chunk=chunk, unit=unit.id, error=result.error)
@@ -701,4 +739,40 @@ class PortDriver:
                     self.events.emit("driver_stopped", reason="units_budget_reached")
                     return EXIT_PROGRESSED
         finally:
+            self._batch_push()
             self.lock.release()
+
+    def _batch_push(self) -> None:
+        """D8: one push per driver run, non-fatal, event-visible.
+
+        Per-unit push was removed from _git_checkpoint -- a failed push after
+        a landed commit reverted the worktree and terminally rejected a fully
+        green unit (G16 reproduced). Commits are durable locally either way;
+        the next run's push carries anything this one could not.
+        """
+        if not self._integrations_this_run:
+            return
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", *args],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        try:
+            pushed = git("push")
+            if pushed.returncode != 0:
+                pushed = git("push", "-u", "origin", "HEAD")
+            ok = pushed.returncode == 0
+            self.events.emit(
+                "batch_push",
+                ok=ok,
+                integrated_units=self._integrations_this_run,
+                detail="" if ok else (pushed.stdout + pushed.stderr)[-400:],
+            )
+        except Exception as error:  # push must never take down the driver
+            self.events.emit(
+                "batch_push", ok=False, integrated_units=self._integrations_this_run,
+                detail=f"{type(error).__name__}: {error}",
+            )
