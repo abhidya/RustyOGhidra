@@ -263,7 +263,7 @@ def test_generate_estimates_tokens_when_api_omits_usage(monkeypatch, tmp_path):
     assert metrics["token_source"] == "estimated"
 
 
-def test_finish_game_structured_call_streams_tool_arguments_without_read_timeout(
+def test_finish_game_structured_call_streams_tool_arguments_with_stall_ceiling(
     monkeypatch,
     tmp_path,
 ):
@@ -323,7 +323,11 @@ def test_finish_game_structured_call_streams_tool_arguments_without_read_timeout
 
     assert mode == "tool_call"
     assert json.loads(text)["action"] == "exclude"
-    assert request_seen["timeout"] == (30, None)
+    # Long, but never unbounded: prefill can run 30-60 min with no bytes on the
+    # wire, so the read timeout must clear that -- yet `None` let a lost model
+    # binding hang the driver for four hours (2026-08-09). The ceiling surfaces
+    # as requests.Timeout, which maps to ProviderUnavailable.
+    assert request_seen["timeout"] == (30, 5400)
     assert request_seen["stream"] is True
     assert request_seen["json"]["stream"] is True
     assert [kind for kind, _ in events] == [

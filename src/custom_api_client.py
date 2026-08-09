@@ -888,15 +888,26 @@ class CustomAPIClient:
                     self._write_liveness()
                 request_clock = time.perf_counter()
                 first_output_clock = None
-                # No read timeout for port-work phases: an 81k-token prompt can
-                # spend 30-60 min in prefill on this hardware with zero bytes
-                # on the wire, and requests' read timeout is time-between-bytes
-                # -- it would kill a healthy request. Hang detection belongs to
-                # the supervisor's stall/liveness probes, not the socket.
-                _no_read_timeout_phases = ("finish_game_source:", "chunk_analysis:")
+                # Port-work phases need a very LONG read timeout, not none at
+                # all: an 81k-token prompt can spend 30-60 min in prefill with
+                # zero bytes on the wire, and requests' read timeout is
+                # time-between-bytes, so a short one kills healthy requests.
+                # But `None` is unbounded, and on 2026-08-09 the studio silently
+                # lost its model binding mid-request: the driver sat in
+                # awaiting_provider_output for FOUR HOURS (liveness frozen at
+                # 04:10, pause not raised until 08:10) because nothing ever
+                # gave up. The supervisor's stall probes did not catch it
+                # either. A generous ceiling well past the longest legitimate
+                # prefill bounds the loss and surfaces as requests.Timeout,
+                # which TRANSIENT_MARKERS already maps to ProviderUnavailable --
+                # so the driver pauses cleanly instead of blocking chunks.
+                _long_read_phases = ("finish_game_source:", "chunk_analysis:")
+                _stall_ceiling = int(
+                    os.getenv("OGHIDRA_PORT_STALL_TIMEOUT_SECONDS", "5400")
+                )
                 request_timeout = (
-                    (30, None)
-                    if phase and phase.startswith(_no_read_timeout_phases)
+                    (30, _stall_ceiling)
+                    if phase and phase.startswith(_long_read_phases)
                     else self.timeout
                 )
                 request_arguments = {
