@@ -207,6 +207,12 @@ class ExecutionUnit(BaseModel):
     runtime_entry_symbols: list[str] = Field(default_factory=list)
     target_source_paths: list[str] = Field(default_factory=list)
     status: Literal["analyzed", "porting", "integrated", "rejected"] = "analyzed"
+    # Per-unit provenance (refinement design, 2026-08-08): "deterministic"
+    # means no model judgment has touched this unit yet -- the driver defers
+    # it, it is never port-eligible. Default "model_refined" keeps analyses
+    # persisted before this field existed (all fresh-emission era, therefore
+    # model-authored) eligible when reloaded from disk.
+    provenance: Literal["deterministic", "model_refined"] = "model_refined"
 
     @field_validator("function_addresses", "external_dependencies")
     @classmethod
@@ -214,17 +220,73 @@ class ExecutionUnit(BaseModel):
         return list(dict.fromkeys(normalize_address(value) for value in values))
 
 
-class ChunkModelAnalysis(BaseModel):
+# ---------------------------------------------------------------------------
+# Refinement ops (the model's ONLY output surface for chunk analysis).
+#
+# Invariant: everything mechanically derivable is mechanically derived --
+# addresses, coverage, dependencies, globals. The model contributes judgment:
+# names, classifications, entry symbols, summaries, and grouping decisions
+# expressed as operations over the deterministic clusters. Coverage cannot be
+# incomplete because nothing ever re-creates it.
+# ---------------------------------------------------------------------------
+
+
+class ClusterJudgment(BaseModel):
+    """Model-authored judgment applied to one resulting unit."""
+
     model_config = ConfigDict(extra="forbid")
 
-    subsystems: list[str] = Field(default_factory=list)
-    state_dispatchers: list[str] = Field(default_factory=list)
-    callback_tables: list[str] = Field(default_factory=list)
-    shared_globals: list[str] = Field(default_factory=list)
-    external_dependencies: list[str] = Field(default_factory=list)
-    hardware_or_sdk_functions: list[str] = Field(default_factory=list)
-    game_owned_functions: list[str] = Field(default_factory=list)
-    units: list[ExecutionUnit]
+    label: str
+    classification: UnitClassification
+    summary: str
+    runtime_entry_symbols: list[str] = Field(default_factory=list)
+    target_source_paths: list[str] = Field(default_factory=list)
+
+
+class RefineOp(BaseModel):
+    """Judgment on one deterministic cluster, membership unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    judgment: ClusterJudgment
+
+
+class MergeOp(BaseModel):
+    """Fuse two or more deterministic clusters into one unit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clusters: list[str] = Field(min_length=2)
+    judgment: ClusterJudgment
+
+
+class SplitGroup(BaseModel):
+    """One side of a split, identified by exact function NAMES (never addresses)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    functions: list[str] = Field(min_length=1)
+    judgment: ClusterJudgment
+
+
+class SplitOp(BaseModel):
+    """Divide one deterministic cluster; unlisted members stay together, unrefined."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: str
+    groups: list[SplitGroup] = Field(min_length=1)
+
+
+class ChunkRefinementOps(BaseModel):
+    """The model's structured response: operations over deterministic clusters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refine: list[RefineOp] = Field(default_factory=list)
+    merge: list[MergeOp] = Field(default_factory=list)
+    split: list[SplitOp] = Field(default_factory=list)
 
 
 class ChunkAnalysis(BaseModel):
@@ -424,6 +486,7 @@ def build_deterministic_analysis(chunk: ParsedChunk) -> ChunkAnalysis:
                         if classification == "game_owned"
                         else []
                     ),
+                    provenance="deterministic",
                 )
             )
     hardware = [
@@ -475,18 +538,41 @@ def _model_prompt(
     *,
     repair_feedback: str | None = None,
 ) -> str:
+    by_address = {function.address: function for function in chunk.functions}
+    cluster_edges: dict[str, set[str]] = {}
+    address_to_cluster = {
+        address: unit.id
+        for unit in deterministic.units
+        for address in unit.function_addresses
+    }
+    for unit in deterministic.units:
+        targets = {
+            address_to_cluster[target]
+            for address in unit.function_addresses
+            for target in by_address[address].direct_calls
+            if target in address_to_cluster and address_to_cluster[target] != unit.id
+        }
+        if targets:
+            cluster_edges[unit.id] = targets
     facts = {
         "chunk": chunk.name,
         "function_count": len(chunk.functions),
-        "functions": deterministic.functions,
-        # Membership only. A full schema-shaped candidate dump (labels,
-        # boilerplate summaries, dependency lists) is a copy-paste target:
-        # observed live, repair rounds degenerated into transcribing it
-        # verbatim until truncation instead of analyzing.
-        "candidate_groupings": [
-            {"id": unit.id, "function_addresses": unit.function_addresses}
+        # Clusters are the ONLY things the model references; addresses appear
+        # as read-only context and must never be transcribed back.
+        "clusters": [
+            {
+                "id": unit.id,
+                "heuristic_classification": unit.classification,
+                "functions": [
+                    {"name": by_address[address].name, "address": address}
+                    for address in unit.function_addresses
+                ],
+            }
             for unit in deterministic.units
         ],
+        "cross_cluster_calls": {
+            cluster: sorted(targets) for cluster, targets in sorted(cluster_edges.items())
+        },
     }
     # Appended AFTER the static evidence: the evidence prefix is identical
     # across attempts and prompt-caches at ~100% (measured 111,006/111,010
@@ -495,24 +581,33 @@ def _model_prompt(
     repair_section = (
         f"""
 
-A previous attempt at this exact task was rejected. Fix ONLY the reported problem and
-return the complete corrected assignment (the validator re-checks full coverage). Do not
-copy candidate_groupings back as your answer; produce your own analysis:
+A previous attempt at this exact task was rejected. Fix the reported problems and return
+the complete corrected op list (ops are small; re-emit all of them):
 {repair_feedback}
 """
         if repair_feedback
         else ""
     )
-    return f"""Analyze this complete Ghidra export chunk as shared translation context.
+    return f"""Refine the deterministic clustering of this Ghidra export chunk.
 
-Return execution units, not one TypeScript file and not one unit per function. Every original
-function address must appear in exactly one unit. Keep SDK/hardware/data units separate from
-game-owned state controllers. A generation unit should normally contain 2-40 tightly related
-functions. Record cross-chunk calls as external dependencies. runtime_entry_symbols must be exact
-function names from the chunk that a production caller must reach. target_source_paths may name
-only likely existing browser source integration files; use an empty list when unresolved.
-To conserve output, leave hardware_or_sdk_functions and game_owned_functions as empty lists --
-they are derived from your units' classifications; do not repeat per-function metadata.
+The chunk is already partitioned into clusters (see facts). You never write address lists;
+you emit OPERATIONS over cluster ids, and membership/coverage/dependencies are derived
+mechanically. Decide EVERY cluster exactly once, choosing per cluster one of:
+- refine: keep its membership; supply judgment (label, classification, summary,
+  runtime_entry_symbols, target_source_paths).
+- merge: fuse 2+ clusters that form one coherent subsystem (cross_cluster_calls shows
+  where the heuristic split real subsystems, including size-sliced -1/-2 suffix pairs);
+  supply one judgment for the merged unit.
+- split: divide a cluster whose members do not belong together; give each group its
+  member function NAMES (exact names from the facts) plus judgment. Unlisted members
+  stay together automatically.
+
+Judgment rules: classification is one of game_owned, shared_runtime, hardware_or_sdk,
+data_or_table, unresolved. Keep SDK/hardware/data separate from game-owned state
+controllers. For game_owned and shared_runtime units, runtime_entry_symbols must name the
+real entry functions a production caller must reach (exact chunk function names, never
+FUN_/LAB_ placeholders); for other classifications leave it empty. target_source_paths may
+name only likely existing browser source integration files; empty when unresolved.
 Emit compact single-line JSON with no indentation or extra whitespace.
 
 Deterministic evidence:
@@ -638,67 +733,157 @@ class ChunkPortWorkflow:
         }
         atomic_write_json(self.state_path, state)
 
-    def _validate_model_analysis(
+    def _apply_refinement_ops(
         self,
         chunk: ParsedChunk,
-        payload: ChunkModelAnalysis,
+        deterministic: ChunkAnalysis,
+        ops: ChunkRefinementOps,
         *,
         generated_by: Literal["model", "saved_model_response"],
     ) -> ChunkAnalysis:
-        known = {function.address for function in chunk.functions}
-        assigned: list[str] = [address for unit in payload.units for address in unit.function_addresses]
-        unknown = sorted(set(assigned) - known)
-        duplicate = sorted({address for address in assigned if assigned.count(address) > 1})
-        missing = sorted(known - set(assigned))
-        # A handful of dropped addresses is a transcription slip, not a broken
-        # partition: rejecting the whole response discarded ~57 min over ONE
-        # address (chunk_0009, 2026-08-08) and ~60 min more over three. Sweep a
-        # small tail into an explicit unresolved unit -- 'unresolved' is not in
-        # PORTABLE_CLASSIFICATIONS, so it is recorded honestly and never ported
-        # blind. unknown/duplicate still hard-fail: those corrupt the mapping.
-        # Purely proportional, no flat floor: on a 3-function chunk a single
-        # miss is 33% -- a real partition failure that must still repair (the
-        # test suite caught exactly that). 150 functions tolerate 7; anything
-        # under 20 tolerates none.
-        tolerance = int(
-            len(known) * float(os.getenv("OGHIDRA_CHUNK_COVERAGE_SLACK_RATIO", "0.05"))
+        """Mechanically apply model judgment to the deterministic partition.
+
+        Coverage is inherited from the deterministic base by construction --
+        there is no coverage to validate because the model never writes
+        address lists. Validation here checks that the OPS are well-formed:
+        known cluster ids, each cluster decided exactly once, split function
+        names resolvable, portable units carrying a real entry symbol. Every
+        violation raises ValueError with the exact defect, which the repair
+        loop feeds back; repairs re-emit the (small) op list, never addresses.
+        """
+        by_id = {unit.id: unit for unit in deterministic.units}
+        by_name = {function.name: function for function in chunk.functions}
+        functions_by_address = {function.address: function for function in chunk.functions}
+        errors: list[str] = []
+
+        referenced: list[str] = (
+            [op.cluster for op in ops.refine]
+            + [cluster for op in ops.merge for cluster in op.clusters]
+            + [op.cluster for op in ops.split]
         )
-        if missing and not unknown and not duplicate and len(missing) <= tolerance:
-            payload = payload.model_copy(
-                update={
-                    "units": [
-                        *payload.units,
-                        ExecutionUnit(
-                            id=f"unassigned-{chunk.name.removesuffix('.c')}",
-                            label="Unassigned functions (model omitted)",
-                            classification="unresolved",
-                            summary=(
-                                "Addresses the model left unassigned, swept in to preserve "
-                                "full coverage; needs classification before porting."
-                            ),
-                            function_addresses=missing,
-                        ),
-                    ]
-                }
+        unknown_ids = sorted({cluster for cluster in referenced if cluster not in by_id})
+        if unknown_ids:
+            errors.append(f"unknown cluster ids: {unknown_ids}")
+        seen: set[str] = set()
+        double = sorted({cluster for cluster in referenced if cluster in seen or seen.add(cluster)})
+        if double:
+            errors.append(f"cluster ids decided more than once: {double}")
+        undecided = sorted(set(by_id) - set(referenced))
+        if undecided:
+            errors.append(
+                "every deterministic cluster needs exactly one decision "
+                f"(refine, merge, or split); undecided: {undecided}"
             )
-            print(
-                f"coverage slack: swept {len(missing)} unassigned address(es) into "
-                f"unassigned-{chunk.name.removesuffix('.c')} instead of discarding the analysis"
+        if errors:
+            raise ValueError("invalid refinement ops: " + "; ".join(errors))
+
+        def judged_unit(
+            unit_id: str,
+            label_source: str,
+            addresses: list[str],
+            judgment: ClusterJudgment,
+        ) -> ExecutionUnit:
+            members = [functions_by_address[address] for address in addresses]
+            if judgment.classification in PORTABLE_CLASSIFICATIONS:
+                # Entry symbols must exist for portable units. Placeholder-only
+                # entries are ACCEPTED here (a function whose only exact name is
+                # FUN_xxxxxxxx cannot be named otherwise without inventing) --
+                # session enrichment and unit_eligibility arbitrate them
+                # downstream, exactly as before.
+                if not judgment.runtime_entry_symbols:
+                    raise ValueError(
+                        f"unit {unit_id!r} is {judgment.classification} but names no "
+                        "runtime_entry_symbols; list the exact entry function names a "
+                        "production caller must reach"
+                    )
+            return ExecutionUnit(
+                id=unit_id,
+                label=judgment.label or label_source,
+                classification=judgment.classification,
+                summary=judgment.summary,
+                function_addresses=addresses,
+                external_dependencies=sorted(
+                    {
+                        target
+                        for member in members
+                        for target in member.direct_calls
+                        if target not in addresses
+                    }
+                ),
+                shared_globals=sorted(
+                    {token for member in members for token in member.shared_globals}
+                ),
+                runtime_entry_symbols=list(dict.fromkeys(judgment.runtime_entry_symbols)),
+                target_source_paths=judgment.target_source_paths,
+                provenance="model_refined",
             )
-            missing = []
-        if unknown or duplicate or missing:
-            raise ValueError(
-                f"invalid unit coverage: unknown={unknown}, duplicate={duplicate}, missing={missing}"
+
+        units: list[ExecutionUnit] = []
+        merged_ids = {cluster for op in ops.merge for cluster in op.clusters}
+        split_ids = {op.cluster for op in ops.split}
+        refine_by_id = {op.cluster: op for op in ops.refine}
+
+        for base in deterministic.units:
+            if base.id in merged_ids or base.id in split_ids:
+                continue
+            refine_op = refine_by_id.get(base.id)
+            units.append(
+                judged_unit(base.id, base.label, base.function_addresses, refine_op.judgment)
             )
-        hardware = payload.hardware_or_sdk_functions or [
+
+        for op in ops.merge:
+            addresses = [
+                address
+                for cluster in op.clusters
+                for address in by_id[cluster].function_addresses
+            ]
+            units.append(judged_unit(op.clusters[0], by_id[op.clusters[0]].label, addresses, op.judgment))
+
+        for op in ops.split:
+            base = by_id[op.cluster]
+            base_names = {functions_by_address[a].name: a for a in base.function_addresses}
+            taken: set[str] = set()
+            for index, group in enumerate(op.groups, start=1):
+                addresses = []
+                for name in group.functions:
+                    address = base_names.get(name)
+                    if address is None:
+                        raise ValueError(
+                            f"split of {op.cluster!r}: function {name!r} is not a member "
+                            f"of that cluster (members: {sorted(base_names)})"
+                        )
+                    if address in taken:
+                        raise ValueError(
+                            f"split of {op.cluster!r}: function {name!r} listed in more than one group"
+                        )
+                    taken.add(address)
+                    addresses.append(address)
+                units.append(
+                    judged_unit(f"{op.cluster}-s{index}", base.label, addresses, group.judgment)
+                )
+            rest = [a for a in base.function_addresses if a not in taken]
+            if rest:
+                # Unlisted members stay together with deterministic provenance:
+                # undecided work remains visible and deferred, never invented.
+                units.append(
+                    base.model_copy(
+                        update={
+                            "id": f"{op.cluster}-rest",
+                            "function_addresses": rest,
+                            "provenance": "deterministic",
+                        }
+                    )
+                )
+
+        hardware = [
             address
-            for unit in payload.units
+            for unit in units
             if unit.classification == "hardware_or_sdk"
             for address in unit.function_addresses
         ]
-        game = payload.game_owned_functions or [
+        game = [
             address
-            for unit in payload.units
+            for unit in units
             if unit.classification == "game_owned"
             for address in unit.function_addresses
         ]
@@ -708,15 +893,12 @@ class ChunkPortWorkflow:
             function_count=len(chunk.functions),
             generated_by=generated_by,
             generated_at=utc_now(),
-            subsystems=payload.subsystems,
-            state_dispatchers=[normalize_address(value) for value in payload.state_dispatchers],
-            callback_tables=payload.callback_tables,
-            shared_globals=payload.shared_globals,
-            external_dependencies=[normalize_address(value) for value in payload.external_dependencies],
-            hardware_or_sdk_functions=[normalize_address(value) for value in hardware],
-            game_owned_functions=[normalize_address(value) for value in game],
-            functions=build_deterministic_analysis(chunk).functions,
-            units=payload.units,
+            shared_globals=deterministic.shared_globals,
+            external_dependencies=deterministic.external_dependencies,
+            hardware_or_sdk_functions=hardware,
+            game_owned_functions=game,
+            functions=deterministic.functions,
+            units=units,
         )
 
     def _model_analyze_with_repair(
@@ -736,11 +918,14 @@ class ChunkPortWorkflow:
         archived before validation so a failed run no longer discards a
         20-minute generation.
         """
-        fn_count = len(chunk.functions)
+        # Refinement ops are per-CLUSTER, not per-function: the output no
+        # longer scales with address transcription. Budget generously per
+        # cluster (judgment text + thinking tokens share this budget).
+        cluster_count = len(deterministic.units)
         max_tokens = int(
             os.getenv(
                 "OGHIDRA_CHUNK_ANALYSIS_MAX_TOKENS",
-                str(max(32768, 160 * fn_count + 4096)),
+                str(max(16384, 512 * cluster_count + 4096)),
             )
         )
         # Preflight BEFORE any request: the server rejects on prompt tokens
@@ -771,12 +956,13 @@ class ChunkPortWorkflow:
             try:
                 raw, _mode = llm.generate_structured(
                     prompt=_model_prompt(chunk, deterministic, repair_feedback=repair_feedback),
-                    schema=ChunkModelAnalysis.model_json_schema(),
-                    tool_name="submit_chunk_analysis",
+                    schema=ChunkRefinementOps.model_json_schema(),
+                    tool_name="submit_chunk_refinement",
                     model=model_name,
                     system_prompt=(
-                        "You partition complete Ghidra export chunks into coherent execution units. "
-                        "Return only the requested strict structured result; do not browse source or generate code."
+                        "You refine deterministic clusterings of Ghidra export chunks by emitting "
+                        "merge/split/refine operations. Return only the requested strict structured "
+                        "result; never transcribe address lists, browse source, or generate code."
                     ),
                     temperature=0.1,
                     max_tokens=max_tokens,
@@ -813,8 +999,10 @@ class ChunkPortWorkflow:
             archive.parent.mkdir(parents=True, exist_ok=True)
             archive.write_text(raw, encoding="utf-8")
             try:
-                payload = ChunkModelAnalysis.model_validate(_json_payload(raw))
-                analysis = self._validate_model_analysis(chunk, payload, generated_by="model")
+                ops = ChunkRefinementOps.model_validate(_json_payload(raw))
+                analysis = self._apply_refinement_ops(
+                    chunk, deterministic, ops, generated_by="model"
+                )
             except (ValueError, ValidationError) as error:
                 # Truncated JSON parses fail here too -- both are repairable.
                 last_error = error
@@ -883,9 +1071,9 @@ class ChunkPortWorkflow:
             analysis = deterministic
         elif model_response is not None:
             raw = Path(model_response).read_text(encoding="utf-8")
-            payload = ChunkModelAnalysis.model_validate(_json_payload(raw))
-            analysis = self._validate_model_analysis(
-                chunk, payload, generated_by="saved_model_response"
+            ops = ChunkRefinementOps.model_validate(_json_payload(raw))
+            analysis = self._apply_refinement_ops(
+                chunk, deterministic, ops, generated_by="saved_model_response"
             )
         else:
             analysis = self._model_analyze_with_repair(chunk, deterministic)

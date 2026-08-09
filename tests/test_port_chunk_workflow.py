@@ -79,75 +79,49 @@ def test_deterministic_analysis_groups_related_game_functions_and_classifies_sdk
 
 def test_analysis_from_saved_model_response_is_one_shot_and_list_is_offline(tmp_path: Path):
     root = fixture_repo(tmp_path)
-    response = tmp_path / "analysis-response.json"
-    response.write_text(
-        json.dumps(
-            {
-                "subsystems": ["challenge frontend"],
-                "state_dispatchers": ["0x80001000"],
-                "callback_tables": [],
-                "shared_globals": ["DAT_80430000"],
-                "external_dependencies": ["0x80003000"],
-                "hardware_or_sdk_functions": ["0x80002000"],
-                "game_owned_functions": ["0x80001000", "0x80001020"],
-                "units": [
-                    {
-                        "id": "challenge-controller",
-                        "label": "Challenge controller",
-                        "classification": "game_owned",
-                        "summary": "Owns challenge selection state.",
-                        "function_addresses": ["0x80001000", "0x80001020"],
-                        "external_dependencies": ["0x80003000"],
-                        "shared_globals": ["DAT_80430000"],
-                        "runtime_entry_symbols": ["challenge_root"],
-                        "target_source_paths": ["apps/game/src/ui/screens/Challenge.ts"],
-                    },
-                    {
-                        "id": "gx-host",
-                        "label": "GX host boundary",
-                        "classification": "hardware_or_sdk",
-                        "summary": "Host graphics initialization.",
-                        "function_addresses": ["0x80002000"],
-                        "external_dependencies": [],
-                        "shared_globals": [],
-                        "runtime_entry_symbols": [],
-                        "target_source_paths": [],
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    response = write_saved_response(tmp_path, entry_symbols=["challenge_root"])
     workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
 
     analysis = workflow.analyze("chunk_0048", model_response=response)
     listed = workflow.list_units("chunk_0048")
 
     assert analysis.generated_by == "saved_model_response"
-    assert [unit.id for unit in listed] == ["challenge-controller", "gx-host"]
+    assert [unit.id for unit in listed] == ["challenge-root", "gnt4-gxinit"]
+    # Judgment is model-authored; membership/deps/globals mechanically derived.
+    controller = listed[0]
+    assert controller.label == "Challenge controller"
+    assert controller.function_addresses == ["0x80001000", "0x80001020"]
+    assert controller.external_dependencies == ["0x80003000"]
+    assert controller.shared_globals == ["DAT_80430000"]
+    assert controller.provenance == "model_refined"
     assert workflow.analysis_path("chunk_0048").is_file()
 
 
 def write_saved_response(tmp_path: Path, *, entry_symbols: list[str]) -> Path:
+    # Refinement-ops form: judgment over the deterministic clusters
+    # (challenge-root = {challenge_root, challenge_poll}, gnt4-gxinit = {gnt4_GXInit}).
     response = tmp_path / "analysis-response.json"
     response.write_text(
         json.dumps(
             {
-                "units": [
+                "refine": [
                     {
-                        "id": "challenge-controller",
-                        "label": "Challenge controller",
-                        "classification": "game_owned",
-                        "summary": "Owns challenge selection state.",
-                        "function_addresses": ["0x80001000", "0x80001020"],
-                        "runtime_entry_symbols": entry_symbols,
+                        "cluster": "challenge-root",
+                        "judgment": {
+                            "label": "Challenge controller",
+                            "classification": "game_owned",
+                            "summary": "Owns challenge selection state.",
+                            "runtime_entry_symbols": entry_symbols,
+                            "target_source_paths": ["apps/game/src/ui/screens/Challenge.ts"],
+                        },
                     },
                     {
-                        "id": "gx-host",
-                        "label": "GX host boundary",
-                        "classification": "hardware_or_sdk",
-                        "summary": "Host graphics initialization.",
-                        "function_addresses": ["0x80002000"],
+                        "cluster": "gnt4-gxinit",
+                        "judgment": {
+                            "label": "GX host boundary",
+                            "classification": "hardware_or_sdk",
+                            "summary": "Host graphics initialization.",
+                        },
                     },
                 ],
             }
@@ -197,7 +171,7 @@ def test_port_unit_skips_non_portable_classification_without_model_calls(tmp_pat
         model_response=write_saved_response(tmp_path, entry_symbols=["challenge_root"]),
     )
 
-    result = workflow.port_unit("chunk_0048", "gx-host")
+    result = workflow.port_unit("chunk_0048", "gnt4-gxinit")
 
     assert isinstance(result, UnitSkipResult)
     assert result.eligibility == "ineligible_classification"
@@ -216,7 +190,7 @@ def test_port_unit_skips_placeholder_only_entry_symbols_without_model_calls(tmp_
         ),
     )
 
-    result = workflow.port_unit("chunk_0048", "challenge-controller")
+    result = workflow.port_unit("chunk_0048", "challenge-root")
 
     assert isinstance(result, UnitSkipResult)
     assert result.eligibility == "ineligible_fun_entry"
@@ -248,7 +222,7 @@ def test_session_index_enrichment_unlocks_placeholder_entry_symbols(tmp_path: Pa
 
     listed = workflow.list_units("chunk_0048")
 
-    controller = next(item for item in listed if item.id == "challenge-controller")
+    controller = next(item for item in listed if item.id == "challenge-root")
     assert controller.runtime_entry_symbols == ["dispatch_challenge_flow_state"]
     from src.port_chunk_workflow import unit_eligibility as eligibility
 
@@ -308,30 +282,32 @@ class ScriptedLlm:
 
 
 def model_response_json(*, complete: bool) -> str:
-    units = [
+    refine = [
         {
-            "id": "challenge-controller",
-            "label": "Challenge controller",
-            "classification": "game_owned",
-            "summary": "",
-            "function_addresses": ["0x80001000", "0x80001020"],
-            "runtime_entry_symbols": ["challenge_root"],
+            "cluster": "challenge-root",
+            "judgment": {
+                "label": "Challenge controller",
+                "classification": "game_owned",
+                "summary": "",
+                "runtime_entry_symbols": ["challenge_root"],
+            },
         }
     ]
     if complete:
-        units.append(
+        refine.append(
             {
-                "id": "gx-host",
-                "label": "GX host",
-                "classification": "hardware_or_sdk",
-                "summary": "",
-                "function_addresses": ["0x80002000"],
+                "cluster": "gnt4-gxinit",
+                "judgment": {
+                    "label": "GX host",
+                    "classification": "hardware_or_sdk",
+                    "summary": "",
+                },
             }
         )
-    return json.dumps({"units": units})
+    return json.dumps({"refine": refine})
 
 
-def test_analyzer_repairs_coverage_violations_within_request_budget(tmp_path: Path):
+def test_analyzer_repairs_undecided_clusters_within_request_budget(tmp_path: Path):
     root = fixture_repo(tmp_path)
     llm = ScriptedLlm([model_response_json(complete=False), model_response_json(complete=True)])
     workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: (llm, "custom_api", "qwen"))
@@ -341,11 +317,10 @@ def test_analyzer_repairs_coverage_violations_within_request_budget(tmp_path: Pa
     assert analysis.generated_by == "model"
     assert workflow.last_analyze_requests == 2
     assert len(llm.calls) == 2
-    assert "missing=['0x80002000']" in llm.calls[1]["prompt"]
-    # Output budget floors at 32768 and scales UP with the chunk, never
-    # ceiling-clamped: the 90 tok/fn + 28672 clamp sat below the measured
-    # 123-134 tok/fn demand and guaranteed truncation (chunk_0048, 2026-08-07).
-    assert llm.calls[0]["max_tokens"] == 32768
+    # The repair names the undecided cluster ids -- never addresses.
+    assert "undecided: ['gnt4-gxinit']" in llm.calls[1]["prompt"]
+    # Ops scale with clusters, not functions: floor is 16384.
+    assert llm.calls[0]["max_tokens"] == 16384
     chunk_root = workflow.chunk_root("chunk_0048")
     assert (chunk_root / "analysis-attempt-1.raw.txt").is_file()
     assert (chunk_root / "analysis-attempt-2.raw.txt").is_file()
@@ -426,3 +401,107 @@ def test_oversized_chunk_prompt_raises_before_any_model_request(tmp_path, monkey
     with pytest.raises(ChunkAnalysisOversized):
         workflow.analyze("chunk_0048", force=True)
     assert workflow.last_analyze_requests == 0
+
+
+def test_merge_op_fuses_clusters_with_derived_membership(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    response = tmp_path / "merge-response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "merge": [
+                    {
+                        "clusters": ["challenge-root", "gnt4-gxinit"],
+                        "judgment": {
+                            "label": "Challenge subsystem",
+                            "classification": "game_owned",
+                            "summary": "Whole challenge flow incl. GX bring-up.",
+                            "runtime_entry_symbols": ["challenge_root"],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+
+    analysis = workflow.analyze("chunk_0048", model_response=response)
+
+    assert [unit.id for unit in analysis.units] == ["challenge-root"]
+    merged = analysis.units[0]
+    assert merged.function_addresses == ["0x80001000", "0x80001020", "0x80002000"]
+    assert merged.external_dependencies == ["0x80003000"]  # in-unit calls excluded
+    assert merged.provenance == "model_refined"
+
+
+def test_split_op_resolves_names_and_keeps_rest_unrefined(tmp_path: Path):
+    root = fixture_repo(tmp_path)
+    response = tmp_path / "split-response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "split": [
+                    {
+                        "cluster": "challenge-root",
+                        "groups": [
+                            {
+                                "functions": ["challenge_root"],
+                                "judgment": {
+                                    "label": "Challenge controller",
+                                    "classification": "game_owned",
+                                    "summary": "",
+                                    "runtime_entry_symbols": ["challenge_root"],
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "refine": [
+                    {
+                        "cluster": "gnt4-gxinit",
+                        "judgment": {
+                            "label": "GX host",
+                            "classification": "hardware_or_sdk",
+                            "summary": "",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+
+    analysis = workflow.analyze("chunk_0048", model_response=response)
+
+    by_id = {unit.id: unit for unit in analysis.units}
+    assert by_id["challenge-root-s1"].function_addresses == ["0x80001000"]
+    assert by_id["challenge-root-s1"].provenance == "model_refined"
+    # The unlisted member stays together, visibly awaiting judgment.
+    assert by_id["challenge-root-rest"].function_addresses == ["0x80001020"]
+    assert by_id["challenge-root-rest"].provenance == "deterministic"
+
+
+def test_undecided_and_unknown_clusters_are_repairable_errors(tmp_path: Path):
+    from src.port_chunk_workflow import ChunkRefinementOps
+
+    root = fixture_repo(tmp_path)
+    workflow = ChunkPortWorkflow(repo_root=root, llm_factory=lambda: pytest.fail("model called"))
+    chunk = __import__("src.port_chunk_workflow", fromlist=["parse_chunk_export"]).parse_chunk_export(
+        root, "chunk_0048"
+    )
+    deterministic = __import__(
+        "src.port_chunk_workflow", fromlist=["build_deterministic_analysis"]
+    ).build_deterministic_analysis(chunk)
+
+    ops = ChunkRefinementOps.model_validate(
+        {"refine": [{"cluster": "no-such-cluster", "judgment": {
+            "label": "x", "classification": "game_owned", "summary": "",
+            "runtime_entry_symbols": ["challenge_root"]}}]}
+    )
+    with pytest.raises(ValueError) as excinfo:
+        workflow._apply_refinement_ops(chunk, deterministic, ops, generated_by="model")
+    message = str(excinfo.value)
+    assert "unknown cluster ids: ['no-such-cluster']" in message
+    assert "undecided: ['challenge-root', 'gnt4-gxinit']" in message

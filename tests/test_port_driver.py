@@ -402,3 +402,28 @@ def test_oversized_analysis_blocks_chunk_without_spending_budget(tmp_path: Path)
     assert analysis["status"] == "analysis_blocked"
     assert "too big for context" in analysis["detail"]
     assert analysis.get("model_requests_spent", 0) == 0
+
+
+def test_unrefined_units_in_model_analysis_defer_instead_of_skip(tmp_path: Path):
+    # Refinement design: a model-generated analysis can carry untouched
+    # clusters (split remainders). They must wait for judgment, never be
+    # terminally skipped -- even when their entry symbols are placeholders.
+    root = fixture_repo(tmp_path)
+    units = [
+        unit("refined", ["0x80001000"], entry_symbols=["real_entry"]),
+        unit("leftover", ["0x80001004"], entry_symbols=["FUN_80001004"]),
+    ]
+    units[1] = units[1].model_copy(update={"provenance": "deterministic"})
+    workflow = StubWorkflow(root, analysis_with(units, generated_by="model"))
+
+    exit_code = make_driver(root, workflow).run()
+
+    ledger = read_ledger(root)
+    chunk_units = ledger["chunks"]["chunk_0048"]["units"]
+    assert exit_code == EXIT_PROGRESSED
+    assert workflow.port_calls == ["refined"]
+    assert chunk_units["leftover"]["status"] == "pending"
+    assert chunk_units["leftover"]["eligibility"] in (
+        "eligible_pending_model_analysis",
+        "ineligible_singleton_pending_model",
+    )

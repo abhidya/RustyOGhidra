@@ -362,10 +362,17 @@ class PortDriver:
     ) -> tuple[list[ExecutionUnit], bool]:
         """Record eligibility for every unit; return (portable-now units, any_pending_model)."""
         integrated = set(ledger.get("integrated_addresses", []))
-        deterministic = analysis.generated_by == "deterministic"
         portable: list[ExecutionUnit] = []
         any_pending_model = False
         for unit in analysis.units:
+            # Provenance is per-unit under the refinement design: a
+            # model-generated analysis can still contain untouched clusters
+            # (split remainders), and those defer exactly like units of a
+            # fully deterministic analysis -- deferred, never skipped.
+            deterministic = (
+                analysis.generated_by == "deterministic"
+                or getattr(unit, "provenance", "model_refined") == "deterministic"
+            )
             record = self._unit_record(ledger, chunk, unit.id)
             record.setdefault("entry_symbols", unit.runtime_entry_symbols)
             if record.get("status") in TERMINAL_UNIT_STATUSES:
@@ -379,6 +386,12 @@ class PortDriver:
                 continue
             eligibility, reason = unit_eligibility(unit)
             if eligibility != "eligible":
+                if deterministic:
+                    # An unrefined cluster failing eligibility (placeholder
+                    # entry names) is pending judgment, not a terminal skip.
+                    record.update(status="pending", eligibility="eligible_pending_model_analysis")
+                    any_pending_model = True
+                    continue
                 record.update(status="skipped", eligibility=eligibility, detail=reason)
                 self.events.emit(
                     "unit_skipped", chunk=chunk, unit=unit.id, eligibility=eligibility
