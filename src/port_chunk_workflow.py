@@ -650,6 +650,42 @@ class ChunkPortWorkflow:
         unknown = sorted(set(assigned) - known)
         duplicate = sorted({address for address in assigned if assigned.count(address) > 1})
         missing = sorted(known - set(assigned))
+        # A handful of dropped addresses is a transcription slip, not a broken
+        # partition: rejecting the whole response discarded ~57 min over ONE
+        # address (chunk_0009, 2026-08-08) and ~60 min more over three. Sweep a
+        # small tail into an explicit unresolved unit -- 'unresolved' is not in
+        # PORTABLE_CLASSIFICATIONS, so it is recorded honestly and never ported
+        # blind. unknown/duplicate still hard-fail: those corrupt the mapping.
+        # Purely proportional, no flat floor: on a 3-function chunk a single
+        # miss is 33% -- a real partition failure that must still repair (the
+        # test suite caught exactly that). 150 functions tolerate 7; anything
+        # under 20 tolerates none.
+        tolerance = int(
+            len(known) * float(os.getenv("OGHIDRA_CHUNK_COVERAGE_SLACK_RATIO", "0.05"))
+        )
+        if missing and not unknown and not duplicate and len(missing) <= tolerance:
+            payload = payload.model_copy(
+                update={
+                    "units": [
+                        *payload.units,
+                        ExecutionUnit(
+                            id=f"unassigned-{chunk.name.removesuffix('.c')}",
+                            label="Unassigned functions (model omitted)",
+                            classification="unresolved",
+                            summary=(
+                                "Addresses the model left unassigned, swept in to preserve "
+                                "full coverage; needs classification before porting."
+                            ),
+                            function_addresses=missing,
+                        ),
+                    ]
+                }
+            )
+            print(
+                f"coverage slack: swept {len(missing)} unassigned address(es) into "
+                f"unassigned-{chunk.name.removesuffix('.c')} instead of discarding the analysis"
+            )
+            missing = []
         if unknown or duplicate or missing:
             raise ValueError(
                 f"invalid unit coverage: unknown={unknown}, duplicate={duplicate}, missing={missing}"
