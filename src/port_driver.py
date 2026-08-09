@@ -441,9 +441,21 @@ class PortDriver:
             ) if len(chunk_units) > 1 else set()
             return len(set(unit.external_dependencies) & other_addresses)
 
+        # Attempt band OUTRANKS priority. Priority alone came first, so a
+        # priority unit sorted ahead of everything no matter how often it had
+        # failed: challenge_flow_state_controller was re-selected on every pass
+        # at 21 attempts with one identical error, and 0-attempt units in the
+        # same chunk were never reached (2026-08-09). That defeats the stated
+        # design -- "a failing unit sinks behind fresh work ... and returns when
+        # everything cheaper has had its turn" -- without any countdown killing
+        # it. Banding keeps priority decisive among comparably-tried units while
+        # letting repeated failure sink a unit below fresh work; the unit still
+        # comes back once the cheaper work has had its turn.
+        band = max(1, int(os.getenv("OGHIDRA_PORT_ATTEMPT_BAND", "3")))
         return sorted(
             units,
             key=lambda unit: (
+                (unit_records.get(unit.id, {}).get("attempts_spent") or 0) // band,
                 not self._is_priority_unit(unit, ledger),
                 unit_records.get(unit.id, {}).get("attempts_spent") or 0,
                 internal_dependencies(unit),
