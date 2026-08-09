@@ -310,6 +310,36 @@ def _extract_browser_source_patch(text: str) -> BrowserSourcePatch:
     )
 
 
+def _closest_source_files(repo_root: Path, claimed: str, limit: int = 5) -> list[str]:
+    """Real source files most similar to a hallucinated path, for repair feedback.
+
+    Ranked by basename similarity first (the invented name is usually a
+    near-miss of a real module, e.g. challengeFlowManager vs challengeFlowVm),
+    with generator-owned .generated.ts files excluded since patching them is
+    rejected anyway.
+    """
+    import difflib
+
+    claimed_name = Path(claimed).name.lower()
+    candidates: list[tuple[float, str]] = []
+    for root_name in ("apps", "packages"):
+        root = repo_root / root_name
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.ts"):
+            relative = path.relative_to(repo_root).as_posix()
+            if EXCLUDED_CONTEXT_DIRECTORIES.intersection(Path(relative.lower()).parts):
+                continue
+            if relative.endswith(".generated.ts"):
+                continue
+            score = difflib.SequenceMatcher(
+                None, claimed_name, path.name.lower()
+            ).ratio()
+            candidates.append((score, relative))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [relative for _score, relative in candidates[:limit]]
+
+
 def _safe_source_path(repo_root: Path, relative: str) -> Path:
     normalized = relative.replace("\\", "/").lstrip("/")
     if (
@@ -1928,8 +1958,23 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                             f"{file_patch.path} must provide either new-file content or existing-file edits"
                         )
                     if file_patch.edits and not target.is_file():
+                        # R13/R14 (distillation): a doomed patch must fail with
+                        # actionable ground truth, not a bare rejection -- three
+                        # byte-identical resubmissions of edits against an
+                        # invented challengeFlowManager.ts (2026-08-08) proved
+                        # that "does not exist" alone gives the model nothing
+                        # to change course with.
+                        candidates = _closest_source_files(self.repo_root, file_patch.path)
+                        hint = (
+                            f" Closest existing files: {', '.join(candidates)}."
+                            if candidates
+                            else ""
+                        )
                         raise ValueError(
-                            f"Qwen attempted exact edits on a file that does not exist: {file_patch.path}"
+                            f"Qwen attempted exact edits on a file that does not exist: "
+                            f"{file_patch.path}.{hint} Edit one of the REAL files above "
+                            "(read it first), or introduce a genuinely new file via "
+                            "complete `content` with no `edits`."
                         )
                     if file_patch.content is not None and target.is_file():
                         raise ValueError(

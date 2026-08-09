@@ -737,3 +737,22 @@ def test_sequential_loop_pauses_generic_provider_failure_after_one_request(tmp_p
     assert result.attempts == 1
     assert calls == 1
     assert result.error == "ConnectionError: connection refused"
+
+
+def test_closest_source_files_ranks_real_near_misses(tmp_path: Path):
+    # The 2026-08-08 failure shape: model invents challengeFlowManager.ts while
+    # challengeFlowVm.ts exists. The rejection must name the real candidates.
+    from src.port_source_loop import _closest_source_files
+
+    ui = tmp_path / "apps/game/src/ui"
+    ui.mkdir(parents=True)
+    (ui / "challengeFlowVm.ts").write_text("export const x = 1;\n", encoding="utf-8")
+    (ui / "challengeFlowTables.generated.ts").write_text("", encoding="utf-8")
+    (ui / "hudRenderer.ts").write_text("export const y = 2;\n", encoding="utf-8")
+    (tmp_path / "packages/combat/src").mkdir(parents=True)
+    (tmp_path / "packages/combat/src/runtime.ts").write_text("", encoding="utf-8")
+
+    candidates = _closest_source_files(tmp_path, "apps/game/src/ui/challengeFlowManager.ts")
+
+    assert candidates[0] == "apps/game/src/ui/challengeFlowVm.ts"
+    assert all(not c.endswith(".generated.ts") for c in candidates)
