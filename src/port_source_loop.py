@@ -1629,6 +1629,11 @@ Patch protocol:
 - For an existing file, return ordered exact find/replace edits. Each find string must occur exactly once.
 - Copy every find string BYTE-EXACT from read_browser_source output (same whitespace,
   same line breaks). A find string composed from memory matches 0 times and fails.
+- `edits` are ONLY valid on a file you have actually read and confirmed exists. A file you
+  are introducing must use complete `content` and no `edits` -- the two modes are not
+  interchangeable, and edits against a non-existent path are rejected outright (twice on
+  an invented `challengeFlowManager.ts`, 2026-08-09). If you are unsure a path exists,
+  read it first; if the read fails, create it with `content`.
 - Use complete content only when creating a new file.
 - Keep edits minimal; do not reproduce an entire existing file. Full content for an
   existing file is REJECTED automatically: you cannot reproduce it faithfully and the
