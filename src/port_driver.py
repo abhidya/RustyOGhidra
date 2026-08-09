@@ -71,20 +71,10 @@ DEFAULT_PRIORITY_ENTRY_SYMBOLS = [
 ]
 ANALYSIS_REQUEST_BUDGET = 3
 TERMINAL_UNIT_STATUSES = {"integrated", "rejected_final", "skipped", "alias"}
-# Harness/budget failures say nothing about port quality (R15 spirit): the
-# designated milestone unit was once terminally rejected by a request_limit
-# error. Such units stay retryable until the cumulative attempt budget runs
-# out; only gate/quality failures (or budget exhaustion) are final.
-HARNESS_ERROR_MARKERS = (
-    "usagelimitexceeded",
-    "request_limit",
-    "token limit",
-    "max_tokens",
-    "maximum output retries",
-    "apiresponseerror",
-    "unexpectedmodelbehavior",
-)
-UNIT_ATTEMPT_BUDGET = int(os.getenv("OGHIDRA_UNIT_ATTEMPT_BUDGET", "9"))
+# Owner design (2026-08-08): resource countdowns never kill work. Failed
+# units are always retryable; starvation is prevented by ordering (least-
+# attempted first in _order_units), not by terminal verdicts. rejected_final
+# survives only in TERMINAL_UNIT_STATUSES for legacy ledger records.
 
 EXIT_NO_WORK = 0
 EXIT_STOPPED = 2
@@ -431,7 +421,14 @@ class PortDriver:
     def _order_units(
         self, ledger: dict[str, Any], analysis: ChunkAnalysis, units: list[ExecutionUnit]
     ) -> list[ExecutionUnit]:
-        """Priority symbols first, then leaf-first within the chunk, ties by address (D2)."""
+        """Priority symbols first, least-attempted next, then leaf-first, ties by address.
+
+        attempts_spent in the ordering is what replaces attempt budgets: a
+        failing unit sinks behind fresh work instead of hot-looping or dying,
+        and returns when everything cheaper has had its turn.
+        """
+        chunk_key = analysis.chunk.removesuffix(".c")
+        unit_records = ledger.get("chunks", {}).get(chunk_key, {}).get("units", {})
         chunk_units = {unit.id: set(unit.function_addresses) for unit in analysis.units}
 
         def internal_dependencies(unit: ExecutionUnit) -> int:
@@ -448,6 +445,7 @@ class PortDriver:
             units,
             key=lambda unit: (
                 not self._is_priority_unit(unit, ledger),
+                unit_records.get(unit.id, {}).get("attempts_spent") or 0,
                 internal_dependencies(unit),
                 int(unit.function_addresses[0], 16),
             ),
@@ -608,27 +606,21 @@ class PortDriver:
                 "unit_integrated", chunk=chunk, unit=unit.id, files=result.files
             )
             return "integrated"
-        error_text = (result.error or "").lower()
-        attempts_total = record.get("attempts_spent", 0)
-        if (
-            any(marker in error_text for marker in HARNESS_ERROR_MARKERS)
-            and attempts_total < UNIT_ATTEMPT_BUDGET
-        ):
-            record.update(status="rejected_retryable", error=result.error)
-            self._save_ledger(ledger, reason=f"unit_retryable:{chunk}/{unit.id}")
-            self.events.emit(
-                "unit_retryable",
-                chunk=chunk,
-                unit=unit.id,
-                error=result.error,
-                attempts_spent=attempts_total,
-                attempt_budget=UNIT_ATTEMPT_BUDGET,
-            )
-            return "rejected_retryable"
-        record.update(status="rejected_final", error=result.error)
-        self._save_ledger(ledger, reason=f"unit_rejected:{chunk}/{unit.id}")
-        self.events.emit("unit_rejected", chunk=chunk, unit=unit.id, error=result.error)
-        return "rejected"
+        # Owner design (2026-08-08): no countdown ever kills a unit. Only
+        # correctness gates decide "not yet" and only structural ineligibility
+        # decides "never". A failed unit keeps its feedback, sinks behind
+        # less-attempted work (_order_units), and comes around again when the
+        # system has improved -- which tonight it did, hourly.
+        record.update(status="rejected_retryable", error=result.error)
+        self._save_ledger(ledger, reason=f"unit_retryable:{chunk}/{unit.id}")
+        self.events.emit(
+            "unit_retryable",
+            chunk=chunk,
+            unit=unit.id,
+            error=result.error,
+            attempts_spent=record.get("attempts_spent", 0),
+        )
+        return "rejected_retryable"
 
     # --------------------------------------------------------------- progress
 

@@ -429,42 +429,45 @@ def test_unrefined_units_in_model_analysis_defer_instead_of_skip(tmp_path: Path)
     )
 
 
-def test_harness_failure_is_retryable_until_attempt_budget(tmp_path: Path):
-    # Audit drift item 1: request_limit/token-limit failures say nothing about
-    # port quality and must not terminally kill a unit (the milestone unit
-    # died this way). Budget exhaustion is what makes them final.
+def test_no_failure_is_ever_final(tmp_path: Path):
+    # Owner design 2026-08-08: countdowns never kill work. Harness errors and
+    # quality-gate failures alike leave the unit retryable with its feedback;
+    # attempts only accumulate for ordering.
     root = fixture_repo(tmp_path)
     units = [unit("milestone", ["0x80001000"], entry_symbols=["real_entry"])]
     workflow = StubWorkflow(root, analysis_with(units))
-    workflow.port_results["milestone"] = SourceLoopResult(
-        passed=False, attempts=4, error="UsageLimitExceeded: request_limit of 10 exceeded"
-    )
-
-    make_driver(root, workflow).run()
-    record = read_ledger(root)["chunks"]["chunk_0048"]["units"]["milestone"]
-    assert record["status"] == "rejected_retryable"
-
-    make_driver(root, workflow).run()  # 8 attempts, still under budget of 9
-    record = read_ledger(root)["chunks"]["chunk_0048"]["units"]["milestone"]
-    assert record["status"] == "rejected_retryable"
-
-    make_driver(root, workflow).run()  # 12 attempts, budget crossed -> final
-    record = read_ledger(root)["chunks"]["chunk_0048"]["units"]["milestone"]
-    assert record["status"] == "rejected_final"
+    for error in (
+        "UsageLimitExceeded: request_limit of 10 exceeded",
+        "$ pnpm typecheck failed: TS2532",
+    ):
+        workflow.port_results["milestone"] = SourceLoopResult(
+            passed=False, attempts=4, error=error
+        )
+        make_driver(root, workflow).run()
+        record = read_ledger(root)["chunks"]["chunk_0048"]["units"]["milestone"]
+        assert record["status"] == "rejected_retryable"
+        assert record["error"] == error
 
 
-def test_quality_failure_stays_terminally_rejected(tmp_path: Path):
+def test_failed_units_sink_behind_less_attempted_work(tmp_path: Path):
+    # Starvation is prevented by ordering, not by killing: after fresh-unit
+    # ports, the failing unit comes around again.
     root = fixture_repo(tmp_path)
-    units = [unit("bad-port", ["0x80001000"], entry_symbols=["real_entry"])]
+    units = [
+        unit("flaky", ["0x80001000"], entry_symbols=["flaky_entry"]),
+        unit("fresh", ["0x80001010"], entry_symbols=["fresh_entry"]),
+    ]
     workflow = StubWorkflow(root, analysis_with(units))
-    workflow.port_results["bad-port"] = SourceLoopResult(
-        passed=False, attempts=3, error="$ pnpm typecheck failed: TS2532"
+    workflow.port_results["flaky"] = SourceLoopResult(
+        passed=False, attempts=3, error="transient harness failure"
     )
 
-    make_driver(root, workflow).run()
+    make_driver(root, workflow).run()  # flaky (address order) fails, gains attempts
+    make_driver(root, workflow).run()  # fresh must be selected ahead of flaky now
+    assert workflow.port_calls == ["flaky", "fresh"]
 
-    record = read_ledger(root)["chunks"]["chunk_0048"]["units"]["bad-port"]
-    assert record["status"] == "rejected_final"
+    make_driver(root, workflow).run()  # everything else done: flaky retries
+    assert workflow.port_calls == ["flaky", "fresh", "flaky"]
 
 
 def test_blocked_analysis_chunk_still_ports_from_on_disk_analysis(tmp_path: Path):

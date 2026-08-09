@@ -52,6 +52,11 @@ from src.custom_api_client import APIResponseError
 # before any response was generated". The serving context (~131k) minus the
 # ~10-14k unit prompt leaves ample room.
 MODEL_MAX_OUTPUT_TOKENS = int(os.getenv("OGHIDRA_PORT_MAX_TOKENS", "65536"))
+# The model ports what it can SEE. The old flat 12,000-char clamp silently
+# truncated any unit beyond ~8 functions -- a 22-function unit was ported from
+# a prefix and no gate could tell (audit 2026-08-08 item 7). Sized to the
+# served context (131k tokens ~= 260k chars) instead of a guess.
+PORT_SOURCE_CHAR_LIMIT = int(os.getenv("OGHIDRA_PORT_SOURCE_CHAR_LIMIT", "260000"))
 MAX_REPAIR_ATTEMPTS = int(os.getenv("OGHIDRA_PORT_REPAIR_ATTEMPTS", "3"))
 SOURCE_CONTEXT_FILE_LIMIT = int(os.getenv("OGHIDRA_PORT_SOURCE_FILE_LIMIT", "4"))
 SOURCE_CONTEXT_FILE_CHAR_LIMIT = int(
@@ -607,7 +612,7 @@ def _source_tokens(bundle: dict[str, Any]) -> set[str]:
         (
             str(identity.get("name", "")),
             str(identity.get("prototype", "")),
-            str(bundle.get("decompiler", {}).get("c", ""))[:12000],
+            str(bundle.get("decompiler", {}).get("c", ""))[:PORT_SOURCE_CHAR_LIMIT],
             str(bundle.get("browser_search_hints", ""))[:6000],
         )
     )
@@ -725,7 +730,7 @@ def _bundle_for_prompt(bundle: dict[str, Any]) -> dict[str, Any]:
     decompiler = bundle.get("decompiler")
     decompiler_summary = dict(decompiler) if isinstance(decompiler, dict) else {}
     if "c" in decompiler_summary:
-        decompiler_summary["c"] = str(decompiler_summary.get("c") or "")[:12000]
+        decompiler_summary["c"] = str(decompiler_summary.get("c") or "")[:PORT_SOURCE_CHAR_LIMIT]
     return {
         "identity": bundle.get("identity"),
         "decompiler": decompiler_summary,
@@ -1514,7 +1519,7 @@ class SequentialSourcePortLoop:
                 [
                     "",
                     "Saved analysis, sibling functions, and research grounding:",
-                    json.dumps(analysis_context, indent=2, default=str)[:12000],
+                    json.dumps(analysis_context, indent=2, default=str)[:PORT_SOURCE_CHAR_LIMIT],
                 ]
             )
         if failure:
