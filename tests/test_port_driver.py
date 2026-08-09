@@ -470,17 +470,17 @@ def test_failed_units_sink_behind_less_attempted_work(tmp_path: Path):
     assert workflow.port_calls == ["flaky", "fresh", "flaky"]
 
 
-def test_blocked_analysis_chunk_still_ports_from_on_disk_analysis(tmp_path: Path):
-    # Audit drift item 2: analysis_blocked forbids spending more analysis
-    # requests -- it must not make the chunk's existing units unreachable.
+def test_analysis_failures_never_block_and_ports_resume_when_analysis_lands(tmp_path: Path):
+    # Owner design 2026-08-08: analysis spend is recorded and rotated, never a
+    # death sentence. Repeated failures keep the chunk analyzable, and an
+    # on-disk analysis makes its units portable immediately.
     root = fixture_repo(tmp_path)
     workflow = StubWorkflow(root, None)
     for _ in range(4):
         make_driver(root, workflow).run()
-    assert (
-        read_ledger(root)["chunks"]["chunk_0048"]["analysis"]["status"]
-        == "analysis_blocked"
-    )
+    record = read_ledger(root)["chunks"]["chunk_0048"]["analysis"]
+    assert record["status"] == "analysis_failed"  # never analysis_blocked
+    assert record["model_requests_spent"] == 4
 
     workflow.analysis = analysis_with(
         [unit("controller", ["0x80001000"], entry_symbols=["real_entry"])]

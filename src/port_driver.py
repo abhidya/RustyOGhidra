@@ -452,24 +452,34 @@ class PortDriver:
         )
 
     def _next_step(self, ledger: dict[str, Any]) -> tuple[str, str, ExecutionUnit | None]:
-        """Return (action, chunk, unit): action in {port, analyze, none}."""
-        for chunk in self._chunk_order(ledger):
+        """Return (action, chunk, unit): action in {port, analyze, none}.
+
+        Ports always win over analyses (a portable unit is the shortest path
+        to the product goal). Analyses ROTATE least-spent-first and are never
+        budget-blocked (owner design 2026-08-08: countdowns do not kill work);
+        the only analysis skip is the structural oversize verdict, which waits
+        for chunk splitting rather than for retries that cannot help.
+        """
+        analyze_candidate: tuple[int, int, str] | None = None
+        for order_index, chunk in enumerate(self._chunk_order(ledger)):
             chunk_record = self._chunk_record(ledger, chunk)
             analysis_record = chunk_record["analysis"]
+
+            def note_analysis_candidate() -> None:
+                nonlocal analyze_candidate
+                detail = str(analysis_record.get("detail", ""))
+                if "context window" in detail:
+                    return  # structural: waits for the splitter, not retries
+                spent = analysis_record.get("model_requests_spent", 0) or 0
+                key = (spent, order_index, chunk)
+                if analyze_candidate is None or key < analyze_candidate:
+                    analyze_candidate = key
+
             try:
                 analysis = self.workflow.load_analysis(chunk)
             except (FileNotFoundError, ValueError):
-                # analysis_blocked is an ANALYSIS verdict, not a chunk death
-                # sentence (audit 2026-08-08 drift item 2): it only forbids
-                # spending more analysis requests. An on-disk analysis -- past
-                # or future -- still gets its units considered above.
-                if analysis_record.get("status") == "analysis_blocked":
-                    continue
-                if analysis_record.get("model_requests_spent", 0) >= ANALYSIS_REQUEST_BUDGET:
-                    analysis_record["status"] = "analysis_blocked"
-                    analysis_record["detail"] = "analysis request budget exhausted"
-                    continue
-                return ("analyze", chunk, None)
+                note_analysis_candidate()
+                continue
             analysis_record.setdefault("generated_by", analysis.generated_by)
             # A unit left "porting" means the previous driver died mid-port:
             # resume it first so a SIGKILL costs at most the in-flight request (R5).
@@ -485,11 +495,9 @@ class PortDriver:
                 ordered = self._order_units(ledger, analysis, portable)
                 return ("port", chunk, ordered[0])
             if any_pending_model and analysis.generated_by == "deterministic":
-                if analysis_record.get("model_requests_spent", 0) >= ANALYSIS_REQUEST_BUDGET:
-                    analysis_record["status"] = "analysis_blocked"
-                    analysis_record["detail"] = "analysis request budget exhausted"
-                    continue
-                return ("analyze", chunk, None)
+                note_analysis_candidate()
+        if analyze_candidate is not None:
+            return ("analyze", analyze_candidate[2], None)
         return ("none", "", None)
 
     # ------------------------------------------------------------------ steps
@@ -529,13 +537,13 @@ class PortDriver:
             return "analysis_oversized"
         except Exception as error:
             self._record_analysis_spend(ledger, record)
+            # Never blocked on spend (owner design 2026-08-08): the failure and
+            # its spend are recorded, and _next_step's least-spent rotation
+            # decides when this chunk gets another turn.
             record["status"] = "analysis_failed"
             record["error"] = f"{type(error).__name__}: {error}"
-            if record["model_requests_spent"] >= ANALYSIS_REQUEST_BUDGET:
-                record["status"] = "analysis_blocked"
-                record["detail"] = "analysis request budget exhausted"
-                self.events.emit("analysis_blocked", chunk=chunk, error=record["error"])
             self._save_ledger(ledger, reason=f"analysis_failed:{chunk}")
+            self.events.emit("analysis_failed", chunk=chunk, error=record["error"])
             return "analysis_failed"
         self._record_analysis_spend(ledger, record)
         record["status"] = "analyzed"
