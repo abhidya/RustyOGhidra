@@ -1647,6 +1647,12 @@ Patch protocol:
   parameters and locals with an underscore (`_param10`); declare any local you reassign
   with `let`, never `const`; reference only globals and constants that already exist in
   current source or in the generated ROM-table modules listed below.
+- `noUncheckedIndexedAccess` is ON repo-wide (tsconfig.base.json). EVERY indexed access
+  -- `arr[i]`, `table[key]`, `obj[n]` -- has type `T | undefined`, even when the index is
+  provably in range. Bind once and guard before use
+  (`const e = arr[i]; if (!e) return;`) or assert when the ROM guarantees the slot
+  (`arr[i]!`). Indexing a ROM table straight into a field assignment produced 18
+  identical TS2532 failures in one patch (anim_transform, 2026-08-09).
 - The scheduler already removed proven platform/runtime functions; do not exclude this unit.
 - Do not emit placeholders, TODOs, fallbacks, documentation, shell commands, or generated reports.
 - NEVER fabricate ROM data. Zero-filled arrays, null function-pointer tables, or guessed
