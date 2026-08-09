@@ -2049,8 +2049,45 @@ Line windows are selected around matches. Use exact find/replace edits so unseen
                                         + updated[span.end() :]
                                     )
                                     continue
+                            # The error message IS the repair channel: the ratchet
+                            # feeds it straight back, and "matched 0 times" says
+                            # nothing about what the file actually contains, so the
+                            # next attempt re-guesses from memory. Anchor the model
+                            # to real text by quoting the closest lines we can find.
+                            hint = ""
+                            if occurrences == 0:
+                                probe = next(
+                                    (
+                                        line.strip()
+                                        for line in edit.find.splitlines()
+                                        if len(line.strip()) > 12
+                                    ),
+                                    "",
+                                )
+                                nearby: list[str] = []
+                                if probe:
+                                    needle = probe[:24]
+                                    for number, line in enumerate(
+                                        updated.splitlines(), start=1
+                                    ):
+                                        if needle in line or (
+                                            len(needle) > 8 and needle[:12] in line
+                                        ):
+                                            nearby.append(f"  {number}: {line}")
+                                        if len(nearby) >= 5:
+                                            break
+                                hint = (
+                                    "\nClosest real lines in the file (copy an anchor "
+                                    "from these verbatim):\n" + "\n".join(nearby)
+                                    if nearby
+                                    else (
+                                        "\nNo line resembling that anchor exists; "
+                                        "re-read the file and copy a real one."
+                                    )
+                                )
                             raise ValueError(
-                                f"exact edit in {file_patch.path} matched {occurrences} times; expected 1"
+                                f"exact edit in {file_patch.path} matched {occurrences} times; "
+                                f"expected 1. Anchor was: {edit.find[:160]!r}{hint}"
                             )
                     else:
                         updated = file_patch.content or ""
