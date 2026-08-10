@@ -166,6 +166,7 @@ class WasmUnitDriver:
         self.state_path = self.run_root / "wasm-units-state.json"
         self.work_root = self.run_root / "wasm-units"
         self.artifact_root = self.repo_root / "research/decomp/port-units"
+        self.staging_root = self.repo_root / "research/decomp/port-units-staging"
         self.lock = DriverLock(self.run_root / "wasm-units.lock")
         self.run_id = os.getenv("OGHIDRA_PORT_RUN_ID") or utc_now()
         self.events = DriverEvents(self.run_root / "events.jsonl", self.run_id)
@@ -300,7 +301,12 @@ class WasmUnitDriver:
 
     # ------------------------------------------------------------------- build
 
-    def _emcc_build(self, workdir: Path, exports: list[str]) -> tuple[bool, str]:
+    def _emcc_build(
+        self,
+        workdir: Path,
+        exports: list[str],
+        allowed_extra: list[str] | None = None,
+    ) -> tuple[bool, str]:
         bash = shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
         emsdk = self.repo_root / "research/tools/emsdk"
         exports_flag = ",".join("_" + name for name in exports)
@@ -309,6 +315,7 @@ class WasmUnitDriver:
             f"cd \"$(cygpath -u '{workdir}')\" && "
             "emcc unit.c -O1 -fno-strict-aliasing --no-entry "
             "-Wno-implicit-function-declaration -Wno-int-conversion "
+            "-Wno-deprecated-non-prototype "
             "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
             "-sALLOW_MEMORY_GROWTH=0 "
             f"-sEXPORTED_FUNCTIONS={exports_flag} "
@@ -323,6 +330,11 @@ class WasmUnitDriver:
         if completed.returncode != 0:
             return False, (completed.stderr + completed.stdout)[-6000:]
         bad = scan_disallowed_imports(workdir / "unit.wasm")
+        # Auto-generated units may declare external callees (functions outside the
+        # unit's extraction set). Those stay wasm imports by design — the JS side
+        # stubs+logs them (auto-stub rule) — so they are whitelisted per unit.
+        if allowed_extra:
+            bad = [name for name in bad if name not in allowed_extra]
         if bad:
             return False, (
                 "link gate: these symbols are UNDEFINED and became wasm imports, but "
@@ -373,14 +385,24 @@ class WasmUnitDriver:
             timeout=300,
         )
 
-    def _commit_unit(self, name: str, summary: str) -> tuple[str | None, bool, str]:
+    def _commit_unit(
+        self, name: str, summary: str, *, staging: bool = False
+    ) -> tuple[str | None, bool, str]:
         """git add + commit + push the unit's artifact dir. Returns
         (commit_sha or None, pushed, detail)."""
-        rel = f"research/decomp/port-units/{name}"
+        rel = (
+            f"research/decomp/port-units-staging/{name}"
+            if staging
+            else f"research/decomp/port-units/{name}"
+        )
         added = self._git_runner("add", rel)
         if added.returncode != 0:
             return None, False, (added.stdout + added.stderr)[-400:]
-        message = f"port: {name} wasm unit green (oracle {summary})\n\n{GIT_TRAILER}"
+        message = (
+            f"port-staging: {name} wasm unit LINKED (unoracled, not for integration)\n\n{GIT_TRAILER}"
+            if staging
+            else f"port: {name} wasm unit green (oracle {summary})\n\n{GIT_TRAILER}"
+        )
         committed = self._git_runner("commit", "-m", message)
         if committed.returncode != 0:
             return None, False, (committed.stdout + committed.stderr)[-400:]
@@ -441,7 +463,9 @@ class WasmUnitDriver:
             iterations = iteration
             self._heartbeat(f"wasm_units:{name}:build:{iteration}")
             try:
-                linked, build_error = self._build_runner(workdir, exports)
+                linked, build_error = self._build_runner(
+                    workdir, exports, unit.get("allowed_extra_imports") or None
+                )
             except (OSError, subprocess.SubprocessError) as error:
                 return self._fail(state, record, name, f"build runner: {error}")
             self.events.emit(
@@ -470,18 +494,31 @@ class WasmUnitDriver:
         if not linked:
             return self._fail(state, record, name, f"not linked: {build_error[:600]}")
 
-        # 4. oracle gate
-        self._heartbeat(f"wasm_units:{name}:oracle")
-        try:
-            passed, summary, oracle_log = self._oracle_runner(unit, workdir / "unit.wasm")
-        except (OSError, subprocess.SubprocessError, FileNotFoundError) as error:
-            return self._fail(state, record, name, f"oracle runner: {error}")
+        # 4. oracle gate. Tier "compile_only" (auto-generated chunk units) has no
+        # oracle yet: it passes build+import gates only, lands in the STAGING
+        # artifact tree with verified:false provenance, and is never wired into
+        # the app. Design stage 4 (oracle before trust) still governs promotion.
+        oracle_spec = unit.get("oracle") or {}
+        compile_only = oracle_spec.get("type") == "compile_only"
+        if compile_only:
+            passed, summary, oracle_log = True, "compile-only (UNVERIFIED)", (
+                "compile_only tier: build + import whitelist gates only; no "
+                "behavioral oracle was run. NOT for app integration."
+            )
+        else:
+            self._heartbeat(f"wasm_units:{name}:oracle")
+            try:
+                passed, summary, oracle_log = self._oracle_runner(unit, workdir / "unit.wasm")
+            except (OSError, subprocess.SubprocessError, FileNotFoundError) as error:
+                return self._fail(state, record, name, f"oracle runner: {error}")
         (workdir / "oracle.log").write_text(oracle_log, encoding="utf-8", newline="\n")
         if not passed:
             return self._fail(state, record, name, f"oracle red: {summary}")
 
         # 5. green: artifacts + provenance + commit-per-match
-        artifact_dir = self.artifact_root / name
+        artifact_dir = (
+            self.staging_root if compile_only else self.artifact_root
+        ) / name
         artifact_dir.mkdir(parents=True, exist_ok=True)
         for file_name in ("unit.c", "gnt4_shim.h", "unit.wasm", "oracle.log"):
             shutil.copyfile(workdir / file_name, artifact_dir / file_name)
@@ -495,10 +532,21 @@ class WasmUnitDriver:
             "compile_iterations": iterations,
             "model": model_used,
             "model_requests": record.get("model_requests", 0),
-            "oracle": {"command": unit["oracle"]["command"], "cwd": unit["oracle"]["cwd"], "summary": summary},
+            "verified": not compile_only,
+            "tier": "compile_only" if compile_only else "oracle_green",
+            "allowed_extra_imports": unit.get("allowed_extra_imports") or [],
+            "oracle": (
+                {"type": "compile_only", "summary": summary}
+                if compile_only
+                else {
+                    "command": oracle_spec["command"],
+                    "cwd": oracle_spec["cwd"],
+                    "summary": summary,
+                }
+            ),
         }
         atomic_write_json(artifact_dir / "provenance.json", provenance)
-        sha, pushed, push_detail = self._commit_unit(name, summary)
+        sha, pushed, push_detail = self._commit_unit(name, summary, staging=compile_only)
         record.update(
             status="green",
             error=None,

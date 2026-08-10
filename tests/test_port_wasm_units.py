@@ -89,7 +89,7 @@ def test_scan_disallowed_imports_flags_non_sdk(tmp_path):
 def _driver(repo: Path, **kwargs) -> WasmUnitDriver:
     defaults = dict(
         repo_root=repo,
-        build_runner=lambda workdir, exports: (True, ""),
+        build_runner=lambda workdir, exports, extra=None: (True, ""),
         oracle_runner=lambda unit, wasm: (True, "1/1", "PASS log"),
         git_runner=lambda *args: _completed(0, "abc123\n"),
     )
@@ -119,7 +119,7 @@ def test_green_unit_commits_artifacts_and_completes(tmp_path, monkeypatch):
             return _completed(0, "deadbeef\n")
         return _completed(0)
 
-    def fake_build(workdir, exports):
+    def fake_build(workdir, exports, extra=None):
         (workdir / "unit.wasm").write_bytes(b"\x00asm")
         return True, ""
 
@@ -162,7 +162,7 @@ def test_red_unit_stays_retryable_and_reports_progress(tmp_path, monkeypatch):
 
     driver = _driver(
         repo,
-        build_runner=lambda workdir, exports: (False, "error: bad"),
+        build_runner=lambda workdir, exports, extra=None: (False, "error: bad"),
         llm=NoBlockLLM(),
     )
     assert driver.run() == EXIT_PROGRESSED
@@ -182,7 +182,7 @@ def test_oracle_red_blocks_commit(tmp_path, monkeypatch):
     repo = _write_repo(tmp_path)
     git_calls = []
 
-    def fake_build(workdir, exports):
+    def fake_build(workdir, exports, extra=None):
         (workdir / "unit.wasm").write_bytes(b"\x00asm")
         return True, ""
 
@@ -206,7 +206,7 @@ def test_compile_fix_header_only_loop(tmp_path, monkeypatch):
     repo = _write_repo(tmp_path)
     builds = []
 
-    def flaky_build(workdir, exports):
+    def flaky_build(workdir, exports, extra=None):
         builds.append((workdir / "gnt4_shim.h").read_text())
         if len(builds) == 1:
             return False, "error: use of undeclared identifier 'bool'"
@@ -234,3 +234,42 @@ def test_compile_fix_header_only_loop(tmp_path, monkeypatch):
     )
     assert provenance["model"] == "fake-27b"
     assert provenance["compile_iterations"] == 2
+
+
+def test_compile_only_unit_commits_to_staging_unverified(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    queue_path = repo / "research/decomp/generated/finish-game-port/wasm-units.json"
+    queue = json.loads(queue_path.read_text())
+    queue["units"][0]["oracle"] = {"type": "compile_only"}
+    queue["units"][0]["allowed_extra_imports"] = ["FUN_80001234"]
+    queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "cafe1234\n")
+        return _completed(0)
+
+    def fake_build(workdir, exports, extra=None):
+        assert extra == ["FUN_80001234"]
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    oracle_calls = []
+    driver = _driver(
+        repo,
+        git_runner=fake_git,
+        build_runner=fake_build,
+        oracle_runner=lambda unit, wasm: oracle_calls.append(unit) or (True, "x", "y"),
+    )
+    assert driver.run() == EXIT_NO_WORK
+    assert oracle_calls == []  # compile_only never runs a behavioral oracle
+    staged = repo / "research/decomp/port-units-staging/unit-a/provenance.json"
+    prov = json.loads(staged.read_text())
+    assert prov["verified"] is False and prov["tier"] == "compile_only"
+    add_call = next(c for c in git_calls if c[0] == "add")
+    assert "port-units-staging" in add_call[1]
+    commit_call = next(c for c in git_calls if c[0] == "commit")
+    assert "port-staging:" in commit_call[2] and "unoracled" in commit_call[2]
