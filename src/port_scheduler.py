@@ -1516,6 +1516,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.drive:
+            # wasm-unit mode (POC-RESULTS-2026-08-09): opt-in via
+            # OGHIDRA_PORT_MODE=wasm_units in the environment or the live .env.
+            # The .env has not been loaded yet on this path (get_config() runs
+            # inside the workflow), so sniff it here without overriding real
+            # environment variables; when the flag is absent, behavior is
+            # unchanged.
+            try:
+                from dotenv import load_dotenv
+
+                _env_path = Path(__file__).resolve().parent.parent / ".env"
+                load_dotenv(_env_path if _env_path.is_file() else ".env", override=False)
+            except ImportError:
+                pass
+            if (os.getenv("OGHIDRA_PORT_MODE") or "").strip().lower() == "wasm_units":
+                from src.port_wasm_units import WasmUnitDriver
+
+                wasm_driver = WasmUnitDriver(
+                    units_budget=args.units, until_blocked=args.until_blocked
+                )
+                return wasm_driver.run()
             from src.port_driver import PortDriver
 
             driver = PortDriver(units_budget=args.units, until_blocked=args.until_blocked)
