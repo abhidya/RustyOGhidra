@@ -16,8 +16,10 @@ live inside the driver:
 Supervision rules ported from the fixed PS monitor (post-mortem 2026-08-08 §4b):
 telemetry writes are swallowed, protection steps before the kill are best-effort,
 the crash guard is exit-code aware (0/2/3/4/5 are healthy fast exits), the
-``completed`` latch un-latches when port-ledger.json outdates run-state.json,
-and a run the watchdog killed on purpose never feeds the crash guard.
+``completed`` latch un-latches when new work appears (chunk mode: port-ledger.json
+outdates run-state.json; wasm-unit mode: wasm-units.json moves or holds a
+non-green unit), and a run the watchdog killed on purpose never feeds the crash
+guard.
 
 Run: ``python -m src.palworld_watchdog`` (single instance per state dir).
 """
@@ -124,6 +126,14 @@ class WatchdogConfig:
     @property
     def liveness_path(self) -> Path:
         return self.run_root / "llm-liveness.json"
+
+    @property
+    def wasm_queue_path(self) -> Path:
+        return self.run_root / "wasm-units.json"
+
+    @property
+    def wasm_state_path(self) -> Path:
+        return self.run_root / "wasm-units-state.json"
 
     @property
     def state_dir(self) -> Path:
@@ -573,14 +583,44 @@ class Watchdog:
             return False
         return True
 
+    def _wasm_units_mode(self) -> bool:
+        """True when the port stack runs OGHIDRA_PORT_MODE=wasm_units.
+
+        Same resolution order as port_scheduler's dispatch: a real environment
+        variable wins, otherwise the OGhidra .env is sniffed (utf-8-sig because
+        the .env has carried a BOM before -- handoff trap 2026-08-06).
+        """
+        value = os.environ.get("OGHIDRA_PORT_MODE")
+        if value is None:
+            try:
+                match = re.search(
+                    r"^\s*OGHIDRA_PORT_MODE\s*=\s*(.+?)\s*$",
+                    (self.config.oghidra_root / ".env").read_text(encoding="utf-8-sig"),
+                    re.MULTILINE,
+                )
+            except OSError:
+                return False
+            if not match:
+                return False
+            value = match.group(1)
+        return value.strip().lower() == "wasm_units"
+
     def _completed_latch_holds(self) -> bool:
-        """True when run-state says completed AND the ledger has not moved since."""
+        """True when run-state says completed AND no new work appeared since.
+
+        Chunk mode keys on port-ledger.json mtime. wasm-unit mode
+        (OGHIDRA_PORT_MODE=wasm_units) keys on the wasm queue instead, because
+        src/port_wasm_units.py never touches the ledger -- the old key would
+        latch forever and starve fresh queue entries.
+        """
         try:
             state = json.loads(self.config.run_state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return False
         if state.get("status") != "completed" or state.get("run_mode") != "driver":
             return False
+        if self._wasm_units_mode():
+            return self._wasm_completed_latch_holds()
         try:
             ledger_mtime = self.config.ledger_path.stat().st_mtime
             state_mtime = self.config.run_state_path.stat().st_mtime
@@ -589,6 +629,37 @@ class Watchdog:
         if ledger_mtime > state_mtime:
             logger.info("port-ledger.json changed after completed state; probing for new work")
             return False
+        return True
+
+    def _wasm_completed_latch_holds(self) -> bool:
+        """wasm-unit latch: relaunch is warranted iff the queue moved after the
+        completed run OR any queued unit's state record is not green -- the same
+        rule WasmUnitDriver uses to decide work remains (_next_unit skips green;
+        all_green == every state record green). Fail-open: unreadable files mean
+        "probe for work" (the driver exits healthily if there is none)."""
+        try:
+            queue_mtime = self.config.wasm_queue_path.stat().st_mtime
+            state_mtime = self.config.run_state_path.stat().st_mtime
+        except OSError:
+            return False
+        if queue_mtime > state_mtime:
+            logger.info("wasm-units.json changed after completed state; probing for new work")
+            return False
+        try:
+            queue = json.loads(self.config.wasm_queue_path.read_text(encoding="utf-8-sig"))
+            unit_state = json.loads(self.config.wasm_state_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return False
+        units = queue.get("units")
+        records = unit_state.get("units")
+        if not isinstance(units, list) or not units or not isinstance(records, dict):
+            return False
+        for unit in units:
+            name = unit.get("name") if isinstance(unit, dict) else None
+            record = records.get(name) if name else None
+            if not isinstance(record, dict) or record.get("status") != "green":
+                logger.info("wasm unit %s not green; relaunch warranted", name)
+                return False
         return True
 
     def _provider_pause_holds(self) -> bool:

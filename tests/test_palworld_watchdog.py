@@ -1,7 +1,17 @@
 import json
+import os
 from pathlib import Path
 
+import pytest
+
 from src.palworld_watchdog import Watchdog, WatchdogConfig, atomic_write_json
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_port_mode(monkeypatch):
+    # Keep chunk-mode tests deterministic even if another test loaded the real
+    # .env (which carries OGHIDRA_PORT_MODE=wasm_units) into os.environ.
+    monkeypatch.delenv("OGHIDRA_PORT_MODE", raising=False)
 
 
 class FakeClock:
@@ -202,6 +212,98 @@ def test_completed_latch_blocks_relaunch_until_ledger_moves(tmp_path: Path):
     atomic_write_json(watchdog.config.ledger_path, {"chunks": {"chunk_0009": {}}})
     watchdog.iterate()
     assert driver.calls == ["launch"]
+
+
+def _write_wasm_latch_files(watchdog: Watchdog, statuses: dict[str, str]) -> None:
+    """Completed wasm run: queue + state + run-state, with deterministic mtimes
+    (queue strictly older than run-state so only unit status opens the latch)."""
+    atomic_write_json(
+        watchdog.config.wasm_queue_path,
+        {"queue_schema": 1, "units": [{"name": name} for name in statuses]},
+    )
+    atomic_write_json(
+        watchdog.config.wasm_state_path,
+        {
+            "state_schema": 1,
+            "units": {name: {"status": status, "attempts": 1} for name, status in statuses.items()},
+        },
+    )
+    atomic_write_json(
+        watchdog.config.run_state_path, {"status": "completed", "run_mode": "driver"}
+    )
+    base = 1_700_000_000
+    os.utime(watchdog.config.wasm_queue_path, (base, base))
+    os.utime(watchdog.config.run_state_path, (base + 100, base + 100))
+
+
+def test_wasm_latch_holds_only_while_every_queued_unit_is_green(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OGHIDRA_PORT_MODE", "wasm_units")
+    watchdog, _, _, driver, clock = make_watchdog(tmp_path)
+    _write_wasm_latch_files(watchdog, {"damage-core": "green", "knockback-core": "green"})
+
+    run_until_heavy(watchdog, clock)
+    assert driver.calls == []  # all green: latch holds, no ledger involved
+
+    # A unit falls back to non-green (or a fresh unit gains a pending record):
+    # work remains, exactly as WasmUnitDriver would decide -> relaunch.
+    _write_wasm_latch_files(
+        watchdog, {"damage-core": "green", "knockback-core": "red_retryable"}
+    )
+    watchdog.iterate()
+    assert driver.calls == ["launch"]
+
+
+def test_wasm_latch_breaks_when_queue_outdates_completed_state(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OGHIDRA_PORT_MODE", "wasm_units")
+    watchdog, _, _, driver, clock = make_watchdog(tmp_path)
+    _write_wasm_latch_files(watchdog, {"damage-core": "green"})
+
+    run_until_heavy(watchdog, clock)
+    assert driver.calls == []
+
+    # Owner edits the queue after the completed run (statuses unchanged): the
+    # mtime alone must open the latch.
+    base = 1_700_000_000
+    os.utime(watchdog.config.wasm_queue_path, (base + 200, base + 200))
+    watchdog.iterate()
+    assert driver.calls == ["launch"]
+
+
+def test_wasm_latch_holds_with_queued_unit_missing_from_state(tmp_path: Path, monkeypatch):
+    # A queue entry with no state record yet is pending work -> latch open.
+    monkeypatch.setenv("OGHIDRA_PORT_MODE", "wasm_units")
+    watchdog, _, _, driver, clock = make_watchdog(tmp_path)
+    _write_wasm_latch_files(watchdog, {"damage-core": "green"})
+    atomic_write_json(
+        watchdog.config.wasm_queue_path,
+        {"queue_schema": 1, "units": [{"name": "damage-core"}, {"name": "collision-core"}]},
+    )
+    base = 1_700_000_000
+    os.utime(watchdog.config.wasm_queue_path, (base, base))  # NOT newer than run-state
+
+    run_until_heavy(watchdog, clock)
+    assert driver.calls == ["launch"]
+
+
+def test_chunk_mode_latch_ignores_wasm_queue(tmp_path: Path):
+    # No OGHIDRA_PORT_MODE anywhere: byte-identical old behavior -- the ledger
+    # keys the latch and wasm-units.json is never consulted.
+    watchdog, _, _, driver, clock = make_watchdog(tmp_path)
+    atomic_write_json(watchdog.config.ledger_path, {"chunks": {}})
+    atomic_write_json(
+        watchdog.config.run_state_path, {"status": "completed", "run_mode": "driver"}
+    )
+    atomic_write_json(
+        watchdog.config.wasm_queue_path,
+        {"queue_schema": 1, "units": [{"name": "collision-core"}]},
+    )
+    base = 1_700_000_000
+    os.utime(watchdog.config.ledger_path, (base, base))
+    os.utime(watchdog.config.run_state_path, (base + 100, base + 100))
+    os.utime(watchdog.config.wasm_queue_path, (base + 200, base + 200))
+
+    run_until_heavy(watchdog, clock)
+    assert driver.calls == []  # non-green wasm unit + newer queue: irrelevant here
 
 
 def test_crash_guard_blocks_after_three_unhealthy_short_exits(tmp_path: Path):
