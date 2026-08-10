@@ -73,6 +73,9 @@ class WatchdogConfig:
     rig_metrics_jsonl: Path = Path(r"D:\rig\state\palworld-metrics.jsonl")
     rig_players_json: Path = Path(r"D:\rig\state\palworld-players.json")
     reset_marker: Path = Path(r"D:\rig\state\reset-request.marker")
+    # Owner's manual pause switch, written by the rig dashboard button, the
+    # widget, and `rig gate pause|resume`. Missing file == not paused.
+    manual_gate_path: Path = Path(r"D:\rig\state\manual-gate.json")
     legacy_state_path: Path = Path(
         r"D:\Palworld_Server_Setup\monitor\palworld-oghidra-monitor-state.json"
     )
@@ -401,6 +404,7 @@ class Watchdog:
         self.last_state_write: float | None = None
         self.last_reason = "starting"
         self.consecutive_loop_failures = 0
+        self.manual_paused = False
 
     # ----------------------------------------------------------------- telemetry
 
@@ -543,6 +547,20 @@ class Watchdog:
         if self.blocked_at is None:
             return True
         return (self.clock() - self.blocked_at) >= self.config.block_recheck_minutes * 60
+
+    def _manual_gate_paused(self) -> bool:
+        """Owner pause switch. Fail-open: missing/unreadable file == not paused.
+
+        utf-8-sig because two of the three writers are PowerShell and PS-written
+        JSON has carried a BOM before (handoff trap, 2026-08-06).
+        """
+        try:
+            flag = json.loads(
+                self.config.manual_gate_path.read_text(encoding="utf-8-sig")
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            return False
+        return isinstance(flag, dict) and bool(flag.get("paused"))
 
     def _reset_requested(self) -> bool:
         """`rig reset` drops a marker file; consume it so the request fires once."""
@@ -731,6 +749,21 @@ class Watchdog:
             self.api_failures += 1
             self.write_state("Palworld API unavailable.", players=None)
             logger.debug("palworld api failure %s: %s", self.api_failures, error)
+
+        # Owner's manual gate overrides everything below: stop automated jobs
+        # (same kill-before-unload path as a player join) and hold restarts.
+        # Palworld itself is untouched -- protect() never touches the server.
+        if self._manual_gate_paused():
+            self.empty_since = None  # full empty-grace applies again on resume
+            if not self.manual_paused:
+                self.manual_paused = True
+                logger.info("manual gate PAUSED by owner; stopping automated jobs")
+                self.protect("Manually paused by owner (rig gate).", players)
+                self.mode = "manual-paused"
+            return
+        if self.manual_paused:
+            self.manual_paused = False
+            logger.info("manual gate RESUMED by owner")
 
         if players is not None:
             if players > 0:
