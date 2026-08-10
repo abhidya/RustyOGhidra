@@ -1333,6 +1333,12 @@ class CustomAPIConfig(BaseModel):
     respect_retry_after: bool = Field(default=True, env="CUSTOM_API_RESPECT_RETRY_AFTER")
     retry_after_max_seconds: int = Field(default=60, ge=0, env="CUSTOM_API_RETRY_AFTER_MAX_SECONDS")
 
+    # Serving-slot management (unsloth studio admin API; 0/"" disables).
+    # max_seq_length > 0 opts the client into the /api/inference/* preflight
+    # context check, JIT-reload correction, and cancel-on-abandon.
+    gguf_variant: str = Field(default="", env="CUSTOM_API_GGUF_VARIANT")
+    max_seq_length: int = Field(default=0, ge=0, env="CUSTOM_API_MAX_SEQ_LEN")
+
     # Adaptive throttling (advanced)
     adaptive_throttle_enabled: bool = Field(default=True, env="CUSTOM_API_ADAPTIVE_THROTTLE_ENABLED")
     adaptive_max_interval: float = Field(default=10.0, ge=0.0, env="CUSTOM_API_ADAPTIVE_MAX_INTERVAL")
@@ -1986,6 +1992,19 @@ def get_config() -> BridgeConfig:
         if os.getenv("CUSTOM_API_ADAPTIVE_JITTER_SECONDS"):
             try:
                 config_data["custom_api"]["adaptive_jitter_seconds"] = float(os.getenv("CUSTOM_API_ADAPTIVE_JITTER_SECONDS"))
+            except ValueError:
+                pass
+        if os.getenv("CUSTOM_API_GGUF_VARIANT"):
+            config_data["custom_api"]["gguf_variant"] = os.getenv("CUSTOM_API_GGUF_VARIANT")
+        # CUSTOM_API_MAX_SEQ_LEN wins; the port pipeline's existing context pin
+        # (OGHIDRA_PORT_CONTEXT_TOKENS) is the fallback so port runs get the
+        # serving-slot management without a second knob to keep in sync.
+        if os.getenv("CUSTOM_API_MAX_SEQ_LEN") or os.getenv("OGHIDRA_PORT_CONTEXT_TOKENS"):
+            try:
+                config_data["custom_api"]["max_seq_length"] = int(
+                    os.getenv("CUSTOM_API_MAX_SEQ_LEN")
+                    or os.getenv("OGHIDRA_PORT_CONTEXT_TOKENS")
+                )
             except ValueError:
                 pass
 

@@ -11,6 +11,7 @@ import logging.handlers
 import os
 import requests
 import re
+import sys
 import time
 import uuid
 import warnings
@@ -28,6 +29,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Also suppress requests warnings
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+# Windows consoles default to cp1252, and model output contains emoji: printing
+# a streamed delta or an error body then raises UnicodeEncodeError and kills an
+# otherwise healthy port run. Every port entrypoint imports this module, so make
+# the console lossy-but-crashproof once here. (File logs are already utf-8.)
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
 
 # Bounds for the dedicated LLM-interaction log. Overridable via env so a debug
 # session can widen them without editing code.
@@ -118,6 +130,12 @@ class CustomAPIClient:
 
         # SSL verification (disabled by default for custom APIs with cert issues)
         self.verify_ssl = getattr(config, "verify_ssl", False)
+
+        # Serving-slot management (unsloth studio admin API on the same host as
+        # the chat endpoint). Enabled only when a max_seq_length is configured;
+        # generic OpenAI-compatible endpoints have no /api/inference/* routes.
+        self.gguf_variant = str(getattr(config, "gguf_variant", "") or "")
+        self.max_seq_length = int(getattr(config, "max_seq_length", 0) or 0)
         self.last_response_metadata: Dict[str, Any] = {}
         self.generation_metrics: Dict[str, Any] = {
             "api_calls": 0,
@@ -395,6 +413,142 @@ class CustomAPIClient:
             cb(event_type, payload)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Serving-slot management (unsloth studio /api/inference/* admin API)
+    # ------------------------------------------------------------------
+
+    def _admin_base_url(self) -> str:
+        """Root of the serving host (chat URL minus the OpenAI-compatible path)."""
+        base = self.base_url
+        for suffix in ("/v1/chat/completions", "/chat/completions", "/v1"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        return base.rstrip("/")
+
+    def _admin_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+
+    def _served_context_length(self) -> Optional[int]:
+        """Context the server is ACTUALLY serving, or None when unknowable.
+
+        Only `context_length` from the inference monitor/status endpoints is
+        trustworthy; `max_context_length` from /v1/models lies in both
+        directions (observed 2026-08-09) and must never be consulted.
+        """
+        admin = self._admin_base_url()
+        for endpoint in ("/api/inference/monitor", "/api/inference/status"):
+            try:
+                response = requests.get(
+                    f"{admin}{endpoint}",
+                    headers=self._admin_headers(),
+                    timeout=10,
+                    verify=self.verify_ssl,
+                )
+                body = response.json()
+            except (requests.RequestException, ValueError):
+                continue
+            if isinstance(body, dict) and "error" not in body:
+                context = body.get("context_length")
+                if isinstance(context, int) and context > 0:
+                    return context
+        return None
+
+    def _issue_serving_load(self) -> None:
+        """(Re)load the served model at the configured max_seq_length."""
+        body: Dict[str, Any] = {
+            "model_path": self.default_model,
+            "max_seq_length": self.max_seq_length,
+        }
+        if self.gguf_variant:
+            body["gguf_variant"] = self.gguf_variant
+        response = requests.post(
+            f"{self._admin_base_url()}/api/inference/load",
+            headers=self._admin_headers(),
+            timeout=120,
+            json=body,
+            verify=self.verify_ssl,
+        )
+        response.raise_for_status()
+
+    def _preflight_serving_context(self, required_tokens: int) -> None:
+        """Assert served context >= prompt + output budget before dispatching.
+
+        A JIT model reload silently resets the served context to 4096; the
+        request then fails (or truncates) after minutes of prefill. When the
+        served context is too small, re-issue the load at the configured
+        max_seq_length and wait for it to take effect. No-op unless
+        max_seq_length is configured (management opt-in) or when the admin
+        endpoints are absent (generic OpenAI-compatible providers).
+        """
+        if self.max_seq_length <= 0:
+            return
+        served = self._served_context_length()
+        if served is None or served >= required_tokens:
+            return
+        self.logger.warning(
+            f"[Custom API] Served context {served} < required {required_tokens}; "
+            f"re-issuing load at max_seq_length={self.max_seq_length}"
+        )
+        self._log_llm_interaction(
+            "serving_context_reload",
+            {
+                "served_context": served,
+                "required_tokens": required_tokens,
+                "max_seq_length": self.max_seq_length,
+            },
+        )
+        try:
+            self._issue_serving_load()
+        except requests.RequestException as error:
+            raise APIResponseError(
+                f"Serving context {served} < required {required_tokens} and reload "
+                f"failed: {error}"
+            ) from error
+        # The load call returns before the model finishes (re)loading; poll the
+        # monitor until the new context is visible. Model loads take minutes.
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
+            served = self._served_context_length()
+            if served is not None and served >= required_tokens:
+                return
+            time.sleep(5)
+        raise APIResponseError(
+            f"Serving context still {served} < required {required_tokens} after "
+            f"reload at max_seq_length={self.max_seq_length}; the request would "
+            "fail or truncate -- split the prompt or raise the served context"
+        )
+
+    def _cancel_abandoned_generation(self, reason: str) -> None:
+        """Force-cancel a server-side generation this client has abandoned.
+
+        The server keeps generating for disconnected clients; a zombie request
+        held the single serving slot for 79 minutes on 2026-08-09. There is no
+        lighter cancel endpoint, so force-unload with cancel, then re-request
+        the model so the next dispatch does not eat a cold load.
+        """
+        if self.max_seq_length <= 0:
+            return
+        self.logger.warning(f"[Custom API] Cancelling abandoned server generation ({reason})")
+        self._log_llm_interaction("cancel_abandoned_generation", {"reason": reason})
+        try:
+            requests.post(
+                f"{self._admin_base_url()}/api/inference/unload",
+                headers=self._admin_headers(),
+                timeout=60,
+                json={"model_path": self.default_model, "force_cancel_active": True},
+                verify=self.verify_ssl,
+            )
+        except requests.RequestException as error:
+            self.logger.warning(f"[Custom API] cancel-on-abandon unload failed: {error}")
+            return
+        try:
+            self._issue_serving_load()
+        except requests.RequestException as error:
+            # The slot is free (unload succeeded); a missing model surfaces as
+            # the well-known "no model loaded" 400 the pause rule matches.
+            self.logger.warning(f"[Custom API] cancel-on-abandon reload failed: {error}")
 
     @staticmethod
     def _read_streaming_response(
@@ -732,6 +886,7 @@ class CustomAPIClient:
         first_output_clock: float | None = None
         streamed_output: List[str] = []
         last_liveness_clock: float | None = None
+        stream_read_started = False
         start_time = time.time() if self.llm_log_timing else None
 
         # Request Delay
@@ -859,6 +1014,14 @@ class CustomAPIClient:
         try:
             # Concurrency + global throttling
             self._request_semaphore.acquire()
+            # Context preflight uses the ~2.05 chars/token measurement from the
+            # chunk workflow (chars//2 slightly overestimates tokens, which is
+            # the safe direction for a context gate).
+            required_context_tokens = (
+                len(json.dumps(conversation, ensure_ascii=False, default=str)) // 2
+                + int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 0)
+            )
+            self._preflight_serving_context(required_context_tokens)
             self._apply_global_throttle()
 
             retryer = Retrying(
@@ -973,11 +1136,11 @@ class CustomAPIClient:
                     stream_callback(event_type, event)
 
             response = retryer(do_post)
-            data = (
-                self._read_streaming_response(response, observed_stream_callback)
-                if stream_callback is not None
-                else response.json()
-            )
+            if stream_callback is not None:
+                stream_read_started = True
+                data = self._read_streaming_response(response, observed_stream_callback)
+            else:
+                data = response.json()
 
             # Extract response
             if "choices" in data and len(data["choices"]) > 0:
@@ -1114,6 +1277,23 @@ class CustomAPIClient:
         except Exception as e:
             error_msg = str(e)
             self.logger.error(f"Error calling Custom API: {error_msg}")
+            # Cancel-on-abandon: a read timeout (prefill or generation) or a
+            # dropped stream leaves the server generating for a client that is
+            # gone -- a zombie that hogs the single serving slot. A connect
+            # timeout or an in-band SSE error means no orphaned generation.
+            read_timed_out = isinstance(
+                e, requests.exceptions.Timeout
+            ) and not isinstance(e, requests.exceptions.ConnectTimeout)
+            stream_dropped = stream_read_started and isinstance(
+                e,
+                (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                    OSError,
+                ),
+            )
+            if read_timed_out or stream_dropped:
+                self._cancel_abandoned_generation(f"{type(e).__name__}: {error_msg[:200]}")
             with self._metrics_lock:
                 self.generation_metrics["active"] = False
                 self.generation_metrics["status"] = "failed"
