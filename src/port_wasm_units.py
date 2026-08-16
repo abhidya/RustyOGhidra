@@ -89,6 +89,19 @@ Fix the header so the C compiles AND keeps the original PowerPC runtime semantic
 Output the COMPLETE corrected gnt4_shim.h in a single ```c code block. No other text
 is used by the pipeline."""
 
+# Thinking OFF, exactly as the chunk-era source loop learned to do it
+# (src/port_source_loop.py PORT_DISABLE_THINKING). This server reports
+# reasoning_style=enable_thinking with reasoning_always_on=false, so thinking is
+# ON unless the request says otherwise -- and when it is on, the model spends the
+# whole max_tokens budget in `reasoning_content` and returns an EMPTY `content`.
+# The client then raises "returned no assistant content", which is how 8 of the
+# 19 reds on 2026-08-15 were recorded as unit faults, plus 3 more that simply hit
+# the 1200s read timeout mid-spiral. The disable machinery already existed; the
+# wasm-unit path just never inherited it.
+DISABLE_THINKING = os.getenv("OGHIDRA_PORT_DISABLE_THINKING", "1").lower() not in (
+    "0", "false", "no",
+)
+
 CODE_BLOCK = re.compile(r"```(?:c|cpp|h)?\s*\n(.*?)```", re.S)
 GIT_TRAILER = "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
@@ -379,7 +392,17 @@ class WasmUnitDriver:
             "Return the complete corrected gnt4_shim.h."
         )
         reply = self._llm_client().generate(
-            prompt=prompt, system_prompt=SYSTEM_PROMPT, temperature=0.6
+            prompt=prompt,
+            system_prompt=SYSTEM_PROMPT + (" /no_think" if DISABLE_THINKING else ""),
+            temperature=0.6,
+            # Belt and braces, same as the source loop: the template kwarg is
+            # honoured by llama.cpp/vLLM/SGLang and ignored elsewhere, and the
+            # Qwen `/no_think` soft switch covers the rest.
+            **(
+                {"chat_template_kwargs": {"enable_thinking": False}}
+                if DISABLE_THINKING
+                else {}
+            ),
         )
         matches = CODE_BLOCK.findall(reply or "")
         if not matches:

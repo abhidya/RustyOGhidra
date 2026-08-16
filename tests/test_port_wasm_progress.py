@@ -309,3 +309,39 @@ def test_a_journal_that_raises_never_fails_a_unit(tmp_path):
         ).read_text(encoding="utf-8")
     )
     assert state["units"]["unit-a"]["status"] == "green"
+
+
+def test_compile_fix_disables_thinking(tmp_path, monkeypatch):
+    """The server reports reasoning_always_on=false, so thinking is ON unless the
+    request disables it -- and a reasoning spiral returns EMPTY content, which
+    the client raises as 'no assistant content'. That is 8 of the 19 reds on
+    2026-08-15, recorded as unit faults. The chunk-era loop already knew this;
+    the wasm path had not inherited it."""
+    monkeypatch.setenv("OGHIDRA_PORT_DISABLE_THINKING", "1")
+    import importlib
+
+    import src.port_wasm_units as module
+
+    importlib.reload(module)
+    captured: dict = {}
+
+    class CapturingLLM:
+        default_model = "configured/model"
+
+        def generate(self, **kwargs):
+            captured.update(kwargs)
+            return "```c\n/* fixed */\n```"
+
+    driver = module.WasmUnitDriver(
+        repo_root=_repo(tmp_path, [_unit("unit-a")]),
+        units_budget=1,
+        journal=RecordingJournal(),
+        git_runner=lambda *a: _completed(0, "sha\n"),
+        build_runner=lambda workdir, exports, extra=None: (False, "error: missing CONCAT44"),
+        llm=CapturingLLM(),
+    )
+    driver.run()
+
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["system_prompt"].endswith("/no_think")
+    importlib.reload(module)
