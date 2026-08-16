@@ -589,12 +589,72 @@ class CustomAPIClient:
         except requests.RequestException as error:
             self.logger.warning(f"[Custom API] cancel-on-abandon unload failed: {error}")
             return
+        # The unload returns before the slot is actually clear, and the load
+        # returns before the model is actually resident. Retrying blind across
+        # that window is what turned one slow generation into a cascade,
+        # observed live: three consecutive 1200s timeouts followed by a stub
+        # response carrying finish_reason='stop' with prompt_tokens=0 and
+        # completion_tokens=0 -- a server that never processed a prompt because
+        # it was still reloading. That stub was then recorded as the unit's
+        # verdict. Wait for each transition instead.
+        if not self._wait_for_slot_empty(timeout=120):
+            self.logger.warning(
+                "[Custom API] abandoned generation still active after the unload; "
+                "the retry would contend with it"
+            )
         try:
             self._issue_serving_load()
         except requests.RequestException as error:
             # The slot is free (unload succeeded); a missing model surfaces as
             # the well-known "no model loaded" 400 the pause rule matches.
             self.logger.warning(f"[Custom API] cancel-on-abandon reload failed: {error}")
+            return
+        if not self._wait_for_model_ready(timeout=600):
+            self.logger.warning(
+                "[Custom API] model not resident again after cancel-on-abandon; "
+                "the retry may land mid-reload"
+            )
+
+    def _serving_active_requests(self) -> Optional[int]:
+        """Generations the SERVER thinks are running, or None when unknowable."""
+        admin = self._admin_base_url()
+        for endpoint in ("/api/inference/monitor", "/api/inference/status"):
+            try:
+                body = requests.get(
+                    f"{admin}{endpoint}", headers=self._admin_headers(),
+                    timeout=10, verify=self.verify_ssl,
+                ).json()
+            except (requests.RequestException, ValueError):
+                continue
+            if not isinstance(body, dict) or "error" in body:
+                continue
+            count = body.get("active_requests")
+            if isinstance(count, int):
+                return count
+            queue = body.get("queue")
+            if isinstance(queue, dict) and isinstance(queue.get("active"), int):
+                return queue["active"]
+        return None
+
+    def _wait_for_slot_empty(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            active = self._serving_active_requests()
+            if active == 0:
+                return True
+            if active is None:
+                return True   # unknowable; do not block the retry forever
+            time.sleep(2)
+        return (self._serving_active_requests() or 0) == 0
+
+    def _wait_for_model_ready(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            served = self._served_context_length()
+            if served is not None and served > 0:
+                return True
+            time.sleep(3)
+        return False
 
     @staticmethod
     def _read_streaming_response(
