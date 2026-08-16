@@ -136,3 +136,39 @@ def test_the_live_env_is_the_configured_source_of_truth():
     assert config.model
     assert config.admin_base_url.startswith("http")
     assert config.source.endswith(".env")
+
+
+# ------------------------------------------------- the committed template
+
+
+TEMPLATE = Path(port_model_config.__file__).resolve().parent.parent / "port-model.env.example"
+
+
+def test_the_committed_template_carries_no_secret():
+    """The template exists so a fresh clone reproduces the port configuration.
+    That is only safe while every secret in it is a placeholder."""
+    text = TEMPLATE.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if line.startswith(("CUSTOM_API_KEY=", "EXTERNAL_API_KEY=")):
+            value = line.split("=", 1)[1]
+            assert not value or "REPLACE-ME" in value, f"real secret in the template: {line!r}"
+    assert "sk-unsloth-" not in text.replace("sk-unsloth-REPLACE-ME", "")
+
+
+def test_the_template_declares_every_key_the_live_env_does():
+    """A key that exists live but not in the template is a setting a fresh clone
+    would silently lose -- which is exactly how src/.env's stale model survived."""
+    live = read_env_file(port_model_config.ENV_PATH)
+    template = read_env_file(TEMPLATE)
+    missing = sorted(set(live) - set(template))
+    assert not missing, f"live .env keys absent from the template: {missing}"
+
+
+def test_the_template_resolves_to_the_same_port_model_configuration():
+    """Drift between the two is the whole failure mode this guards."""
+    live = resolve_port_model_config(port_model_config.ENV_PATH)
+    template = resolve_port_model_config(TEMPLATE)
+    assert template.model == live.model
+    assert template.gguf_variant == live.gguf_variant
+    assert template.max_seq_length == live.max_seq_length
+    assert template.port_mode == live.port_mode
