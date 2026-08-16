@@ -29,7 +29,6 @@ import re
 import shutil
 import subprocess
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -272,7 +271,10 @@ class WasmUnitDriver:
                 "run_id": self.run_id,
                 "status": status,
                 "active": not status.endswith(":idle"),
-                "updated_at": datetime.now().isoformat(),
+                # UTC-Z, like every sibling stamp in this file. A naive local
+                # stamp here made every consumer diffing against UTC see a
+                # constant multi-hour staleness.
+                "updated_at": utc_now(),
             }
         )
         try:
@@ -325,6 +327,7 @@ class WasmUnitDriver:
         current_stage: str | None = None,
         current_attempt: int = 0,
         workflow_state: str = "running",
+        driver_running: bool = True,
     ) -> None:
         """Emit one remote progress checkpoint. Telemetry: never fails a unit.
 
@@ -334,7 +337,7 @@ class WasmUnitDriver:
         """
         machine = MachineState(
             workflow_state=workflow_state,
-            driver_status="running",
+            driver_status="running" if driver_running else "stopped",
             configured_model=self._model_config.model,
             active_model=self._model_config.model,
             context_length=self._model_config.max_seq_length or None,
@@ -349,7 +352,7 @@ class WasmUnitDriver:
                 current_unit=current_unit,
                 current_stage=current_stage,
                 current_attempt=current_attempt,
-                driver_running=True,
+                driver_running=driver_running,
             )
         except Exception as error:  # noqa: BLE001 - telemetry is never fatal
             self.events.emit("progress_checkpoint_failed", error=str(error)[:400])
@@ -487,7 +490,7 @@ class WasmUnitDriver:
             if staging
             else f"port: {name} wasm unit green (oracle {summary})\n\n{GIT_TRAILER}"
         )
-        committed = self._git_runner("commit", "-m", message)
+        committed = self._git_runner("commit", "-m", message, "--", rel)
         if committed.returncode != 0:
             return None, False, (committed.stdout + committed.stderr)[-400:]
         sha = ""
@@ -690,25 +693,6 @@ class WasmUnitDriver:
                 f"product commit failed, unit not settled: {push_detail}",
                 stage="commit",
             )
-        record.update(
-            status="green",
-            error=None,
-            oracle_summary=summary,
-            commit=sha,
-            pushed=pushed,
-            tier="compile_only" if compile_only else "oracle_green",
-            last_stage="commit",
-        )
-        self._save_state(state)
-        self._greens_this_run += 1
-        self.events.emit(
-            "wasm_unit_green",
-            unit=name,
-            oracle_summary=summary,
-            commit=sha,
-            pushed=pushed,
-            push_detail=push_detail,
-        )
         self._checkpoint(
             state,
             UnitTransition(
@@ -727,6 +711,25 @@ class WasmUnitDriver:
                 model=model_used or self._model_config.model,
                 tier="compile_only" if compile_only else "oracle_green",
             ),
+        )
+        record.update(
+            status="green",
+            error=None,
+            oracle_summary=summary,
+            commit=sha,
+            pushed=pushed,
+            tier="compile_only" if compile_only else "oracle_green",
+            last_stage="commit",
+        )
+        self._save_state(state)
+        self._greens_this_run += 1
+        self.events.emit(
+            "wasm_unit_green",
+            unit=name,
+            oracle_summary=summary,
+            commit=sha,
+            pushed=pushed,
+            push_detail=push_detail,
         )
         return "green"
 
@@ -806,23 +809,30 @@ class WasmUnitDriver:
             if result == RESULT_STRUCTURAL_INELIGIBLE
             else "red_retryable"
         )
-        record.update(status=status, error=error[:2000], last_stage=stage)
-        self._save_state(state)
+        transition = UnitTransition(
+            unit=name,
+            result=result,
+            stage=stage,
+            attempt=record.get("attempts", 0),
+            detail=error,
+            model=self._model_config.model,
+            product_commit_failed=stage == "commit",
+            product_commit_detail=error if stage == "commit" else "",
+        )
+        if status in self.SETTLED_STATUSES:
+            # Settling removes the unit from the queue permanently, and
+            # `_reconcile_interrupted` only rescues units left as `porting`.
+            # Record it remotely BEFORE it becomes unrecoverable locally.
+            self._checkpoint(state, transition)
+            record.update(status=status, error=error[:2000], last_stage=stage)
+            self._save_state(state)
+        else:
+            record.update(status=status, error=error[:2000], last_stage=stage)
+            self._save_state(state)
+            self._checkpoint(state, transition)
         self.events.emit(
             "wasm_unit_red", unit=name, error=error[:600], attempts=record.get("attempts", 0),
             stage=stage, result=result,
-        )
-        # LOCAL state is durable above; the remote checkpoint follows.
-        self._checkpoint(
-            state,
-            UnitTransition(
-                unit=name,
-                result=result,
-                stage=stage,
-                attempt=record.get("attempts", 0),
-                detail=error,
-                model=self._model_config.model,
-            ),
         )
         return status
 
@@ -932,6 +942,7 @@ class WasmUnitDriver:
                     self.events.emit("driver_stopped", reason=f"control:{command}")
                     self._checkpoint(
                         state, None, workflow_state="stopped_at_boundary",
+                        driver_running=False,
                     )
                     return EXIT_STOPPED
                 unit = self._next_unit(queue, state, processed)
@@ -945,6 +956,7 @@ class WasmUnitDriver:
                     self._checkpoint(
                         state, None,
                         workflow_state="running" if work_left else "complete",
+                        driver_running=False,   # this run is ending right here
                     )
                     return EXIT_PROGRESSED if work_left else EXIT_NO_WORK
                 self.events.emit("selection", action="wasm_unit", unit=unit["name"])
@@ -979,7 +991,9 @@ class WasmUnitDriver:
                     done = not self._work_remains(state) and remaining is None
                     if done:
                         self._write_progress(state, "completed")
-                        self._checkpoint(state, None, workflow_state="complete")
+                        self._checkpoint(
+                            state, None, workflow_state="complete", driver_running=False,
+                        )
                     self.events.emit("driver_stopped", reason="units_budget_reached")
                     return EXIT_NO_WORK if done else EXIT_PROGRESSED
         finally:

@@ -279,3 +279,58 @@ def test_replay_does_not_duplicate_events_already_on_the_branch(journal):
         for line in lines
     ]
     assert len(keys) == len(set(keys)), f"duplicate journal events: {keys}"
+
+
+def test_a_settled_unit_is_journalled_before_it_becomes_unrecoverable(tmp_path):
+    """`_reconcile_interrupted` only rescues units left as `porting`. A kill
+    between the local save and the remote record would therefore drop a settled
+    unit from the queue forever with no record anywhere."""
+    repo = _wasm_repo(tmp_path)
+    order: list[str] = []
+
+    class OrderingJournal(NullJournal):
+        def checkpoint(self, transition=None, **kwargs):
+            order.append(
+                f"journal:{transition.result}" if transition is not None else "journal:machine"
+            )
+            return {"recorded": True}
+
+    driver = WasmUnitDriver(
+        repo_root=repo, units_budget=1, journal=OrderingJournal(),
+        git_runner=lambda *a: subprocess.CompletedProcess(a, 0, "sha1234\n", ""),
+        build_runner=_build, oracle_runner=lambda unit, wasm: (True, "ok", "PASS"),
+    )
+    original_save = driver._save_state
+
+    def watched(state):
+        order.append("save")
+        return original_save(state)
+
+    driver._save_state = watched
+    driver.run()
+
+    # The staged (compile_only) record reaches the journal BEFORE the save that
+    # settles it.
+    settle = order.index("journal:staged")
+    assert order[settle + 1] == "save"
+
+
+def test_a_product_commit_is_scoped_to_the_unit(tmp_path):
+    """Without a pathspec, `git commit` sweeps the owner's staged work into
+    `port: <unit> wasm unit green` and pushes it."""
+    repo = _wasm_repo(tmp_path)
+    calls: list[tuple] = []
+
+    def recording(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "sha\n", "")
+
+    driver = WasmUnitDriver(
+        repo_root=repo, units_budget=1, journal=NullJournal(),
+        git_runner=recording, build_runner=_build,
+        oracle_runner=lambda unit, wasm: (True, "ok", "PASS"),
+    )
+    driver.run()
+
+    commit = next(c for c in calls if c and c[0] == "commit")
+    assert "--" in commit and commit[-1].startswith("research/decomp/port-units")

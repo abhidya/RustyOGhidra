@@ -74,6 +74,18 @@ HEALTH_COMPLETE = "complete"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _port_mode() -> str:
+    """Through the single authority -- reading OGHIDRA_PORT_MODE straight from
+    the environment is exactly the split the .env-wins precedence exists to
+    prevent."""
+    try:
+        from src.port_model_config import resolve_port_model_config
+
+        return resolve_port_model_config().port_mode
+    except Exception:  # noqa: BLE001 - telemetry field, never fatal
+        return os.environ.get("OGHIDRA_PORT_MODE", "") or "unknown"
+
+
 def stable_unit_id(name: str) -> str:
     """Filesystem-safe, stable, collision-free id for a queue unit name.
 
@@ -253,13 +265,19 @@ class ProgressJournal:
     # --------------------------------------------------------------------- git
 
     def _git(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(cwd or self.repo_root),
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT_SECONDS,
-        )
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=str(cwd or self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            # A stalled push raises TimeoutExpired. Every caller here treats a
+            # nonzero return as a recorded failure; raising instead would take
+            # out `port-contract progress-flush`, which has no guard.
+            return subprocess.CompletedProcess(args, 1, "", f"git invocation failed: {error}")
 
     def _git_wt(self, *args: str) -> subprocess.CompletedProcess:
         return self._git_runner(*args, cwd=self.worktree)
@@ -446,9 +464,11 @@ class ProgressJournal:
         records = []
         for line in lines[-MAX_EVENT_LINES:]:
             try:
-                records.append(json.loads(line))
+                parsed = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(parsed, dict):   # `null` / `[]` are valid JSON, not events
+                records.append(parsed)
         return records
 
     def _write_events(self, record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -480,9 +500,15 @@ class ProgressJournal:
                 parsed = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(parsed, dict):
+                continue
             present.add((parsed.get("timestamp"), parsed.get("unit"), parsed.get("result")))
-            if newest is None:
-                newest = _parse_iso(parsed.get("timestamp"))
+            stamp = _parse_iso(parsed.get("timestamp"))
+            # MAX, not "the last line": once a replay appends an older event
+            # after a newer one the file is unordered, and a last-line watermark
+            # then regresses and replays the same history on every checkpoint.
+            if stamp is not None and (newest is None or stamp > newest):
+                newest = stamp
         for missed in self._local_events():
             stamp = _parse_iso(missed.get("timestamp"))
             if stamp is None or (newest is not None and stamp < newest):
@@ -500,9 +526,11 @@ class ProgressJournal:
         parsed = []
         for line in lines:
             try:
-                parsed.append(json.loads(line))
+                entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(entry, dict):
+                parsed.append(entry)
         return parsed
 
     @staticmethod
@@ -689,7 +717,7 @@ class ProgressJournal:
                 "schema": PROGRESS_SCHEMA,
                 "timestamp": timestamp,
                 "run_id": self.run_id,
-                "port_mode": os.environ.get("OGHIDRA_PORT_MODE", "") or "wasm_units",
+                "port_mode": _port_mode(),
                 "workflow_state": machine.workflow_state,
                 "current_unit": current_unit,
                 "previous_unit": previous_unit,
