@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -326,9 +327,13 @@ class ProgressJournal:
             )
             if commit.returncode != 0:
                 return False
+            # The empty old-value means "must not already exist": without it a
+            # seed can silently clobber an existing journal branch, and the only
+            # thing standing between that and total loss is a separate rev-parse.
             return (
                 self._git_runner(
-                    "update-ref", f"refs/heads/{self.branch}", commit.stdout.strip()
+                    "update-ref", f"refs/heads/{self.branch}",
+                    commit.stdout.strip(), "",
                 ).returncode
                 == 0
             )
@@ -340,6 +345,17 @@ class ProgressJournal:
             return False
         head = self._git_wt("rev-parse", "--abbrev-ref", "HEAD")
         if head.returncode != 0 or head.stdout.strip() != self.branch:
+            return False
+        # A stale index.lock -- the exact leftover a killed `git commit` leaves,
+        # and supervisor kills are the NORMAL path here -- wedges every future
+        # commit while `rev-parse` and even `status` keep succeeding, because
+        # neither takes the index lock. Look for the lock itself, so prepare()
+        # rebuilds instead of short-circuiting on a worktree that can never
+        # commit again.
+        git_dir = self._git_wt("rev-parse", "--absolute-git-dir")
+        if git_dir.returncode != 0:
+            return False
+        if (Path(git_dir.stdout.strip()) / "index.lock").exists():
             return False
         # The journal directory must exist too: a worktree checked out at the
         # seed commit before the directory was created would otherwise be
@@ -357,7 +373,21 @@ class ProgressJournal:
             return True
         self._git_runner("worktree", "prune")
         if self.worktree.exists():
-            self._git_runner("worktree", "remove", "--force", str(self.worktree))
+            removed = self._git_runner("worktree", "remove", "--force", str(self.worktree))
+            if removed.returncode != 0:
+                # `--force` twice is what removes a LOCKED worktree; a single
+                # --force reports "cannot remove a locked working tree".
+                removed = self._git_runner(
+                    "worktree", "remove", "--force", "--force", str(self.worktree)
+                )
+            if removed.returncode != 0 and self.worktree.exists():
+                # Not a registered worktree at all (a leftover directory), which
+                # makes `worktree add` fail forever with "already exists".
+                try:
+                    shutil.rmtree(self.worktree, ignore_errors=True)
+                except OSError:
+                    return False
+            self._git_runner("worktree", "prune")
         if not self._branch_exists_local():
             if self._branch_exists_remote():
                 fetched = self._git_runner(
@@ -432,7 +462,11 @@ class ProgressJournal:
         path = self.progress_root / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            # errors="replace": a kill during the previous write can leave a
+            # truncated multibyte sequence, and a strict read would then raise
+            # on EVERY later checkpoint -- before reaching the write that would
+            # have repaired the file. Permanently wedged, from one bad byte.
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             lines = []
         newest = None
@@ -590,9 +624,48 @@ class ProgressJournal:
         except OSError:
             pass
 
+        try:
+            return self._checkpoint_locked(
+                record, transition, units, machine, previous_unit, previous_result,
+                current_unit, current_stage, current_attempt, driver_running,
+                queue_counters, timestamp,
+            )
+        except Exception as error:  # noqa: BLE001
+            # The contract is "never raises". `port-contract checkpoint` is
+            # invoked by the rig, where an escaping traceback becomes a failed
+            # machine-state record; the driver's caller swallows it, but then the
+            # branch dies silently. Degrade to a recorded pending instead.
+            self._write_pending(
+                True, f"checkpoint raised: {error}", self._read_pending().get("failures", 0) + 1
+            )
+            return {"recorded": True, "committed": False, "pushed": False,
+                    "detail": f"checkpoint raised: {error}"}
+
+    def _checkpoint_locked(
+        self,
+        record: dict[str, Any],
+        transition: UnitTransition | None,
+        units: dict[str, dict[str, Any]],
+        machine: MachineState,
+        previous_unit: str | None,
+        previous_result: str | None,
+        current_unit: str | None,
+        current_stage: str | None,
+        current_attempt: int,
+        driver_running: bool,
+        queue_counters: dict[str, Any] | None,
+        timestamp: str,
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {"recorded": True, "committed": False, "pushed": False}
         if not self.lock.acquire():
+            # The driver can hold this lock for the length of a push. A pause or
+            # block issued in that window would otherwise never reach
+            # current.json, and GitHub would keep rendering RUNNING over a
+            # paused machine. Record it so the next checkpoint replays it from
+            # the local mirror.
             result["detail"] = "another writer holds progress.lock"
+            self._write_pending(True, "checkpoint skipped: progress.lock contended",
+                                self._read_pending().get("failures", 0) + 1)
             return result
         try:
             if not self.prepare():
@@ -803,6 +876,10 @@ class ProgressJournal:
         """
         pending = self._read_pending()
         failures = int(pending.get("failures") or 0)
+        if not self.worktree.is_dir() and not self.prepare():
+            self._write_pending(True, "progress worktree unavailable", failures + 1)
+            return {"pushed": False, "push_pending": True,
+                    "push_detail": "progress worktree unavailable"}
         pushed = self._git_wt("push", self.remote, f"{self.branch}:{self.branch}")
         if pushed.returncode == 0:
             self._write_pending(False, "", 0)
@@ -823,6 +900,16 @@ class ProgressJournal:
                     self._write_pending(False, "", 0)
                     return {"pushed": True, "push_pending": False, "reconciled": True}
                 detail = (retry.stdout + retry.stderr)[-400:]
+            elif "unrelated histories" in (merged.stdout + merged.stderr).lower():
+                # Our branch was seeded locally while ls-remote was unreachable,
+                # so the remote already had a different journal. The branch is a
+                # machine journal, not shared source: adopt the remote's history
+                # and replay onto it rather than pushing forever into a wall.
+                detail = "unrelated histories; re-seeding from the remote journal"
+                self._git_runner("worktree", "remove", "--force", str(self.worktree))
+                self._git_runner("branch", "-D", self.branch)
+                self._prepared = False
+                self.prepare()
             else:
                 self._git_wt("merge", "--abort")
         self._write_pending(True, detail, failures)

@@ -661,7 +661,25 @@ class WasmUnitDriver:
             ),
         }
         atomic_write_json(artifact_dir / "provenance.json", provenance)
-        sha, pushed, push_detail = self._commit_unit(name, summary, staging=compile_only)
+        try:
+            sha, pushed, push_detail = self._commit_unit(name, summary, staging=compile_only)
+        except (OSError, subprocess.SubprocessError) as error:
+            # A stalled `git push` hits the 300s timeout and raises
+            # TimeoutExpired (a SubprocessError, NOT an OSError). Unguarded, it
+            # escaped run() entirely and left the unit stuck as `porting` after
+            # the local commit had already succeeded.
+            return self._fail(
+                state, record, name, f"product commit/push: {error}", stage="commit",
+            )
+        if sha is None:
+            # The artifact never entered git history. Marking it green would
+            # SETTLE it -- removing it from the queue forever with nothing in the
+            # product tree, and rendering on GitHub as an ordinary green.
+            return self._fail(
+                state, record, name,
+                f"product commit failed, unit not settled: {push_detail}",
+                stage="commit",
+            )
         record.update(
             status="green",
             error=None,
