@@ -1522,14 +1522,13 @@ def main(argv: list[str] | None = None) -> int:
             # inside the workflow), so sniff it here without overriding real
             # environment variables; when the flag is absent, behavior is
             # unchanged.
-            try:
-                from dotenv import load_dotenv
+            # Resolve the mode through the SAME authority the machine contract
+            # reports, so `port-contract status` can never say wasm_units while
+            # this dispatch runs the chunk path (the .env wins over the process
+            # environment, matching src/config.py's load_dotenv(override=True)).
+            from src.port_model_config import resolve_port_model_config
 
-                _env_path = Path(__file__).resolve().parent.parent / ".env"
-                load_dotenv(_env_path if _env_path.is_file() else ".env", override=False)
-            except ImportError:
-                pass
-            if (os.getenv("OGHIDRA_PORT_MODE") or "").strip().lower() == "wasm_units":
+            if resolve_port_model_config().port_mode == "wasm_units":
                 from src.port_wasm_units import WasmUnitDriver
 
                 wasm_driver = WasmUnitDriver(

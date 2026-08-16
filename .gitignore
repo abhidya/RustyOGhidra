@@ -320,3 +320,6 @@ uv.lock
 # Codex
 .codex
 watchdog/
+
+# Scratch dirs from port/codex runs; some are ACL-locked and unreadable.
+.tmp/

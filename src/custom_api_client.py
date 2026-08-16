@@ -487,6 +487,19 @@ class CustomAPIClient:
         served = self._served_context_length()
         if served is None or served >= required_tokens:
             return
+        if self.max_seq_length < required_tokens:
+            # The configured context CANNOT satisfy this request, so reloading
+            # would evict and re-load tens of GB, poll for ten minutes, and then
+            # fail with the same arithmetic. Observed live on 2026-08-15: every
+            # oversized unit paid a full reload before failing, and the failure
+            # was then recorded as a per-unit verdict. Fail immediately and name
+            # the real cause instead.
+            raise APIResponseError(
+                f"request needs {required_tokens} tokens but the configured serving "
+                f"context is {self.max_seq_length} (currently serving {served}); a "
+                "reload cannot help. Raise CUSTOM_API_MAX_SEQ_LEN, lower "
+                "CUSTOM_API_MAX_TOKENS, or split the prompt."
+            )
         self.logger.warning(
             f"[Custom API] Served context {served} < required {required_tokens}; "
             f"re-issuing load at max_seq_length={self.max_seq_length}"

@@ -33,14 +33,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.port_chunk_workflow import atomic_write_json, utc_now
+from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
 from src.port_driver import (
     EXIT_NO_WORK,
     EXIT_PROGRESSED,
+    EXIT_PROVIDER_PAUSED,
     EXIT_STOPPED,
     EXIT_LOCKED,
     DriverEvents,
     DriverLock,
+)
+from src.port_model_config import resolve_port_model_config
+from src.port_progress import (
+    RESULT_DEFERRED,
+    RESULT_GATE_FAILED,
+    RESULT_GREEN,
+    RESULT_RETRYABLE,
+    RESULT_STAGED,
+    RESULT_STRUCTURAL_INELIGIBLE,
+    MachineState,
+    UnitTransition,
+    journal_for,
 )
 from src.port_run_controller import find_gotyaforce_root
 
@@ -157,6 +170,7 @@ class WasmUnitDriver:
         build_runner: Any | None = None,
         oracle_runner: Any | None = None,
         git_runner: Any | None = None,
+        journal: Any | None = None,
     ):
         self.repo_root = (
             Path(repo_root).resolve() if repo_root is not None else find_gotyaforce_root()
@@ -177,6 +191,15 @@ class WasmUnitDriver:
         self._oracle_runner = oracle_runner or self._run_oracle
         self._git_runner = git_runner or self._git
         self._greens_this_run = 0
+        # Remote workflow journal: one durable progress record per unit
+        # transition, on the port-progress branch. Never allowed to fail a unit.
+        self._journal = journal if journal is not None else journal_for(
+            self.repo_root, run_root=self.run_root, run_id=self.run_id
+        )
+        self._previous_unit: str | None = None
+        self._previous_result: str | None = None
+        self._model_config = resolve_port_model_config()
+        self._provider_paused_detail: str | None = None
 
     # ------------------------------------------------------------------- state
 
@@ -194,8 +217,26 @@ class WasmUnitDriver:
             state = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
             if state.get("state_schema") == STATE_SCHEMA:
                 return state
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
+        except FileNotFoundError:
+            return {"state_schema": STATE_SCHEMA, "created_at": utc_now(), "units": {}}
+        except (json.JSONDecodeError, OSError):
+            state = None
+        # An unreadable or wrong-schema state file holds every green verdict and
+        # attempt count in the run. Starting fresh over it would silently re-port
+        # and re-commit units that are already done, so keep a copy and say so.
+        backup = self.state_path.with_name(
+            f"{self.state_path.name}.unreadable-{utc_now().replace(':', '').replace('-', '')}"
+        )
+        try:
+            shutil.copyfile(self.state_path, backup)
+            print(
+                f"WARNING: {self.state_path.name} was unreadable or a foreign schema "
+                f"(found {state.get('state_schema') if isinstance(state, dict) else 'unparseable'}); "
+                f"preserved at {backup.name} and starting a fresh state file"
+            )
+            self.events.emit("state_file_reset", backup=backup.name)
+        except OSError as error:
+            print(f"WARNING: could not preserve the previous state file: {error}")
         return {"state_schema": STATE_SCHEMA, "created_at": utc_now(), "units": {}}
 
     def _save_state(self, state: dict[str, Any]) -> None:
@@ -272,6 +313,49 @@ class WasmUnitDriver:
             payload["unit"] = unit
         atomic_write_json(self.run_root / "run-state.json", payload)
         self.events.emit("progress", **payload["counters"])
+
+    # ---------------------------------------------------------------- progress
+
+    def _checkpoint(
+        self,
+        state: dict[str, Any],
+        transition: UnitTransition | None,
+        *,
+        current_unit: str | None = None,
+        current_stage: str | None = None,
+        current_attempt: int = 0,
+        workflow_state: str = "running",
+    ) -> None:
+        """Emit one remote progress checkpoint. Telemetry: never fails a unit.
+
+        Called at EVERY unit transition, before the selector moves on -- the
+        unit-transition invariant. A git/network fault degrades to a recorded
+        pending push, never to a lost unit or a raised exception.
+        """
+        machine = MachineState(
+            workflow_state=workflow_state,
+            driver_status="running",
+            configured_model=self._model_config.model,
+            active_model=self._model_config.model,
+            context_length=self._model_config.max_seq_length or None,
+        )
+        try:
+            self._journal.checkpoint(
+                transition=transition,
+                units=state.get("units", {}),
+                machine=machine,
+                previous_unit=self._previous_unit,
+                previous_result=self._previous_result,
+                current_unit=current_unit,
+                current_stage=current_stage,
+                current_attempt=current_attempt,
+                driver_running=True,
+            )
+        except Exception as error:  # noqa: BLE001 - telemetry is never fatal
+            self.events.emit("progress_checkpoint_failed", error=str(error)[:400])
+        if transition is not None:
+            self._previous_unit = transition.unit
+            self._previous_result = transition.result
 
     # --------------------------------------------------------------------- llm
 
@@ -435,7 +519,12 @@ class WasmUnitDriver:
         try:
             verbatim, extraction_records = extract_verbatim(self.repo_root, unit["extractions"])
         except (OSError, ValueError, KeyError) as error:
-            return self._fail(state, record, name, f"extraction: {error}")
+            # The queue entry does not describe extractable code: retrying the
+            # identical spec cannot help, so this is structural, not retryable.
+            return self._fail(
+                state, record, name, f"extraction: {error}",
+                stage="extract", result=RESULT_STRUCTURAL_INELIGIBLE,
+            )
         prelude = "\n".join(unit.get("prelude", []))
         unit_c = (
             "#include \"gnt4_shim.h\"\n\n"
@@ -450,7 +539,10 @@ class WasmUnitDriver:
         try:
             header = header_seed.read_text(encoding="utf-8")
         except OSError as error:
-            return self._fail(state, record, name, f"header seed: {error}")
+            return self._fail(
+                state, record, name, f"header seed: {error}",
+                stage="header-seed", result=RESULT_STRUCTURAL_INELIGIBLE,
+            )
         (workdir / "gnt4_shim.h").write_text(header, encoding="utf-8", newline="\n")
 
         # 3. build + LLM compile-fix loop (header-only edits, max 8 iters)
@@ -467,7 +559,9 @@ class WasmUnitDriver:
                     workdir, exports, unit.get("allowed_extra_imports") or None
                 )
             except (OSError, subprocess.SubprocessError) as error:
-                return self._fail(state, record, name, f"build runner: {error}")
+                return self._fail(
+                    state, record, name, f"build runner: {error}", stage="build",
+                )
             self.events.emit(
                 "wasm_unit_build", unit=name, iteration=iteration, linked=linked
             )
@@ -480,19 +574,35 @@ class WasmUnitDriver:
                 fixed = self._compile_fix(
                     unit_c, (workdir / "gnt4_shim.h").read_text(encoding="utf-8"), build_error
                 )
-            except Exception as error:  # LLM/provider failure: red, retryable
-                return self._fail(state, record, name, f"compile-fix LLM: {error}")
+            except Exception as error:  # noqa: BLE001
+                # A PROVIDER outage is not this unit's fault. Blaming the unit
+                # is how 19 consecutive units were marked red_retryable on
+                # 2026-08-15 for "Serving context still 32768 < required 33974"
+                # and "Custom API returned no assistant content" -- provider
+                # faults, recorded as per-unit verdicts, with the rig unable to
+                # see an outage at all because wasm mode never raised one.
+                if self._is_provider_fault(error):
+                    return self._provider_pause(state, record, name, str(error))
+                return self._fail(
+                    state, record, name, f"compile-fix LLM: {error}", stage="compile-fix",
+                )
             record["model_requests"] = record.get("model_requests", 0) + 1
             model_used = getattr(self._llm, "default_model", None) or model_used
             self._save_state(state)
             if fixed is None:
-                return self._fail(state, record, name, "compile-fix returned no code block")
+                return self._fail(
+                    state, record, name, "compile-fix returned no code block",
+                    stage="compile-fix",
+                )
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             (workdir / f"header-iter{iteration}.h").write_text(
                 fixed, encoding="utf-8", newline="\n"
             )
         if not linked:
-            return self._fail(state, record, name, f"not linked: {build_error[:600]}")
+            return self._fail(
+                state, record, name, f"not linked: {build_error[:600]}",
+                stage="wasm-link", result=RESULT_GATE_FAILED,
+            )
 
         # 4. oracle gate. Tier "compile_only" (auto-generated chunk units) has no
         # oracle yet: it passes build+import gates only, lands in the STAGING
@@ -510,10 +620,15 @@ class WasmUnitDriver:
             try:
                 passed, summary, oracle_log = self._oracle_runner(unit, workdir / "unit.wasm")
             except (OSError, subprocess.SubprocessError, FileNotFoundError) as error:
-                return self._fail(state, record, name, f"oracle runner: {error}")
+                return self._fail(
+                    state, record, name, f"oracle runner: {error}", stage="oracle",
+                )
         (workdir / "oracle.log").write_text(oracle_log, encoding="utf-8", newline="\n")
         if not passed:
-            return self._fail(state, record, name, f"oracle red: {summary}")
+            return self._fail(
+                state, record, name, f"oracle red: {summary}",
+                stage="oracle", result=RESULT_GATE_FAILED,
+            )
 
         # 5. green: artifacts + provenance + commit-per-match
         artifact_dir = (
@@ -553,6 +668,8 @@ class WasmUnitDriver:
             oracle_summary=summary,
             commit=sha,
             pushed=pushed,
+            tier="compile_only" if compile_only else "oracle_green",
+            last_stage="commit",
         )
         self._save_state(state)
         self._greens_this_run += 1
@@ -564,19 +681,170 @@ class WasmUnitDriver:
             pushed=pushed,
             push_detail=push_detail,
         )
+        self._checkpoint(
+            state,
+            UnitTransition(
+                unit=name,
+                result=RESULT_STAGED if compile_only else RESULT_GREEN,
+                stage="commit",
+                attempt=record.get("attempts", 0),
+                detail=(
+                    "compile-only staging artifact (UNVERIFIED, not integrated)"
+                    if compile_only
+                    else f"oracle green: {summary}"
+                ),
+                product_commit=sha,
+                product_pushed=pushed,
+                oracle_summary=summary,
+                model=model_used or self._model_config.model,
+                tier="compile_only" if compile_only else "oracle_green",
+            ),
+        )
         return "green"
 
-    def _fail(self, state: dict[str, Any], record: dict[str, Any], name: str, error: str) -> str:
+    @staticmethod
+    def _is_provider_fault(error: Exception) -> bool:
+        """Is this the serving host failing, rather than the unit being bad?
+
+        Uses the SAME marker list the chunk workflow's pause rule uses, plus the
+        two shapes the wasm compile-fix loop actually produced live: a served
+        context too small for the request, and an empty assistant response.
+        """
+        message = str(error).lower()
+        if any(marker in message for marker in TRANSIENT_MARKERS):
+            return True
+        return (
+            "returned no assistant content" in message
+            or "serving context still" in message
+            or "context_length_exceeded" in message
+            or "exceeds the" in message and "context window" in message
+        )
+
+    def _provider_pause(
+        self, state: dict[str, Any], record: dict[str, Any], name: str, detail: str
+    ) -> str:
+        """Hand the unit back untouched and tell the machine the provider is out.
+
+        The unit keeps its previous status (it earned no verdict) and its
+        attempt is refunded, so it does not sink behind the queue for a fault
+        that was not its own.
+        """
+        record["attempts"] = max(0, record.get("attempts", 1) - 1)
+        record["status"] = "pending"
+        record["error"] = f"provider unavailable: {detail[:800]}"
+        record["last_stage"] = "compile-fix"
+        self._save_state(state)
+        self._provider_paused_detail = detail[:600]
+        self.events.emit("provider_unavailable", unit=name, error=detail[:600])
+        self._checkpoint(
+            state,
+            UnitTransition(
+                unit=name,
+                result=RESULT_DEFERRED,
+                stage="compile-fix",
+                attempt=record.get("attempts", 0),
+                detail=f"provider unavailable, unit not blamed: {detail[:400]}",
+                model=self._model_config.model,
+            ),
+            workflow_state="provider_paused",
+        )
+        return "provider_paused"
+
+    def _fail(
+        self,
+        state: dict[str, Any],
+        record: dict[str, Any],
+        name: str,
+        error: str,
+        *,
+        stage: str = "port",
+        result: str = RESULT_RETRYABLE,
+    ) -> str:
         # Owner design: no countdown kills a unit; red units sink behind
-        # less-attempted work and come around again.
-        record.update(status="red_retryable", error=error[:2000])
+        # less-attempted work and come around again. `structural_ineligible` is
+        # the one class that is NOT a retry candidate -- the queue entry itself
+        # does not describe extractable code.
+        status = (
+            "structural_ineligible"
+            if result == RESULT_STRUCTURAL_INELIGIBLE
+            else "red_retryable"
+        )
+        record.update(status=status, error=error[:2000], last_stage=stage)
         self._save_state(state)
         self.events.emit(
-            "wasm_unit_red", unit=name, error=error[:600], attempts=record.get("attempts", 0)
+            "wasm_unit_red", unit=name, error=error[:600], attempts=record.get("attempts", 0),
+            stage=stage, result=result,
         )
-        return "red_retryable"
+        # LOCAL state is durable above; the remote checkpoint follows.
+        self._checkpoint(
+            state,
+            UnitTransition(
+                unit=name,
+                result=result,
+                stage=stage,
+                attempt=record.get("attempts", 0),
+                detail=error,
+                model=self._model_config.model,
+            ),
+        )
+        return status
 
     # --------------------------------------------------------------------- run
+
+    # Statuses that permanently take a unit out of the work pool. Anything else
+    # (pending, porting, red_retryable) still counts as work: red units are
+    # retried forever by design, so only these two end the queue.
+    SETTLED_STATUSES = {"green", "structural_ineligible"}
+
+    def _reconcile_interrupted(self, state: dict[str, Any]) -> None:
+        """A unit left `porting` by a killed run never got a transition record.
+
+        The supervisor kills the driver tree on player join / manual pause, so
+        this is the normal path, not an exception. Reclassify as `deferred` and
+        emit the checkpoint the killed run owed -- otherwise GitHub shows unit A
+        as still in flight while the selector has already moved to unit B.
+        """
+        for name, record in state.get("units", {}).items():
+            if record.get("status") != "porting":
+                continue
+            record["status"] = "deferred"
+            record["error"] = "interrupted before a verdict (driver killed or crashed)"
+            # Refund the attempt. `_next_unit` orders least-attempted-first, so
+            # charging an interrupted unit would push it behind the entire
+            # queue -- and because the supervisor kills the driver on every
+            # player join and manual pause, that is a starvation machine: each
+            # interruption promotes a fresh unit and demotes the one in flight,
+            # so nothing ever finishes.
+            record["attempts"] = max(0, record.get("attempts", 1) - 1)
+            self._save_state(state)
+            self._checkpoint(
+                state,
+                UnitTransition(
+                    unit=name,
+                    result=RESULT_DEFERRED,
+                    stage=record.get("last_stage") or "port",
+                    attempt=record.get("attempts", 0),
+                    detail="interrupted before a verdict; requeued",
+                    model=self._model_config.model,
+                ),
+            )
+            # Deferred is a transient class: the unit re-enters the pool as
+            # pending so `_next_unit` treats it like any other retry candidate.
+            record["status"] = "pending"
+            self._save_state(state)
+
+    def _flush_pending_progress(self) -> None:
+        try:
+            if self._journal.push_is_pending():
+                self._journal.flush_pending_push()
+        except Exception as error:  # noqa: BLE001 - telemetry is never fatal
+            self.events.emit("progress_push_retry_failed", error=str(error)[:300])
+
+    def _work_remains(self, state: dict[str, Any]) -> bool:
+        return any(
+            record.get("status") not in self.SETTLED_STATUSES
+            for record in state.get("units", {}).values()
+        )
 
     def _next_unit(
         self,
@@ -588,7 +856,7 @@ class WasmUnitDriver:
         for index, unit in enumerate(queue):
             name = unit["name"]
             record = self._unit_state(state, name)
-            if record.get("status") == "green" or name in processed:
+            if record.get("status") in self.SETTLED_STATUSES or name in processed:
                 continue
             candidates.append((record.get("attempts", 0), index, unit))
         if not candidates:
@@ -610,10 +878,14 @@ class WasmUnitDriver:
             state = self._load_state()
             for unit in queue:  # make every queued unit visible in state/progress
                 self._unit_state(state, unit["name"])
+            self._reconcile_interrupted(state)
             self._save_state(state)
             self.events.emit(
                 "driver_started", mode="wasm_units", units_budget=self.units_budget
             )
+            # A pending progress push from a previous run is retried here, so a
+            # GitHub outage that spanned a whole run still reaches the remote.
+            self._flush_pending_progress()
             processed: set[str] = set()
             steps_done = 0
             while True:
@@ -621,34 +893,56 @@ class WasmUnitDriver:
                 if command in {"stop_after_stage", "pause_after_stage"}:
                     self._write_progress(state, "stopped")
                     self.events.emit("driver_stopped", reason=f"control:{command}")
+                    self._checkpoint(
+                        state, None, workflow_state="stopped_at_boundary",
+                    )
                     return EXIT_STOPPED
                 unit = self._next_unit(queue, state, processed)
                 if unit is None:
-                    all_green = all(
-                        record.get("status") == "green"
-                        for record in state["units"].values()
-                    )
-                    self._write_progress(state, "completed" if all_green else "running")
+                    work_left = self._work_remains(state)
+                    self._write_progress(state, "running" if work_left else "completed")
                     self.events.emit(
                         "driver_stopped",
-                        reason="no_work_left" if all_green else "pass_complete",
+                        reason="pass_complete" if work_left else "no_work_left",
                     )
-                    return EXIT_NO_WORK if all_green else EXIT_PROGRESSED
+                    self._checkpoint(
+                        state, None,
+                        workflow_state="running" if work_left else "complete",
+                    )
+                    return EXIT_PROGRESSED if work_left else EXIT_NO_WORK
                 self.events.emit("selection", action="wasm_unit", unit=unit["name"])
                 self._write_progress(state, "porting", unit=unit["name"])
-                self._process_unit(unit, state)
+                try:
+                    outcome = self._process_unit(unit, state)
+                except Exception as error:  # noqa: BLE001
+                    # An unexpected fault (a malformed queue entry, a copy
+                    # failure, a git timeout) must still produce a transition
+                    # record. Letting it escape leaves the unit stuck as
+                    # `porting` with nothing on the progress branch until some
+                    # later run reconciles it.
+                    outcome = self._fail(
+                        state, self._unit_state(state, unit["name"]), unit["name"],
+                        f"unexpected fault: {error}", stage="port",
+                    )
+                if outcome == "provider_paused":
+                    # The provider is out. Stop the pass rather than marching
+                    # the rest of the queue into the same wall, and tell the
+                    # machine layer in the vocabulary it already understands.
+                    self._write_progress(state, "paused_provider_unavailable")
+                    self.events.emit(
+                        "driver_stopped", reason="provider_unavailable",
+                        detail=(self._provider_paused_detail or "")[:300],
+                    )
+                    return EXIT_PROVIDER_PAUSED
                 processed.add(unit["name"])
                 steps_done += 1
                 self._write_progress(state, "running")
                 if not self.until_blocked and steps_done >= self.units_budget:
                     remaining = self._next_unit(queue, state, processed)
-                    all_green = all(
-                        record.get("status") == "green"
-                        for record in state["units"].values()
-                    )
-                    done = all_green and remaining is None
+                    done = not self._work_remains(state) and remaining is None
                     if done:
                         self._write_progress(state, "completed")
+                        self._checkpoint(state, None, workflow_state="complete")
                     self.events.emit("driver_stopped", reason="units_budget_reached")
                     return EXIT_NO_WORK if done else EXIT_PROGRESSED
         finally:

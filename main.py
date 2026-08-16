@@ -1312,6 +1312,10 @@ def main():
         from src.port_cli import main as port_cli_main
 
         return port_cli_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "port-contract":
+        from src.port_contract import main as port_contract_main
+
+        return port_contract_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "finish-port":
         from src.port_scheduler import main as port_scheduler_main
 
