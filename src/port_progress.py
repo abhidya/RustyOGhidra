@@ -42,6 +42,12 @@ from typing import Any, Callable
 from src.port_chunk_workflow import atomic_write_json, utc_now
 from src.port_driver import DriverLock
 
+# Windows: this process may run under pythonw.exe (no console), and every
+# console child then allocates a NEW console window that flashes on the owner's
+# desktop. All supervision output belongs in the widget and the dashboard, not
+# in transient terminals.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 PROGRESS_BRANCH = "port-progress"
 PROGRESS_DIR = "workflow-progress"
 PROGRESS_SCHEMA = 1
@@ -272,7 +278,7 @@ class ProgressJournal:
                 capture_output=True,
                 text=True,
                 timeout=GIT_TIMEOUT_SECONDS,
-            )
+             creationflags=NO_WINDOW)
         except (OSError, subprocess.SubprocessError) as error:
             # A stalled push raises TimeoutExpired. Every caller here treats a
             # nonzero return as a recorded failure; raising instead would take
@@ -309,7 +315,7 @@ class ProgressJournal:
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
-        )
+         creationflags=NO_WINDOW)
         if blob.returncode != 0:
             return False
         sha = blob.stdout.strip()
@@ -327,7 +333,7 @@ class ProgressJournal:
                 capture_output=True,
                 text=True,
                 timeout=GIT_TIMEOUT_SECONDS,
-            )
+             creationflags=NO_WINDOW)
 
         try:
             added = plumbing(

@@ -34,6 +34,12 @@ from src.port_chunk_workflow import (
 )
 from src.port_run_controller import _pid_alive, find_gotyaforce_root
 
+# Windows: this process may run under pythonw.exe (no console), and every
+# console child then allocates a NEW console window that flashes on the owner's
+# desktop. All supervision output belongs in the widget and the dashboard, not
+# in transient terminals.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 LEDGER_SCHEMA = 1
 EVENTS_ROTATE_BYTES = 32 * 1024 * 1024
@@ -771,7 +777,7 @@ class PortDriver:
                 capture_output=True,
                 text=True,
                 timeout=300,
-            )
+             creationflags=NO_WINDOW)
         try:
             pushed = git("push")
             if pushed.returncode != 0:

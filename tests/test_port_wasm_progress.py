@@ -400,3 +400,27 @@ def test_the_build_does_not_depend_on_the_launcher_s_path(monkeypatch):
 
     # And no cygpath is needed to build a POSIX path any more.
     assert to_posix_path(Path(r"D:\GotYaForce\x")) == "/d/GotYaForce/x"
+
+
+def test_no_port_stack_subprocess_leaves_a_console_window():
+    """The driver is launched by a windowless supervisor, so every console child
+    it spawns -- bash per build iteration, node per oracle, git per commit and
+    per progress checkpoint -- allocates a NEW console window that flashes on
+    the owner's desktop."""
+    import re
+    from pathlib import Path as _Path
+
+    import src.port_wasm_units as module
+
+    source_dir = _Path(module.__file__).resolve().parent
+    offenders: list[str] = []
+    for name in ("port_wasm_units.py", "port_progress.py", "port_driver.py"):
+        text = (source_dir / name).read_text(encoding="utf-8")
+        for match in re.finditer(r"subprocess\.(run|Popen)\(", text):
+            depth, index = 1, match.end()
+            while index < len(text) and depth:
+                depth += (text[index] == "(") - (text[index] == ")")
+                index += 1
+            if "creationflags" not in text[match.end():index]:
+                offenders.append(f"{name}:{text[: match.start()].count(chr(10)) + 1}")
+    assert not offenders, f"subprocess calls without creationflags: {offenders}"

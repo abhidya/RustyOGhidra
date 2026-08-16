@@ -57,6 +57,12 @@ from src.port_progress import (
 )
 from src.port_run_controller import find_gotyaforce_root
 
+# Windows: this process may run under pythonw.exe (no console), and every
+# console child then allocates a NEW console window that flashes on the owner's
+# desktop. All supervision output belongs in the widget and the dashboard, not
+# in transient terminals.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 QUEUE_SCHEMA = 1
 STATE_SCHEMA = 1
@@ -518,7 +524,7 @@ class WasmUnitDriver:
             text=True,
             timeout=BUILD_TIMEOUT_SECONDS,
             env=build_environment(),
-        )
+         creationflags=NO_WINDOW)
         if completed.returncode != 0:
             return False, (completed.stderr + completed.stdout)[-6000:]
         bad = scan_disallowed_imports(workdir / "unit.wasm")
@@ -555,7 +561,7 @@ class WasmUnitDriver:
             capture_output=True,
             text=True,
             timeout=ORACLE_TIMEOUT_SECONDS,
-        )
+         creationflags=NO_WINDOW)
         log = completed.stdout + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else "")
         passed = completed.returncode == 0
         for pattern in oracle.get("success_patterns") or []:
@@ -575,7 +581,7 @@ class WasmUnitDriver:
             capture_output=True,
             text=True,
             timeout=300,
-        )
+         creationflags=NO_WINDOW)
 
     def _commit_unit(
         self, name: str, summary: str, *, staging: bool = False
