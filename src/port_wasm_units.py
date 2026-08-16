@@ -879,13 +879,14 @@ class WasmUnitDriver:
                 continue
             record["status"] = "deferred"
             record["error"] = "interrupted before a verdict (driver killed or crashed)"
-            # Refund the attempt. `_next_unit` orders least-attempted-first, so
-            # charging an interrupted unit would push it behind the entire
-            # queue -- and because the supervisor kills the driver on every
-            # player join and manual pause, that is a starvation machine: each
-            # interruption promotes a fresh unit and demotes the one in flight,
-            # so nothing ever finishes.
+            # Refund the ATTEMPT (the unit earned no verdict, and charging it
+            # would push it behind the entire queue every time the supervisor
+            # kills the driver for a player join or a manual pause -- a
+            # starvation machine), but COUNT the interruption. Ordering uses
+            # attempts + interruptions, so a unit that keeps taking the driver
+            # down with it still sinks instead of being retried forever.
             record["attempts"] = max(0, record.get("attempts", 1) - 1)
+            record["interruptions"] = int(record.get("interruptions", 0)) + 1
             self._save_state(state)
             self._checkpoint(
                 state,
@@ -928,7 +929,11 @@ class WasmUnitDriver:
             record = self._unit_state(state, name)
             if record.get("status") in self.SETTLED_STATUSES or name in processed:
                 continue
-            candidates.append((record.get("attempts", 0), index, unit))
+            # attempts + interruptions: a verdict and a crash both cost the
+            # unit its place in line, so neither a failing unit nor a
+            # driver-killing one can monopolise the selector.
+            cost = int(record.get("attempts", 0)) + int(record.get("interruptions", 0))
+            candidates.append((cost, index, unit))
         if not candidates:
             return None
         candidates.sort(key=lambda item: (item[0], item[1]))

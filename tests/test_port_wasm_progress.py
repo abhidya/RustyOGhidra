@@ -345,3 +345,31 @@ def test_compile_fix_disables_thinking(tmp_path, monkeypatch):
     assert captured["chat_template_kwargs"] == {"enable_thinking": False}
     assert captured["system_prompt"].endswith("/no_think")
     importlib.reload(module)
+
+
+def test_a_unit_that_keeps_killing_the_driver_still_sinks(tmp_path):
+    """The attempt refund stops a player join from starving the unit in flight.
+    It must NOT also let a unit that crashes the driver be retried forever:
+    ordering costs attempts + interruptions, so repeated interruptions sink it."""
+    journal = RecordingJournal()
+    repo = _repo(tmp_path, [_unit("unit-a"), _unit("unit-b")])
+    state_path = repo / "research/decomp/generated/finish-game-port/wasm-units-state.json"
+    state_path.write_text(
+        json.dumps({
+            "state_schema": 1,
+            "units": {
+                # unit-a has been interrupted three times without earning a verdict
+                "unit-a": {"status": "porting", "attempts": 1, "interruptions": 3},
+                "unit-b": {"status": "pending", "attempts": 1},
+            },
+        }),
+        encoding="utf-8",
+    )
+    driver = _driver(repo, journal)
+
+    driver.run()
+
+    # unit-b (cost 1) must be selected ahead of unit-a (cost 0 attempts + 4
+    # interruptions), even though unit-a's refunded attempt count is lower.
+    picked = [t.unit for t in journal.transitions if t.result != RESULT_DEFERRED]
+    assert picked and picked[0] == "unit-b"

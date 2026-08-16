@@ -207,7 +207,11 @@ class CustomAPIClient:
             **self.generation_metrics,
             "model": self.default_model,
             "run_id": self._liveness_run_id,
-            "updated_at": datetime.now().isoformat(),
+            # UTC, like request_started_at in this SAME record. A naive local
+            # stamp put two timezones in one object (…T12:38:51Z alongside
+            # …T08:38:51) and made every consumer that diffs against UTC see a
+            # constant multi-hour staleness.
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         self._liveness_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._liveness_path.with_suffix(
