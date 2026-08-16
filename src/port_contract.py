@@ -198,9 +198,19 @@ def write_control(repo_root: Path, command: str, source: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     # Shared flags live on a parent parser so they are accepted on either side
     # of the subcommand -- callers script this and must not have to remember.
+    # default=SUPPRESS is load-bearing: with `parents=[common]` on BOTH the top
+    # parser and each subparser, the subparser's defaults overwrite whatever the
+    # top parser already parsed -- so `port-contract --json status` silently
+    # printed key-value text while claiming to be machine-readable.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--repo-root", help="GotYaForce checkout (default: auto-detect)")
-    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument(
+        "--repo-root", default=argparse.SUPPRESS,
+        help="GotYaForce checkout (default: auto-detect)",
+    )
+    common.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS,
+        help="machine-readable output",
+    )
     parser = argparse.ArgumentParser(
         prog="port-contract", description=__doc__, parents=[common]
     )
@@ -225,20 +235,23 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint.add_argument("--manual-paused", action="store_true")
     checkpoint.add_argument("--driver-running", action="store_true")
     arguments = parser.parse_args(argv)
+    # SUPPRESS means the attributes only exist when actually passed.
+    as_json = getattr(arguments, "json", False)
+    repo_root_argument = getattr(arguments, "repo_root", None)
 
     repo_root = (
-        Path(arguments.repo_root).resolve() if arguments.repo_root else find_gotyaforce_root()
+        Path(repo_root_argument).resolve() if repo_root_argument else find_gotyaforce_root()
     )
 
     if arguments.action == "config":
         model = resolve_port_model_config()
         payload = model.to_public_dict()
-        print(json.dumps(payload, indent=2) if arguments.json else _plain(payload))
+        print(json.dumps(payload, indent=2) if as_json else _plain(payload))
         return EXIT_OK
 
     if arguments.action == "status":
         payload = build_status(repo_root)
-        print(json.dumps(payload, indent=2) if arguments.json else _plain(payload))
+        print(json.dumps(payload, indent=2) if as_json else _plain(payload))
         return EXIT_UNUSABLE if payload["work"].get("unusable") else EXIT_OK
 
     if arguments.action in ("stop", "run"):

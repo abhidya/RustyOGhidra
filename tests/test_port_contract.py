@@ -160,3 +160,22 @@ def test_queue_probe_makes_no_network_call(tmp_path, monkeypatch):
     _queue(tmp_path, ["a"])
 
     assert queue_status(tmp_path, "wasm_units")["eligible"] is True
+
+
+def test_json_is_honoured_on_either_side_of_the_subcommand(tmp_path, capsys):
+    """`parents=[common]` on both parsers made the subparser's defaults
+    overwrite the top parser's, so `--json status` silently printed key-value
+    text while the help promised machine-readable output."""
+    _queue(tmp_path, ["a"])
+
+    main(["--json", "status", "--repo-root", str(tmp_path)])
+    assert json.loads(capsys.readouterr().out)["work"]["eligible"] is True
+
+    main(["status", "--json", "--repo-root", str(tmp_path)])
+    assert json.loads(capsys.readouterr().out)["work"]["eligible"] is True
+
+
+def test_repo_root_is_honoured_on_either_side_of_the_subcommand(tmp_path, capsys):
+    _queue(tmp_path, ["a"])
+    main(["--repo-root", str(tmp_path), "status", "--json"])
+    assert json.loads(capsys.readouterr().out)["repo_root"] == str(tmp_path)
