@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -167,6 +168,79 @@ def scan_disallowed_imports(wasm_path: Path) -> list[str]:
             and name not in BENIGN_IMPORTS
         }
     )
+
+
+# Git Bash install roots, most specific first. The wasm build needs a POSIX
+# shell that carries the Git toolchain, and PATH alone is not a safe way to find
+# it (see resolve_bash).
+GIT_BASH_CANDIDATES = [
+    Path(r"C:\Program Files\Git\bin\bash.exe"),
+    Path(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+]
+
+
+def to_posix_path(path: Path) -> str:
+    r"""``D:\GotYaForce\x`` -> ``/d/GotYaForce/x``, without shelling out.
+
+    This is what ``cygpath -u`` does, and doing it in Python removes the runtime
+    dependency on cygpath entirely -- which matters because cygpath lives in
+    Git's /usr/bin and is NOT on the PATH a service-style scheduled task
+    inherits. See resolve_bash for the incident.
+    """
+    text = str(Path(path).resolve())
+    drive, separator, rest = text.partition(":")
+    if separator and len(drive) == 1 and rest:
+        return "/" + drive.lower() + rest.replace("\\", "/")
+    return text.replace("\\", "/")
+
+
+def resolve_bash() -> str:
+    """A bash that carries the Git toolchain, not merely something named bash.
+
+    2026-08-16: after the supervisor's scheduled task moved to an S4U principal
+    (needed for the boot trigger), the driver stopped inheriting the interactive
+    logon PATH. Every build then failed with
+
+        /bin/bash: line 1: cygpath: command not found
+        /bin/bash: line 1: emcc: command not found
+
+    recorded as ``gate_failed at wasm-link`` -- a toolchain fault charged to the
+    unit. Resolve the known Git Bash explicitly and only fall back to PATH.
+    """
+    for candidate in GIT_BASH_CANDIDATES:
+        if candidate.is_file():
+            return str(candidate)
+    found = shutil.which("bash")
+    if found:
+        return found
+    raise FileNotFoundError(
+        "no bash found; the wasm build needs Git Bash (checked: "
+        + ", ".join(str(c) for c in GIT_BASH_CANDIDATES) + ")"
+    )
+
+
+def build_environment() -> dict:
+    """PATH the emsdk toolchain actually needs, independent of the parent's.
+
+    ``emsdk_env.sh`` execs ``python`` (emsdk line 39). A scheduled task running
+    under an S4U principal inherits a bare system PATH with no python and no
+    Git tools, so sourcing emsdk silently failed and emcc was never defined --
+    surfacing as ``gate_failed at wasm-link`` against an innocent unit.
+
+    Prepend the directory of the interpreter that is running us (guaranteed to
+    contain python.exe) plus Git's POSIX tools, so the build does not depend on
+    how the process was launched.
+    """
+    environment = dict(os.environ)
+    extra = [str(Path(sys.executable).parent)]
+    for candidate in GIT_BASH_CANDIDATES:
+        usr_bin = candidate.parent.parent / "usr" / "bin"
+        if usr_bin.is_dir():
+            extra.append(str(usr_bin))
+        if candidate.parent.is_dir():
+            extra.append(str(candidate.parent))
+    environment["PATH"] = os.pathsep.join(extra + [environment.get("PATH", "")])
+    return environment
 
 
 class WasmUnitDriver:
@@ -417,12 +491,19 @@ class WasmUnitDriver:
         exports: list[str],
         allowed_extra: list[str] | None = None,
     ) -> tuple[bool, str]:
-        bash = shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
+        bash = resolve_bash()
         emsdk = self.repo_root / "research/tools/emsdk"
         exports_flag = ",".join("_" + name for name in exports)
+        # Paths converted in Python (no cygpath dependency), and the emsdk
+        # source is NOT silenced: a toolchain that failed to load must name
+        # itself rather than surface as a bare "emcc: command not found"
+        # charged to the unit as a wasm-link gate failure.
         script = (
-            f"source \"$(cygpath -u '{emsdk}')/emsdk_env.sh\" >/dev/null 2>&1; "
-            f"cd \"$(cygpath -u '{workdir}')\" && "
+            f"source \"{to_posix_path(emsdk)}/emsdk_env.sh\" >/dev/null || "
+            "{ echo 'emsdk_env.sh failed to load' >&2; exit 127; }; "
+            "command -v emcc >/dev/null || "
+            "{ echo 'emcc not on PATH after sourcing emsdk_env.sh' >&2; exit 127; }; "
+            f"cd \"{to_posix_path(workdir)}\" && "
             "emcc unit.c -O1 -fno-strict-aliasing --no-entry "
             "-Wno-implicit-function-declaration -Wno-int-conversion "
             "-Wno-deprecated-non-prototype "
@@ -436,6 +517,7 @@ class WasmUnitDriver:
             capture_output=True,
             text=True,
             timeout=BUILD_TIMEOUT_SECONDS,
+            env=build_environment(),
         )
         if completed.returncode != 0:
             return False, (completed.stderr + completed.stdout)[-6000:]

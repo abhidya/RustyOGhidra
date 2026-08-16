@@ -373,3 +373,30 @@ def test_a_unit_that_keeps_killing_the_driver_still_sinks(tmp_path):
     # interruptions), even though unit-a's refunded attempt count is lower.
     picked = [t.unit for t in journal.transitions if t.result != RESULT_DEFERRED]
     assert picked and picked[0] == "unit-b"
+
+
+def test_the_build_does_not_depend_on_the_launcher_s_path(monkeypatch):
+    """S4U scheduled tasks inherit a bare system PATH: no python, no Git tools.
+    emsdk_env.sh execs `python`, so sourcing it silently failed and emcc was
+    never defined -- surfacing as `gate_failed at wasm-link` against an innocent
+    unit. The build must carry its own PATH."""
+    import os
+    import sys
+    from pathlib import Path
+
+    from src.port_wasm_units import build_environment, resolve_bash, to_posix_path
+
+    monkeypatch.setenv("PATH", r"C:\Windows\system32")
+    environment = build_environment()
+    entries = environment["PATH"].split(os.pathsep)
+
+    # The interpreter's own directory is on PATH, so emsdk can exec python.
+    assert str(Path(sys.executable).parent) in entries
+    # ...and it does not simply discard what the parent had.
+    assert r"C:\Windows\system32" in environment["PATH"]
+
+    # Git Bash is resolved explicitly rather than through PATH.
+    assert resolve_bash().lower().endswith("bash.exe")
+
+    # And no cygpath is needed to build a POSIX path any more.
+    assert to_posix_path(Path(r"D:\GotYaForce\x")) == "/d/GotYaForce/x"
