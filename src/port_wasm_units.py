@@ -581,6 +581,16 @@ class WasmUnitDriver:
                 # and "Custom API returned no assistant content" -- provider
                 # faults, recorded as per-unit verdicts, with the rig unable to
                 # see an outage at all because wasm mode never raised one.
+                if self._is_context_budget_fault(error):
+                    # Not a provider outage and not a bad unit: this unit's
+                    # prompt simply does not fit the configured serving context.
+                    # Naming it as its own class makes the repeated-failure
+                    # section of the README say exactly which knob to turn,
+                    # instead of burying 1,500 units under "compile-fix LLM".
+                    return self._fail(
+                        state, record, name, f"context budget: {error}",
+                        stage="context-budget", result=RESULT_GATE_FAILED,
+                    )
                 if self._is_provider_fault(error):
                     return self._provider_pause(state, record, name, str(error))
                 return self._fail(
@@ -721,6 +731,17 @@ class WasmUnitDriver:
         return "green"
 
     @staticmethod
+    def _is_context_budget_fault(error: Exception) -> bool:
+        """The prompt cannot fit the CONFIGURED context, so no retry can help
+        until the configuration changes. Distinct from a provider outage."""
+        message = str(error).lower()
+        return (
+            "a reload cannot help" in message
+            or "context_length_exceeded" in message
+            or ("exceeds the" in message and "context window" in message)
+        )
+
+    @staticmethod
     def _is_provider_fault(error: Exception) -> bool:
         """Is this the serving host failing, rather than the unit being bad?
 
@@ -734,8 +755,6 @@ class WasmUnitDriver:
         return (
             "returned no assistant content" in message
             or "serving context still" in message
-            or "context_length_exceeded" in message
-            or "exceeds the" in message and "context window" in message
         )
 
     def _provider_pause(
