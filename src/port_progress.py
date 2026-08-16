@@ -470,19 +470,29 @@ class ProgressJournal:
         except OSError:
             lines = []
         newest = None
+        # Identity of what the branch already holds. Timestamp ordering alone is
+        # not enough: two writers (the driver and the rig's `port-contract
+        # checkpoint`) share the local mirror, so an event already on the branch
+        # but not the newest line would be replayed again on every checkpoint.
+        present: set[tuple[Any, Any, Any]] = set()
         for line in reversed(lines):
             try:
-                newest = _parse_iso(json.loads(line).get("timestamp"))
+                parsed = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if newest is not None:
-                break
+            present.add((parsed.get("timestamp"), parsed.get("unit"), parsed.get("result")))
+            if newest is None:
+                newest = _parse_iso(parsed.get("timestamp"))
         for missed in self._local_events():
             stamp = _parse_iso(missed.get("timestamp"))
-            if stamp is None or (newest is not None and stamp <= newest):
+            if stamp is None or (newest is not None and stamp < newest):
                 continue
-            if missed.get("timestamp") == record.get("timestamp"):
+            key = (missed.get("timestamp"), missed.get("unit"), missed.get("result"))
+            if key in present:
+                continue
+            if key == (record.get("timestamp"), record.get("unit"), record.get("result")):
                 continue  # the record being written now
+            present.add(key)
             lines.append(json.dumps(missed, ensure_ascii=False, default=str))
         lines.append(json.dumps(record, ensure_ascii=False, default=str))
         lines = lines[-MAX_EVENT_LINES:]

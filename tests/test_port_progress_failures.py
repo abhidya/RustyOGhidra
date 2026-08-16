@@ -258,3 +258,24 @@ def test_an_unreadable_state_file_is_preserved_not_destroyed(tmp_path):
     preserved = list(state_path.parent.glob("wasm-units-state.json.unreadable-*"))
     assert preserved, "the previous state file must survive as a backup"
     assert "green" in preserved[0].read_text(encoding="utf-8")
+
+
+def test_replay_does_not_duplicate_events_already_on_the_branch(journal):
+    """Two writers share the local mirror (the driver and the rig's
+    `port-contract checkpoint`), so replaying by timestamp alone re-appended
+    events that were already on the branch but not the newest line."""
+    from src.port_progress import MachineState
+
+    journal.checkpoint(transition=a_transition(), units=UNITS)
+    journal.checkpoint(transition=None, units=UNITS,
+                       machine=MachineState(workflow_state="running"))
+    journal.checkpoint(transition=a_transition(), units=UNITS)
+
+    lines = (journal.progress_root / "events.jsonl").read_text(
+        encoding="utf-8"
+    ).strip().splitlines()
+    keys = [
+        (json.loads(line).get("timestamp"), json.loads(line).get("result"))
+        for line in lines
+    ]
+    assert len(keys) == len(set(keys)), f"duplicate journal events: {keys}"
