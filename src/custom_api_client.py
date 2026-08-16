@@ -58,6 +58,35 @@ def is_retryable_exception(e):
     return isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
 
 
+def describe_empty_response(data: Any, reasoning_text: str = "") -> str:
+    """Explain WHY a response carried no assistant content.
+
+    The bare symptom ("returned no assistant content") cost two separate
+    misdiagnoses -- a reasoning spiral, then a context-budget theory -- because
+    it described what happened and nothing about why. finish_reason separates
+    the cases that need different fixes:
+
+      "length"    the budget was consumed without emitting content: a reasoning
+                  spiral, or a repetition loop. Lower/raise max_tokens, or turn
+                  thinking off.
+      "stop"      the model genuinely chose to say nothing. A prompt problem.
+      None / []   malformed or short-circuited response. A transport problem.
+    """
+    choices = data.get("choices") if isinstance(data, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices else {}
+    finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+    usage = data.get("usage") if isinstance(data, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    return (
+        "Custom API returned no assistant content or tool-call arguments "
+        f"(finish_reason={finish_reason!r}, "
+        f"choices={len(choices) if isinstance(choices, list) else 'absent'}, "
+        f"reasoning_chars={len(reasoning_text or '')}, "
+        f"prompt_tokens={usage.get('prompt_tokens')}, "
+        f"completion_tokens={usage.get('completion_tokens')})"
+    )
+
+
 class CustomAPIClient:
     """Client for interacting with OpenAI-compatible Custom APIs."""
 
@@ -1199,9 +1228,7 @@ class CustomAPIClient:
                 }
 
             if not response_text.strip():
-                raise APIResponseError(
-                    "Custom API returned no assistant content or tool-call arguments"
-                )
+                raise APIResponseError(describe_empty_response(data, reasoning_text))
 
             completed_clock = time.perf_counter()
             duration_seconds = max(
