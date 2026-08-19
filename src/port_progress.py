@@ -56,7 +56,6 @@ PROGRESS_SCHEMA = 1
 MAX_EVENT_LINES = 2000
 README_TRANSITIONS = 50
 GIT_TIMEOUT_SECONDS = 300
-GIT_TRAILER = "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 # Unit result classes. These are the states that cause the selector to move on.
 RESULT_GREEN = "green"
@@ -347,7 +346,7 @@ class ProgressJournal:
                 return False
             commit = plumbing(
                 "commit-tree", tree.stdout.strip(), "-m",
-                f"progress: initialise {self.branch} journal\n\n{GIT_TRAILER}",
+                f"progress: initialise {self.branch} journal",
             )
             if commit.returncode != 0:
                 return False
@@ -891,7 +890,7 @@ class ProgressJournal:
         added = self._git_wt("add", "--", PROGRESS_DIR)
         if added.returncode != 0:
             return {"committed": False, "pushed": False, "detail": (added.stderr or "")[-300:]}
-        committed = self._git_wt("commit", "-m", f"{subject}\n\n{GIT_TRAILER}")
+        committed = self._git_wt("commit", "-m", subject)
         if committed.returncode != 0:
             combined = (committed.stdout + committed.stderr).lower()
             if "nothing to commit" in combined or "no changes added" in combined:

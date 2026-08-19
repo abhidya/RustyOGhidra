@@ -139,7 +139,9 @@ def test_green_unit_commits_artifacts_and_completes(tmp_path, monkeypatch):
     assert provenance["extractions"][0]["sha256"]
     commit_message = next(args for args in git_calls if args[0] == "commit")[2]
     assert commit_message.startswith("port: unit-a wasm unit green")
-    assert "Co-Authored-By: Claude Fable 5" in commit_message
+    assert "Co-Authored-By" not in commit_message
+    assert "Claude" not in commit_message
+    assert "anthropic" not in commit_message.lower()
     # unit.c embeds the verbatim body untouched
     unit_c = (artifact_dir / "unit.c").read_text()
     assert "return a + 1;" in unit_c

@@ -110,7 +110,6 @@ DISABLE_THINKING = os.getenv("OGHIDRA_PORT_DISABLE_THINKING", "1").lower() not i
 )
 
 CODE_BLOCK = re.compile(r"```(?:c|cpp|h)?\s*\n(.*?)```", re.S)
-GIT_TRAILER = "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 
 def resolve_node_exe() -> str:
@@ -597,9 +596,9 @@ class WasmUnitDriver:
         if added.returncode != 0:
             return None, False, (added.stdout + added.stderr)[-400:]
         message = (
-            f"port-staging: {name} wasm unit LINKED (unoracled, not for integration)\n\n{GIT_TRAILER}"
+            f"port-staging: {name} wasm unit LINKED (unoracled, not for integration)"
             if staging
-            else f"port: {name} wasm unit green (oracle {summary})\n\n{GIT_TRAILER}"
+            else f"port: {name} wasm unit green (oracle {summary})"
         )
         committed = self._git_runner("commit", "-m", message, "--", rel)
         if committed.returncode != 0:
