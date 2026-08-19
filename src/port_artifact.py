@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 import tempfile
 from pathlib import Path
@@ -825,7 +826,17 @@ def atomic_write_artifact(path: os.PathLike[str] | str, artifact: PortArtifact) 
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        # Windows denies replacement while another process holds the destination
+        # open (antivirus, indexer). Wait out the transient sharing violation
+        # rather than discarding output that is already written.
+        for attempt in range(40):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 39:
+                    raise
+                time.sleep(0.05)
     except Exception:
         try:
             os.unlink(temporary)

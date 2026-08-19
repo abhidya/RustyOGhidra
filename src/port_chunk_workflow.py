@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -77,7 +78,18 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    # Windows denies replacement while another process has the destination
+    # briefly open (GUI polling, antivirus, indexer). Preserve atomic writes,
+    # but wait out the transient sharing violation instead of failing the unit
+    # (auto-c0001-011 died on exactly this: WinError 5 on the state rename).
+    for attempt in range(40):
+        try:
+            os.replace(temporary, path)
+            break
+        except PermissionError:
+            if os.name != "nt" or attempt == 39:
+                raise
+            time.sleep(0.05)
 
 
 def normalize_address(value: str) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,7 +134,17 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        # Windows denies replacement while another process holds the destination
+        # open (antivirus, indexer). Wait out the transient sharing violation
+        # rather than discarding output that is already written.
+        for attempt in range(40):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 39:
+                    raise
+                time.sleep(0.05)
     except Exception:
         try:
             os.unlink(temporary)
