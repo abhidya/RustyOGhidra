@@ -245,6 +245,11 @@ def build_environment() -> dict:
         if candidate.parent.is_dir():
             extra.append(str(candidate.parent))
     environment["PATH"] = os.pathsep.join(extra + [environment.get("PATH", "")])
+    # emsdk_env.sh prints a multi-line PATH banner on every invocation. It is
+    # noise for a non-interactive build, and it is worse than noise on failure:
+    # it filled all 600 recorded characters of auto-c0000-000's link error and
+    # pushed the actual linker diagnosis out of the record entirely.
+    environment["EMSDK_QUIET"] = "1"
     return environment
 
 
@@ -723,7 +728,10 @@ class WasmUnitDriver:
             )
         if not linked:
             return self._fail(
-                state, record, name, f"not linked: {build_error[:600]}",
+                # Tail, not head: linkers print the diagnosis last, after any
+                # progress chatter, so a head slice records the least useful part.
+                state, record, name, f"not linked: ...{build_error[-600:]}"
+                if len(build_error) > 600 else f"not linked: {build_error}",
                 stage="wasm-link", result=RESULT_GATE_FAILED,
             )
 
