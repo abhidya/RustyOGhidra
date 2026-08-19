@@ -93,6 +93,27 @@ gnt4_shim.h — the .c file is verbatim decompiler output and must never be edit
 
 Fix the header so the C compiles AND keeps the original PowerPC runtime semantics
 (Ghidra decompiler idioms must behave exactly as they did on the GameCube).
+
+Ghidra's placeholder types have FIXED widths. Use exactly these -- they are not
+open to interpretation, and getting one wrong cascades through the whole file:
+
+    typedef unsigned char       undefined;
+    typedef unsigned char       undefined1;
+    typedef unsigned short      undefined2;
+    typedef unsigned int        undefined4;
+    typedef unsigned long long  undefined8;   /* an INTEGER, never double */
+    typedef unsigned char       byte;
+    typedef unsigned short      ushort;
+    typedef unsigned int        uint;
+    typedef unsigned long       ulong;
+    typedef unsigned long long  ulonglong;
+    typedef long long           longlong;
+
+Function signatures must be read off the CALL SITES in the .c file, which is
+verbatim decompiler output and authoritative. If a call passes 16 arguments,
+declare 16 parameters; if a result is assigned, the return type must not be
+void. Do not invent an arity or a return type that disagrees with the caller.
+
 Output the COMPLETE corrected gnt4_shim.h in a single ```c code block. No other text
 is used by the pipeline."""
 
