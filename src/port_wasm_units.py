@@ -224,6 +224,31 @@ def resolve_bash() -> str:
     )
 
 
+
+def summarise_build_error(output: str, budget: int = 1200) -> str:
+    """Keep the compiler's diagnosis, discard the invocation it echoes.
+
+    emcc prints the failing clang command in full on error: ~500 characters of
+    sysroot and -mllvm boilerplate that is identical for every unit and says
+    nothing about why this one failed. A blind tail slice records that instead
+    of the `error:` lines above it, which is how auto-c0000-005's record ended
+    in "...ed." with the actual cause missing.
+    """
+    text = (output or "").strip()
+    if len(text) <= budget:
+        return text
+    markers = ("error:", "warning:", "undefined symbol", "fatal:")
+    diagnostic = [
+        line for line in text.splitlines()
+        # the echoed invocation is one enormous line; a real diagnostic is not
+        if any(m in line.lower() for m in markers) and len(line) < 400
+    ]
+    if diagnostic:
+        joined = "\n".join(diagnostic)
+        return joined[-budget:] if len(joined) > budget else joined
+    return "..." + text[-budget:]
+
+
 def build_environment() -> dict:
     """PATH the emsdk toolchain actually needs, independent of the parent's.
 
@@ -728,10 +753,8 @@ class WasmUnitDriver:
             )
         if not linked:
             return self._fail(
-                # Tail, not head: linkers print the diagnosis last, after any
-                # progress chatter, so a head slice records the least useful part.
-                state, record, name, f"not linked: ...{build_error[-600:]}"
-                if len(build_error) > 600 else f"not linked: {build_error}",
+                state, record, name,
+                f"not linked: {summarise_build_error(build_error)}",
                 stage="wasm-link", result=RESULT_GATE_FAILED,
             )
 
