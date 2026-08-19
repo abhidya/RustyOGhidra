@@ -109,6 +109,18 @@ DISABLE_THINKING = os.getenv("OGHIDRA_PORT_DISABLE_THINKING", "1").lower() not i
     "0", "false", "no",
 )
 
+# Qwen3.8-27B card, instruct (non-thinking) row. Measured at 262k ctx on a real
+# compile-fix prompt: this profile returned a usable ```c block in 143s, while
+# thinking-ON (1.0/0.95/20) spent 4217s and 8192 tokens inside reasoning_content
+# and returned zero content. Overridable without a code change.
+SAMPLING = {
+    "temperature": float(os.getenv("OGHIDRA_PORT_TEMPERATURE", "0.7")),
+    "top_p": float(os.getenv("OGHIDRA_PORT_TOP_P", "0.80")),
+    "top_k": int(os.getenv("OGHIDRA_PORT_TOP_K", "20")),
+    "min_p": float(os.getenv("OGHIDRA_PORT_MIN_P", "0.0")),
+    "presence_penalty": float(os.getenv("OGHIDRA_PORT_PRESENCE_PENALTY", "1.5")),
+}
+
 CODE_BLOCK = re.compile(r"```(?:c|cpp|h)?\s*\n(.*?)```", re.S)
 
 
@@ -503,7 +515,7 @@ class WasmUnitDriver:
         reply = self._llm_client().generate(
             prompt=prompt,
             system_prompt=SYSTEM_PROMPT + (" /no_think" if DISABLE_THINKING else ""),
-            temperature=0.6,
+            **SAMPLING,
             # Belt and braces, same as the source loop: the template kwarg is
             # honoured by llama.cpp/vLLM/SGLang and ignored elsewhere, and the
             # Qwen `/no_think` soft switch covers the rest.

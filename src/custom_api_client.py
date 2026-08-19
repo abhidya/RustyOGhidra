@@ -983,6 +983,11 @@ class CustomAPIClient:
         stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
     ) -> str:
         """
         Generate a response from the Custom API.
@@ -1040,6 +1045,16 @@ class CustomAPIClient:
             "messages": conversation,
             "temperature": effective_temperature,
         }
+        # Qwen3.8 documents a full sampling profile per mode; sending temperature
+        # alone leaves top_p/top_k/min_p/presence_penalty at server defaults,
+        # which measured 0 usable replies against 1 for the card's own values.
+        for _name, _value in (
+            ("top_p", top_p), ("top_k", top_k), ("min_p", min_p),
+            ("presence_penalty", presence_penalty),
+            ("repetition_penalty", repetition_penalty),
+        ):
+            if _value is not None:
+                payload[_name] = _value
         if chat_template_kwargs is not None:
             # e.g. {"enable_thinking": False}: the server's launch default
             # enables thinking, and a reasoning burn on a structured request
