@@ -542,6 +542,12 @@ class WasmUnitDriver:
             "emcc unit.c -O1 -fno-strict-aliasing --no-entry "
             "-Wno-implicit-function-declaration -Wno-int-conversion "
             "-Wno-deprecated-non-prototype "
+            # Ghidra lowers `undefined` to `unsigned char`, so decompiled C passes
+            # `undefined **` where `char **` is declared. clang 16+ makes that an
+            # ERROR by default, which is the whole auto-c0000-* wasm-link failure
+            # family. Same class of concession as the three flags above; the oracle
+            # gate still enforces actual behaviour.
+            "-Wno-incompatible-pointer-types -Wno-pointer-sign "
             "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
             "-sALLOW_MEMORY_GROWTH=0 "
             f"-sEXPORTED_FUNCTIONS={exports_flag} "
