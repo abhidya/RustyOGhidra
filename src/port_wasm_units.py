@@ -141,6 +141,18 @@ reads a float element, so declare the symbol as `float`, NOT as `float *`.
 Declaring it a pointer makes `(&SYM)[i]` a pointer and the cast illegal
 ('pointer cannot be cast to type float').
 
+More generally: whenever the .c takes a symbol's ADDRESS -- `(&SYM)[i]`,
+`&SYM + n`, `*(short *)(&SYM + n)` -- SYM must be an LVALUE, i.e. a dereference
+of its address:
+
+    #define DAT_802c44f8 (*(unsigned char *)(unsigned int)0x802c44f8)   /* lvalue */
+    #define DAT_802c44f8 0x802c44f8                                     /* WRONG */
+
+A bare integer constant is an rvalue and its address cannot be taken ('cannot
+take the address of an rvalue'). Pick the element type from the cast at the use
+site; when the .c casts the computed address itself (e.g. `*(short *)(&SYM+n)`),
+an `unsigned char` base makes the byte arithmetic come out right.
+
 Function signatures must be read off the CALL SITES in the .c file, which is
 verbatim decompiler output and authoritative. If a call passes 16 arguments,
 declare 16 parameters; if a result is assigned, the return type must not be
