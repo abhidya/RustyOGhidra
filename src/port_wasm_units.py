@@ -285,6 +285,32 @@ def summarise_build_error(output: str, budget: int = 1200) -> str:
     return "..." + text[-budget:]
 
 
+
+VOID_DECL = re.compile(r"^\s*void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
+
+
+def void_result_contradictions(unit_source: str) -> list[str]:
+    """Functions the file declares `void` yet assigns the result of.
+
+    Ghidra sometimes emits a recursive helper as `void` while its own generated
+    body uses the return value. Since the .c is verbatim and the `void`
+    declaration lives in the same translation unit, NO header can reconcile it:
+    declaring the function non-void collides with that declaration, declaring it
+    void leaves the assignment invalid. auto-c0000-013 spent all 8 compile-fix
+    iterations (~3.6 hours of model time) alternating between those two dead
+    ends before failing.
+
+    Conservative on purpose -- the caller settles the unit permanently, so this
+    must be provable rather than heuristic. Only `x = fn(` counts; a bare call
+    or a comparison does not.
+    """
+    contradictions = []
+    for name in sorted(set(VOID_DECL.findall(unit_source))):
+        if re.search(rf"=\s*{re.escape(name)}\s*\(", unit_source):
+            contradictions.append(name)
+    return contradictions
+
+
 def build_environment() -> dict:
     """PATH the emsdk toolchain actually needs, independent of the parent's.
 
@@ -729,6 +755,20 @@ class WasmUnitDriver:
         )
         (workdir / "unit.c").write_text(unit_c, encoding="utf-8", newline="\n")
         combined_sha = hashlib.sha256(verbatim.encode("utf-8")).hexdigest()
+
+        # A .c that both declares a function `void` and assigns its result cannot
+        # be satisfied by ANY header, so spending 8 model iterations discovering
+        # that is pure waste (auto-c0000-013: ~3.6 hours to fail). Settle it here
+        # from the verbatim source alone -- no model call, no retries.
+        contradictions = void_result_contradictions(unit_c)
+        if contradictions:
+            return self._fail(
+                state, record, name,
+                "verbatim .c is self-contradictory: "
+                f"{', '.join(contradictions)} declared void but their results are "
+                "assigned; no header edit can reconcile this",
+                stage="extract", result=RESULT_STRUCTURAL_INELIGIBLE,
+            )
 
         # 2. header scaffold: reset to the seed every attempt (deterministic base)
         header_seed = self.repo_root / unit["header_seed"]

@@ -275,3 +275,51 @@ def test_compile_only_unit_commits_to_staging_unverified(tmp_path, monkeypatch):
     assert "port-units-staging" in add_call[1]
     commit_call = next(c for c in git_calls if c[0] == "commit")
     assert "port-staging:" in commit_call[2] and "unoracled" in commit_call[2]
+
+
+def test_void_result_contradiction_is_detected():
+    """A .c that declares a function void AND assigns its result is unfixable.
+
+    Verbatim decompiler output cannot be edited, and the void declaration lives
+    in the same translation unit, so no header can reconcile it. auto-c0000-013
+    burned all 8 compile-fix iterations (~3.6h) alternating between the two dead
+    ends before failing.
+    """
+    from src.port_wasm_units import void_result_contradictions
+
+    source = """
+void zz_0008f18_(undefined8 param_1, double param_2);
+void zz_0008f18_(undefined8 param_1, double param_2) { return; }
+void caller(void) {
+    undefined8 uVar6;
+    uVar6 = zz_0008f18_(uVar6, 1.0);
+}
+"""
+    assert void_result_contradictions(source) == ["zz_0008f18_"]
+
+
+def test_void_function_merely_called_is_not_a_contradiction():
+    """Settling is permanent, so a bare call must never be flagged."""
+    from src.port_wasm_units import void_result_contradictions
+
+    source = """
+void zz_cleanup_(int a);
+void caller(void) {
+    zz_cleanup_(1);
+    if (zz_cleanup_ != 0) { return; }
+}
+"""
+    assert void_result_contradictions(source) == []
+
+
+def test_non_void_function_with_assignment_is_not_a_contradiction():
+    from src.port_wasm_units import void_result_contradictions
+
+    source = """
+undefined8 zz_value_(int a);
+void caller(void) {
+    undefined8 v;
+    v = zz_value_(1);
+}
+"""
+    assert void_result_contradictions(source) == []
