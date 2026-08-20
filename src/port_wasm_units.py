@@ -577,7 +577,17 @@ class WasmUnitDriver:
         )
         matches = CODE_BLOCK.findall(reply or "")
         if not matches:
+            # Keep the shape of the reply: "no code block" with no evidence is
+            # unactionable, and the interesting cases (refusal, prose, unfenced
+            # header, truncation) are indistinguishable without it.
+            body = (reply or "").strip()
+            self._last_reply_shape = (
+                f"len={len(body)} fences={body.count('```')} "
+                f"head={body[:200]!r} tail={body[-120:]!r}"
+                if body else "empty reply"
+            )
             return None
+        self._last_reply_shape = None
         return max(matches, key=len)
 
     # ------------------------------------------------------------------- build
@@ -837,7 +847,9 @@ class WasmUnitDriver:
             self._save_state(state)
             if fixed is None:
                 return self._fail(
-                    state, record, name, "compile-fix returned no code block",
+                    state, record, name,
+                    "compile-fix returned no code block: "
+                    f"{getattr(self, '_last_reply_shape', None) or 'no reply captured'}",
                     stage="compile-fix",
                 )
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
