@@ -128,6 +128,19 @@ standard PowerPC int->double idiom. The xor and the cast belong to the CALLER;
 do NOT fold them into CONCAT44. A CONCAT that returns double makes the xor
 illegal ('invalid operands to binary expression') and the unit cannot compile.
 
+Ghidra names raw data symbols `DAT_<addr>` / `PTR_DAT_<addr>` after WHERE the
+value was found, not after any recovered type. The `PTR_` prefix is NOT a
+promise that the symbol holds a pointer -- type it from how the .c uses it.
+
+In particular `(&SYM)[i]` means SYM is the FIRST ELEMENT of a table, so SYM must
+be declared as the ELEMENT type and `&SYM` is then the table base:
+
+    (double)(float)(&PTR_DAT_802c3c58)[i * 3]
+
+reads a float element, so declare the symbol as `float`, NOT as `float *`.
+Declaring it a pointer makes `(&SYM)[i]` a pointer and the cast illegal
+('pointer cannot be cast to type float').
+
 Function signatures must be read off the CALL SITES in the .c file, which is
 verbatim decompiler output and authoritative. If a call passes 16 arguments,
 declare 16 parameters; if a result is assigned, the return type must not be
