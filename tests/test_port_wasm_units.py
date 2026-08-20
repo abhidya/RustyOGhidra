@@ -355,3 +355,259 @@ def test_multi_block_reply_is_not_treated_as_unclosed():
     reply = "```c\nint a;\n```\nand\n```c\nint b;\n```\n"
     assert reply.count("```") == 4
     assert len(CODE_BLOCK.findall(reply)) == 2
+
+
+# ---------------------------------------------------------------- T1: depth cap
+
+
+def test_depth_cap_default_is_four(monkeypatch):
+    """Design 2.1: cap 4 in T1 (n=7 repair-greens, 1 needed 5 iterations)."""
+    from src.port_wasm_units import MAX_COMPILE_ITERS
+
+    assert MAX_COMPILE_ITERS == 4
+
+
+# ------------------------------------------------- T1: stage-aware stuck-abort
+
+
+def test_stage_transition_never_aborts():
+    """Design 2.2: crossing a stage boundary is progress by definition, even
+    when the diagnostic content fingerprints identically (a #define'd symbol
+    legitimately converts link-gate lines into compile diagnostics)."""
+    from src.port_wasm_units import is_stuck
+
+    fp = "f" * 64
+    assert not is_stuck("link-gate", fp, "compile", fp, True)
+    assert not is_stuck("import-gate", fp, "link-gate", fp, True)
+
+
+def test_identical_fingerprint_same_stage_after_applied_header_aborts():
+    from src.port_wasm_units import is_stuck
+
+    fp = "f" * 64
+    assert is_stuck("compile", fp, "compile", fp, True)
+    # ...but not when no new header was applied (the 2.5 exemption)
+    assert not is_stuck("compile", fp, "compile", fp, False)
+    # ...and never on the very first build (nothing to compare against)
+    assert not is_stuck(None, None, "compile", fp, False)
+
+
+def test_classify_build_stage():
+    from src.port_wasm_units import classify_build_stage
+
+    assert classify_build_stage(
+        "link gate: these symbols are UNDEFINED and became wasm imports, but "
+        "they are not gnt4_* SDK functions, so they must be DEFINED in "
+        "gnt4_shim.h with correct PowerPC semantics: CONCAT44"
+    ) == "import-gate"
+    assert classify_build_stage(
+        "wasm-ld: error: unit.o: undefined symbol: DoFoo"
+    ) == "link-gate"
+    assert classify_build_stage(
+        "unit.c:5:1: error: call to undeclared function 'DoFoo'"
+    ) == "compile"
+
+
+def test_header_line_number_churn_fingerprints_equal():
+    """The model rewrites the whole header each round, so gnt4_shim.h line
+    numbers churn; a fingerprint that keeps them would mask true oscillation."""
+    from src.port_wasm_units import diagnostic_fingerprint
+
+    a = (
+        "./gnt4_shim.h:12:9: error: unknown type name 'undefined8'\n"
+        "unit.c:40:5: error: invalid operands to binary expression\n"
+    )
+    b = (
+        "./gnt4_shim.h:57:1: error: unknown type name 'undefined8'\n"
+        "unit.c:40:5: error: invalid operands to binary expression\n"
+    )
+    assert diagnostic_fingerprint(a) == diagnostic_fingerprint(b)
+
+
+def test_unit_c_line_change_fingerprints_differ():
+    """unit.c is verbatim and immovable, so a moved diagnostic is real change."""
+    from src.port_wasm_units import diagnostic_fingerprint
+
+    a = "unit.c:40:5: error: invalid operands to binary expression"
+    b = "unit.c:41:5: error: invalid operands to binary expression"
+    assert diagnostic_fingerprint(a) != diagnostic_fingerprint(b)
+
+
+def test_stuck_abort_after_applied_header_with_same_diagnostics(tmp_path, monkeypatch):
+    """Same stage + identical fingerprint right after an applied header: the
+    attempt aborts retryable instead of burning the remaining iterations."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    builds = []
+
+    def same_error_build(workdir, exports, extra=None):
+        builds.append(1)
+        return False, "unit.c:9:3: error: use of undeclared identifier 'x'"
+
+    class FixLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            return "```c\n/* a new header that changes nothing */\n```"
+
+    driver = _driver(repo, build_runner=same_error_build, llm=FixLLM())
+    assert driver.run() == EXIT_PROGRESSED
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    record = state["units"]["unit-a"]
+    assert record["status"] == "red_retryable"
+    assert record["last_stage"] == "compile-fix"
+    assert "stuck: identical diagnostics after applied fix" in record["error"]
+    assert len(builds) == 2  # aborted right after the first post-fix rebuild
+
+
+def test_link_gate_to_compile_transition_does_not_abort(tmp_path, monkeypatch):
+    """Two consecutive failing rounds in DIFFERENT stages must keep iterating."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    responses = [
+        (False, "wasm-ld: error: unit.o: undefined symbol: DoFoo"),
+        (False, "unit.c:5:1: error: call to undeclared function 'DoFoo'"),
+    ]
+
+    def staged_build(workdir, exports, extra=None):
+        if responses:
+            return responses.pop(0)
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    class FixLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            return "```c\n/* another try */\n```"
+
+    driver = _driver(repo, build_runner=staged_build, llm=FixLLM())
+    assert driver.run() == EXIT_NO_WORK
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    assert state["units"]["unit-a"]["status"] == "green"
+
+
+# ------------------------------------------- T1: malformed replies, re-ask, 2.5
+
+
+def test_reask_recovers_a_malformed_reply(tmp_path, monkeypatch):
+    """One fence-less reply triggers a single format-reminder re-ask, and a
+    usable re-ask reply keeps the attempt alive."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    prompts = []
+    replies = ["no fence here, sorry", "```c\n/* fixed */\n```"]
+
+    def fake_build(workdir, exports, extra=None):
+        if not (workdir / "unit.wasm").exists() and replies:
+            return False, "error: bad"
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    class OnceLLM:
+        default_model = "fake"
+
+        def generate(self, prompt="", **_kwargs):
+            prompts.append(prompt)
+            return replies.pop(0)
+
+    driver = _driver(repo, build_runner=fake_build, llm=OnceLLM())
+    assert driver.run() == EXIT_NO_WORK
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    record = state["units"]["unit-a"]
+    assert record["status"] == "green"
+    assert record["model_requests"] == 2  # first ask + one re-ask
+    assert "no usable" not in prompts[0]
+    assert "Your previous reply contained no usable" in prompts[1]
+
+
+def test_no_new_header_round_skips_rebuild_and_never_fails_the_attempt(
+    tmp_path, monkeypatch
+):
+    """A round with no extractable header neither rebuilds (identical input,
+    identical output) nor compares fingerprints; the attempt only fails when
+    the last allowed iteration ends without a link."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    builds, prompts = [], []
+
+    def counting_build(workdir, exports, extra=None):
+        builds.append(1)
+        return False, "error: bad"
+
+    class ProseLLM:
+        default_model = "fake"
+
+        def generate(self, prompt="", **_kwargs):
+            prompts.append(prompt)
+            return "I cannot help with that."
+
+    driver = _driver(repo, build_runner=counting_build, llm=ProseLLM())
+    assert driver.run() == EXIT_PROGRESSED
+    # the seed header was built exactly once; every no_new_header round reused it
+    assert len(builds) == 1
+    # each of the 3 fix rounds (cap 4 => 3 fix slots) asked twice: ask + re-ask
+    assert len(prompts) == 6
+    assert "Your previous reply contained no usable" in prompts[1]
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    record = state["units"]["unit-a"]
+    assert record["status"] == "red_retryable"
+    assert record["last_stage"] == "wasm-link"  # ran out of iterations, not failed mid-round
+    assert "not linked" in record["error"]
+    assert "no code block" in record["error"]
+
+
+# --------------------------------------------------- T1: feedback construction
+
+
+def test_summarise_build_error_deduplicates_and_respects_budget():
+    from src.port_wasm_units import summarise_build_error
+
+    first = "unit.c:1:1: error: something went wrong"
+    second = "unit.c:2:2: error: a different diagnosis"
+    text = "\n".join([first] * 300 + [second])
+    out = summarise_build_error(text, budget=2000)
+    assert len(out) <= 2000
+    assert out.count(first) == 1  # exact duplicates dropped
+    assert second in out
+    assert out.index(first) < out.index(second)  # first-occurrence order kept
+
+
+def test_summarise_build_error_truncated_output_still_dedupes():
+    from src.port_wasm_units import summarise_build_error
+
+    lines = [f"unit.c:{n}:1: error: diag {n}" for n in range(200)]
+    text = "\n".join(lines + lines)  # every line duplicated
+    out = summarise_build_error(text, budget=2000)
+    assert len(out) <= 2000
+    for line in out.splitlines():
+        assert out.count(line) == 1
+
+
+# --------------------------------------------------------------- T1: D14 seed
+
+
+def test_header_seed_read_error_is_retryable_not_structural(tmp_path, monkeypatch):
+    """Design 2.10 / D14: OSError on the seed is transient I/O. Structural
+    settling is permanent, so it must be reserved for provable dead queue
+    entries (extraction-spec errors keep that verdict)."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    (repo / "research/decomp/poc/seed.h").unlink()
+    driver = _driver(repo)
+    assert driver.run() == EXIT_PROGRESSED  # unit is still workable next pass
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    record = state["units"]["unit-a"]
+    assert record["status"] == "red_retryable"
+    assert record["status"] != "structural_ineligible"
+    assert "header seed" in record["error"]

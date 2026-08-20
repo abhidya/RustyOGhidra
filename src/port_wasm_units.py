@@ -13,7 +13,8 @@ exit-code vocabulary, so the existing watchdog needs no changes.
 
 Design rules carried over from the POC (POC-RESULTS-2026-08-09.md):
   - The extracted C is VERBATIM and never edited; the LLM compile-fix loop may
-    only rewrite the scaffold header (gnt4_shim.h), max 8 iterations.
+    only rewrite the scaffold header (gnt4_shim.h); depth is capped by
+    OGHIDRA_PORT_MAX_ITERS (default 4, design doc section 2.1).
   - Never trust link success: undefined symbols silently become wasm env
     imports; only the gnt4_* SDK seam may remain imported (whitelist gate).
   - Only the oracle decides green. Failed units stay retryable forever
@@ -67,7 +68,12 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 QUEUE_SCHEMA = 1
 STATE_SCHEMA = 1
-MAX_COMPILE_ITERS = 8
+# Compile-fix depth cap (design section 2.1): across the n=7 clean repair-greens
+# the link iterations were 2,2,2,2,3,3,5 -- one needed 5, so a hard cap of 3
+# would strand that class while no recovery path exists. Cap 4 for T1; the cap
+# drops to 3 only when T2's recovery (retry lane + carry) lands and F1's
+# measurement window supports it.
+MAX_COMPILE_ITERS = int(os.getenv("OGHIDRA_PORT_MAX_ITERS", "4"))
 # emcc exports must be C identifiers; C++ signatures are not.
 EXPORT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 BUILD_TIMEOUT_SECONDS = 600
@@ -312,8 +318,22 @@ def summarise_build_error(output: str, budget: int = 1200) -> str:
     nothing about why this one failed. A blind tail slice records that instead
     of the `error:` lines above it, which is how auto-c0000-005's record ended
     in "...ed." with the actual cause missing.
+
+    Exact-duplicate lines are dropped, first occurrence wins (design section
+    2.4): with -ferror-limit=0 a bad macro can emit the same diagnostic
+    hundreds of times, spending the whole budget without adding evidence.
+    The stuck-abort fingerprint consumes the RAW build output, never this
+    summary -- truncation here must not be able to mask oscillation.
     """
     text = (output or "").strip()
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for line in text.splitlines():
+        if line in seen:
+            continue
+        seen.add(line)
+        deduped.append(line)
+    text = "\n".join(deduped)
     if len(text) <= budget:
         return text
     markers = ("error:", "warning:", "undefined symbol", "fatal:")
@@ -327,6 +347,98 @@ def summarise_build_error(output: str, budget: int = 1200) -> str:
         return joined[-budget:] if len(joined) > budget else joined
     return "..." + text[-budget:]
 
+
+# ---------------------------------------------------------------------------
+# Stage-aware stuck detection (design section 2.2). Pure functions with no
+# driver state, so the abort rule is testable without running a build.
+
+STAGE_COMPILE = "compile"
+STAGE_LINK_GATE = "link-gate"
+STAGE_IMPORT_GATE = "import-gate"
+
+# _emcc_build's import-whitelist branch is the only producer of this prefix.
+IMPORT_GATE_PREFIX = "link gate:"
+
+
+def classify_build_stage(error_text: str) -> str:
+    """Which gate produced this failed build's error text.
+
+    Progress signals are only comparable WITHIN a stage; crossing a stage
+    boundary is progress by definition -- correctly #define-ing a missing
+    symbol legitimately converts one link-gate line into N compile diagnostics
+    at the use sites (unmasking, not regression). The stuck-abort rule
+    therefore needs the stage, not just the fingerprint.
+    """
+    text = (error_text or "").lstrip()
+    if text.startswith(IMPORT_GATE_PREFIX):
+        return STAGE_IMPORT_GATE
+    lowered = text.lower()
+    if "undefined symbol" in lowered or "wasm-ld: error" in lowered:
+        return STAGE_LINK_GATE
+    return STAGE_COMPILE
+
+
+def extract_error_lines(error_text: str) -> list[str]:
+    """The `error:` diagnostic lines of a build's RAW output. Always the raw
+    text, never the summary: a truncated summary could make two different
+    error sets fingerprint identically."""
+    return [line for line in (error_text or "").splitlines() if "error:" in line]
+
+
+def count_error_lines(error_text: str) -> int:
+    """Recorded per round only to select the best round later. Section 2.2
+    explicitly DROPS the old `count increased => abort` rule: counts are not
+    monotone under clang error recovery, and a correct fix can transiently
+    increase them."""
+    return len(extract_error_lines(error_text))
+
+
+def normalise_diagnostic(line: str) -> str:
+    """gnt4_shim.h-located diagnostics lose their line numbers.
+
+    The model rewrites the whole header every round, so raw header line
+    numbers churn even when the diagnostic itself is byte-identical -- which
+    would mask true oscillation. unit.c locations keep file:line:col: the .c
+    is verbatim and immovable, so a moved unit.c diagnostic is real change.
+    """
+    head, sep, tail = line.partition("error:")
+    if sep and "gnt4_shim.h" in head:
+        return "gnt4_shim.h:*: error:" + tail.rstrip()
+    return line.strip()
+
+
+def diagnostic_fingerprint(error_text: str) -> str:
+    """sha256 over the sorted, deduplicated, normalised `error:` lines.
+
+    Gate messages (link gate / import gate) carry no `error:` lines, so they
+    fall back to the full normalised text: their content is stable symbol
+    names, not churning line numbers, and two different missing-symbol sets
+    must not fingerprint identically.
+    """
+    lines = extract_error_lines(error_text)
+    if not lines:
+        lines = [line for line in (error_text or "").splitlines() if line.strip()]
+    diagnostics = sorted({normalise_diagnostic(line) for line in lines})
+    return hashlib.sha256("\n".join(diagnostics).encode("utf-8")).hexdigest()
+
+
+def is_stuck(
+    previous_stage: str | None,
+    previous_fingerprint: str | None,
+    stage: str,
+    fingerprint: str,
+    header_applied: bool,
+) -> bool:
+    """Section 2.2 abort rule: identical diagnostics after an APPLIED fix,
+    within one stage. A stage transition NEVER aborts. A round that applied no
+    new header (section 2.5 fallback) never compares -- identical input
+    trivially yields identical output and proves nothing about the model."""
+    return (
+        header_applied
+        and previous_fingerprint is not None
+        and stage == previous_stage
+        and fingerprint == previous_fingerprint
+    )
 
 
 VOID_DECL = re.compile(r"^\s*void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
@@ -597,13 +709,31 @@ class WasmUnitDriver:
             self._llm = CustomAPIClient(get_config().custom_api)
         return self._llm
 
-    def _compile_fix(self, unit_c: str, header: str, errors: str) -> str | None:
-        """One LLM round; returns the corrected header text or None."""
+    def _compile_fix(
+        self,
+        unit_c: str,
+        header: str,
+        errors: str,
+        *,
+        format_reminder: bool = False,
+    ) -> str | None:
+        """One LLM round; returns the corrected header text or None.
+
+        format_reminder is the section-2.5 re-ask: the same prompt, plus one
+        line telling the model its previous reply carried no usable code block.
+        """
         prompt = (
             f"Verbatim decompiled C (read-only):\n```c\n{unit_c}\n```\n\n"
             f"Current gnt4_shim.h:\n```c\n{header}\n```\n\n"
-            f"Exact compiler output:\n```\n{errors}\n```\n\n"
-            "Return the complete corrected gnt4_shim.h."
+            f"Compiler output (deduplicated):\n```\n{errors}\n```\n\n"
+            + (
+                "Your previous reply contained no usable ```c code block. "
+                "Reply with ONLY the complete corrected gnt4_shim.h in a "
+                "single ```c block.\n"
+                if format_reminder
+                else ""
+            )
+            + "Return the complete corrected gnt4_shim.h."
         )
         reply = self._llm_client().generate(
             prompt=prompt,
@@ -685,6 +815,12 @@ class WasmUnitDriver:
             # family. Same class of concession as the three flags above; the oracle
             # gate still enforces actual behaviour.
             "-Wno-incompatible-pointer-types -Wno-pointer-sign "
+            # Section 2.2: clang stops after 19 errors by default, so two
+            # DIFFERENT error sets could share a truncated prefix and
+            # fingerprint identically. The stuck-abort fingerprint needs the
+            # full set; the prompt still receives the deduplicated
+            # summarise_build_error() summary, never this firehose.
+            "-ferror-limit=0 "
             "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
             "-sALLOW_MEMORY_GROWTH=0 "
             f"-sEXPORTED_FUNCTIONS={shlex.quote(exports_flag)} "
@@ -839,81 +975,156 @@ class WasmUnitDriver:
         try:
             header = header_seed.read_text(encoding="utf-8")
         except OSError as error:
+            # D14 (design section 2.10): a failed READ is transient I/O -- an
+            # AV lock or a network-share hiccup -- not proof the queue entry is
+            # bad. Settling it structural would remove the unit from the pool
+            # forever over a fault a retry can clear. Extraction-SPEC errors
+            # above stay structural: the spec itself describes no extractable
+            # code, so retrying the identical spec cannot help.
             return self._fail(
                 state, record, name, f"header seed: {error}",
-                stage="header-seed", result=RESULT_STRUCTURAL_INELIGIBLE,
+                stage="header-seed", result=RESULT_RETRYABLE,
             )
         (workdir / "gnt4_shim.h").write_text(header, encoding="utf-8", newline="\n")
 
-        # 3. build + LLM compile-fix loop (header-only edits, max 8 iters)
+        # 3. build + LLM compile-fix loop (header-only edits; depth capped by
+        #    OGHIDRA_PORT_MAX_ITERS per section 2.1, stage-aware stuck-abort
+        #    per section 2.2, round-level malformed replies per section 2.5)
         exports = unit["exported_functions"]
         model_used: str | None = None
         iterations = 0
         linked = False
         build_error = ""
+        # Stuck-abort state: progress is only comparable within a stage, and
+        # only across rounds where a new header was actually applied.
+        previous_stage: str | None = None
+        previous_fingerprint: str | None = None
+        header_applied = False
+        no_new_header_rounds = 0
+        current_header_path = str(header_seed)
+        # Per-round memory: error count + header path, recorded to select the
+        # best round when T2's carry logic lands (section 2.2 drops the old
+        # count-increase abort). Not used further in T1.
+        rounds: list[dict[str, Any]] = []
         for iteration in range(1, MAX_COMPILE_ITERS + 1):
             iterations = iteration
-            self._heartbeat(f"wasm_units:{name}:build:{iteration}")
-            try:
-                linked, build_error = self._build_runner(
-                    workdir, exports, unit.get("allowed_extra_imports") or None
+            if iteration == 1 or header_applied:
+                self._heartbeat(f"wasm_units:{name}:build:{iteration}")
+                try:
+                    linked, build_error = self._build_runner(
+                        workdir, exports, unit.get("allowed_extra_imports") or None
+                    )
+                except (OSError, subprocess.SubprocessError) as error:
+                    return self._fail(
+                        state, record, name, f"build runner: {error}", stage="build",
+                    )
+                self.events.emit(
+                    "wasm_unit_build", unit=name, iteration=iteration, linked=linked
                 )
-            except (OSError, subprocess.SubprocessError) as error:
-                return self._fail(
-                    state, record, name, f"build runner: {error}", stage="build",
+                if linked:
+                    break
+                # Stage + fingerprint come from the RAW build output; the
+                # prompt's summary is truncated and must not feed either.
+                stage = classify_build_stage(build_error)
+                fingerprint = diagnostic_fingerprint(build_error)
+                rounds.append(
+                    {
+                        "iteration": iteration,
+                        "stage": stage,
+                        "error_count": count_error_lines(build_error),
+                        "header": current_header_path,
+                    }
                 )
-            self.events.emit(
-                "wasm_unit_build", unit=name, iteration=iteration, linked=linked
-            )
-            if linked:
-                break
+                if is_stuck(
+                    previous_stage, previous_fingerprint,
+                    stage, fingerprint, header_applied,
+                ):
+                    return self._fail(
+                        state, record, name,
+                        "stuck: identical diagnostics after applied fix",
+                        stage="compile-fix",
+                    )
+                previous_stage, previous_fingerprint = stage, fingerprint
+            # else: section 2.5 exemption -- the previous round applied no new
+            # header, so the previous build's result is already in hand;
+            # rebuilding the identical input would yield the identical output,
+            # and the fingerprint comparison is skipped for that round.
             if iteration == MAX_COMPILE_ITERS:
                 break
             self._heartbeat(f"wasm_units:{name}:compile_fix:{iteration}")
-            try:
-                fixed = self._compile_fix(
-                    unit_c, (workdir / "gnt4_shim.h").read_text(encoding="utf-8"), build_error
-                )
-            except Exception as error:  # noqa: BLE001
-                # A PROVIDER outage is not this unit's fault. Blaming the unit
-                # is how 19 consecutive units were marked red_retryable on
-                # 2026-08-15 for "Serving context still 32768 < required 33974"
-                # and "Custom API returned no assistant content" -- provider
-                # faults, recorded as per-unit verdicts, with the rig unable to
-                # see an outage at all because wasm mode never raised one.
-                if self._is_context_budget_fault(error):
-                    # Not a provider outage and not a bad unit: this unit's
-                    # prompt simply does not fit the configured serving context.
-                    # Naming it as its own class makes the repeated-failure
-                    # section of the README say exactly which knob to turn,
-                    # instead of burying 1,500 units under "compile-fix LLM".
-                    return self._fail(
-                        state, record, name, f"context budget: {error}",
-                        stage="context-budget", result=RESULT_GATE_FAILED,
+            header_text = (workdir / "gnt4_shim.h").read_text(encoding="utf-8")
+            # Section 2.4: the model sees the deduplicated summary; the raw
+            # text stays in build_error for fingerprinting and the state record.
+            prompt_errors = summarise_build_error(build_error, budget=2000)
+            fixed = None
+            for format_reminder in (False, True):
+                try:
+                    fixed = self._compile_fix(
+                        unit_c, header_text, prompt_errors,
+                        format_reminder=format_reminder,
                     )
-                if self._is_provider_fault(error):
-                    return self._provider_pause(state, record, name, str(error))
-                return self._fail(
-                    state, record, name, f"compile-fix LLM: {error}", stage="compile-fix",
-                )
-            record["model_requests"] = record.get("model_requests", 0) + 1
-            model_used = getattr(self._llm, "default_model", None) or model_used
-            self._save_state(state)
+                except Exception as error:  # noqa: BLE001
+                    # A PROVIDER outage is not this unit's fault. Blaming the unit
+                    # is how 19 consecutive units were marked red_retryable on
+                    # 2026-08-15 for "Serving context still 32768 < required 33974"
+                    # and "Custom API returned no assistant content" -- provider
+                    # faults, recorded as per-unit verdicts, with the rig unable to
+                    # see an outage at all because wasm mode never raised one.
+                    if self._is_context_budget_fault(error):
+                        # Not a provider outage and not a bad unit: this unit's
+                        # prompt simply does not fit the configured serving context.
+                        # Naming it as its own class makes the repeated-failure
+                        # section of the README say exactly which knob to turn,
+                        # instead of burying 1,500 units under "compile-fix LLM".
+                        return self._fail(
+                            state, record, name, f"context budget: {error}",
+                            stage="context-budget", result=RESULT_GATE_FAILED,
+                        )
+                    if self._is_provider_fault(error):
+                        return self._provider_pause(state, record, name, str(error))
+                    return self._fail(
+                        state, record, name, f"compile-fix LLM: {error}", stage="compile-fix",
+                    )
+                record["model_requests"] = record.get("model_requests", 0) + 1
+                model_used = getattr(self._llm, "default_model", None) or model_used
+                self._save_state(state)
+                if fixed is not None:
+                    break
+                # First miss: fall through to the single format-reminder
+                # re-ask (section 2.5). Second miss: handled below.
             if fixed is None:
-                return self._fail(
-                    state, record, name,
-                    "compile-fix returned no code block: "
-                    f"{getattr(self, '_last_reply_shape', None) or 'no reply captured'}",
-                    stage="compile-fix",
+                # Section 2.5: a malformed reply is ROUND-level, never
+                # attempt-level. Record the round, skip the rebuild (the
+                # header is unchanged, so the failing build result stands),
+                # and give the next iteration a fresh model call.
+                no_new_header_rounds += 1
+                header_applied = False
+                self.events.emit(
+                    "wasm_unit_no_new_header",
+                    unit=name,
+                    iteration=iteration,
+                    reply_shape=(
+                        getattr(self, "_last_reply_shape", None)
+                        or "no reply captured"
+                    ),
                 )
+                continue
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             (workdir / f"header-iter{iteration}.h").write_text(
                 fixed, encoding="utf-8", newline="\n"
             )
+            current_header_path = str(workdir / f"header-iter{iteration}.h")
+            header_applied = True
         if not linked:
+            detail = f"not linked: {summarise_build_error(build_error)}"
+            if no_new_header_rounds:
+                detail += (
+                    f" ({no_new_header_rounds} compile-fix round(s) returned "
+                    "no code block: "
+                    f"{getattr(self, '_last_reply_shape', None) or 'no reply captured'})"
+                )
             return self._fail(
-                state, record, name,
-                f"not linked: {summarise_build_error(build_error)}",
+                state, record, name, detail,
                 stage="wasm-link", result=RESULT_GATE_FAILED,
             )
 
