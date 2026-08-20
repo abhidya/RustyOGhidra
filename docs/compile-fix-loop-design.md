@@ -1,10 +1,32 @@
-# Compile-fix loop redesign — defended design (v3, information-monotone workflow)
+# Compile-fix loop redesign — defended design (v4, information-monotone workflow)
 
 Status: v1 was adversarially reviewed; all BLOCKING/MAJOR findings were resolved
 in v2, each marked `[R#]`. v2's T1 tranche has landed in `src/port_wasm_units.py`
 (depth cap 4, stage-aware stuck-abort, deduplicated feedback, re-ask, D14,
-`-ferror-limit=0`). v3 redesigns the workflow around an owner principle that v2
-violated, marked `[V3-#]`:
+`-ferror-limit=0`). v3 redesigned the workflow around an owner principle that v2
+violated, marked `[V3-#]`. **v3 was then adversarially reviewed and FAILED** on
+one BLOCKING finding (the registry echo chamber, F1) plus ten majors (F2–F11);
+v4 applies that verdict in full. v4 changes are marked `[V4-#]` where `#` is the
+review finding number.
+
+**World state at v4 (verified in-repo, 2026-08-20):**
+
+- The queue Tier-0 generation fixes LANDED (OGhidra `05b94ea`, GotYaForce
+  `9fccede`): `SKIP_PREFIXES` now catches both `gnt4_` and `gnt4-` (996 SDK
+  functions were being queued through the hyphen variant); non-C-identifier
+  exports (truncated demangled C++) are excluded at generation time, with every
+  exclusion recorded in `wasm-units-skipped.json` (996 `sdk_prefix` + 22
+  `non_c_identifier`); the queue regenerated **1520 → 1,396 units / 10,954
+  exports**; the settled-verdict migration is done (`wasm-units-migration.json`:
+  15 verdicts carried on identical export sets, 6 recorded-and-left-pending);
+  generated units now start from the generator's own
+  `finish-game-port/gnt4_shim_seed.h` (integer `undefined8`/`CONCAT44`,
+  matching the driver prompt — the PoC's seed left byte-for-byte untouched).
+  49 port tests green.
+- T1 is landed in `src/port_wasm_units.py`; the port pipeline is **OFFLINE**
+  pending the T2a fixes (§9).
+
+The owner principle, unchanged:
 
 > "If it works on the assumption we retry with the same inputs hoping for
 > different results, that is an incorrect use of AI. For LLMs we need to build a
@@ -33,21 +55,24 @@ three timescales:
   an attempt is scheduled only when the **world has changed** since the last
   verdict, and its prompt carries a **post-mortem** of the failed attempt
   (§2.3, §2.8).
-- **Across units of the program**: the 1,520 units are extractions from ONE
-  program (the whole-program manifest at
+- **Across units of the program**: the queue's 1,396 units [V4-2 count] are
+  extractions from ONE program (the whole-program manifest at
   `research/decomp/generated/finish-game-port/whole-program-manifest.json`
   inventories all 11,980 functions, `inventory_complete=true`). Units share
   `DAT_` addresses, typedef conventions, pseudo-op macros, and function
   prototypes — yet today every unit re-derives all of them from the same cold
   seed header. v3 adds a **knowledge registry** (§2.11): green decisions are
-  harvested and later units start warmer. The registry doubles as the
-  header-reconciliation ledger final assembly needs, which turns G1 from a
-  disclaimer into a mechanism (§3).
+  harvested and later units start warmer ([V4-1]: harvested compile-only
+  knowledge is *advisory* until behaviourally verified — see §2.11). The
+  registry doubles as the header-reconciliation ledger final assembly needs,
+  and [V4-11] the **continuous assembly gate** (§2.13) exercises that ledger
+  empirically from the first N greens, which turns G1 from a disclaimer into
+  a running mechanism (§3, §10).
 
 Corollary used throughout: **a retry whose inputs are identical to the failed
 attempt is not scheduled.** Deprioritising is allowed; blind re-running is not.
 
-## 1. Evidence base (recomputed in v2 — [R5]; re-verified for v3, unchanged)
+## 1. Evidence base (recomputed in v2 — [R5]; corrections [V4-9])
 
 The v1 numbers were contaminated: ≥15 of the ~58 "wasted" iterations were
 infrastructure outages (cygpath PATH, bash-paren export, banner truncation)
@@ -67,8 +92,20 @@ iterations 1–2. Restated on clean data:
   [V3-1 note: mode collapse recurring across *different prompts* at temp 0.7 is
   itself evidence that sampling variation is a weak lever — the fix is
   different *information*, not different dice.]
-- Static profile of all 1520 units: 6.4% provably unfixable, 37% pseudo-ops,
-  29% `(&DAT_)[i]`, 44% clean.
+- Static profile of all units: 6.4% provably unfixable, 37% pseudo-ops,
+  29% `(&DAT_)[i]`, 44% clean. [V4-9]: these percentages were computed on the
+  old 1,520-unit queue; the Tier-0 regeneration (status header) removed the
+  996 SDK functions and 22 non-exportable names (units 1520 → 1,396), so the
+  class mix must be recomputed on the new queue before F1's window is scored.
+  The split is retained as the *ordering* evidence it was used for, not as
+  current absolute truth.
+- Greens count, stated precisely [V4-9] (v3 left this implicit): live state
+  after the migration is **1,381 pending / 12 green / 3 structural_ineligible
+  = 1,396**. Historical green verdicts total 16: 12 carried onto identical
+  export sets, 4 chunk_0000 greens recorded in `wasm-units-migration.json`
+  and left pending because the SDK skips shifted their batches. The journal's
+  16 `wasm_unit_green` events reconcile against this only *via* the migration
+  file — see the settle-through-journal rule in §2.9 [V4-9c].
 
 Research (arXiv 2604.10508, 2505.02931, s41598-025-27846-5, 2608.05643): two
 repair rounds capture most gains; decay per attempt; diverse independent
@@ -115,13 +152,26 @@ boundary is progress by definition:
 [V3-1 note: the stuck-abort is the within-unit enforcement of the principle —
 an applied fix that produced zero informational change ends the attempt.]
 
-### 2.3 Retry = new information, never resampling — G2, G4 [V3-2, replaces v2 §2.3]
+### 2.3 Retry = new information, never resampling — G2, G4 [V3-2; coherence fix V4-4]
 
 v2 made seed/temperature schedules the primary retry lever. Killed: a retry
-whose only difference is sampling noise is same-information resampling. An
-attempt N+1 on a red unit must differ from attempt N in at least one of:
+whose only difference is sampling noise is same-information resampling.
 
-1. **Post-mortem carry (always present).** The retry prompt includes a distilled
+**[V4-4] Scheduling vs prompt content — v3 conflated them.** v3 listed the
+post-mortem as one of three things that could make attempt N+1 "differ" from
+attempt N, implying a post-mortem alone licenses a retry. It does not. A
+post-mortem is derived entirely from the failed attempt's own inputs and
+outputs — carrying it adds no information *about the world* — so **a
+post-mortem alone never makes a retry schedulable**. Scheduling is gated
+exclusively by a world-delta (§2.8). The post-mortem is prompt *content*
+attached to every retry that the world-delta gate has already scheduled, and
+whether it helps at all (vs anchoring the model on the failed trajectory) is
+an open question measured by falsifier F7 (§8), not an assumption.
+
+So: an attempt N+1 is **scheduled** only by §2.8's world-changed gate, and its
+prompt then differs from attempt N's in:
+
+1. **Post-mortem carry (content, not license [V4-4]).** The retry prompt includes a distilled
    post-mortem of the failed attempt, 5–10 lines, **mechanically extracted**
    from the per-round records the loop already keeps (`rounds[]`: iteration,
    stage, error count, header path — plus final fingerprint and verdict):
@@ -135,11 +185,22 @@ attempt N+1 on a red unit must differ from attempt N in at least one of:
    world at failure: registry v<K>, prompt v<P>
    ```
 
-   No LLM writes the post-mortem; it is string assembly from state. This alone
-   makes every retry informationally distinct from the original attempt (the
-   original had no post-mortem).
+   No LLM writes the post-mortem; it is string assembly from state.
 
-2. **World change since the verdict (gates scheduling — see §2.8).** New
+   **Data T2a must record to make this assemblable [V4-4]** — today's
+   `rounds[]` keeps only iteration/stage/error-count/header-path, which cannot
+   answer "never cleared" mechanically, and `header-iter{I}.h` files are
+   overwritten by the next attempt, destroying the artifact the carry decision
+   needs:
+
+   - `rounds[]` gains, per round, the **normalized diagnostic set** (the
+     §2.2-normalised, sorted, dedup'd error lines) and its **fingerprint** —
+     "never cleared" is then a set intersection, and cross-attempt oscillation
+     detection becomes a fingerprint comparison.
+   - **Per-attempt best-header snapshots under attempt-scoped filenames**
+     (`header-attempt{A}-iter{I}.h`), never overwritten by later attempts.
+
+2. **World change since the verdict (the scheduling gate — §2.8).** New
    registry entries intersecting the unit's symbols/addresses, a code/toolchain
    fix matching the unit's recorded error class, or a prompt-rule change. The
    changed input (augmented seed header, fixed toolchain, new system prompt) is
@@ -168,19 +229,49 @@ accordingly (§8): it now measures conversion of *world-changed* retries, and
 the seed's marginal contribution is measured only as an A/B *within* that
 population.
 
+**The post-mortem itself is A/B-tested [V4-4].** Falsifier F7 (§8) runs
+post-mortem on/off within world-changed retries and tracks conversion AND the
+**resurrection rate** — a `#define` that failed in attempt N re-emitted
+byte-identical in attempt N+1. The §1 oscillation evidence (byte-identical
+wrong `#define` under *different prompts*) cuts both ways: it motivated
+information-carrying retries, but it is equally consistent with the model
+anchoring on any prior trajectory shown to it. If anchoring is confirmed, the
+post-mortem is reduced to **diagnostics-only phrased as prohibition** ("these
+lines were tried and failed; do not re-emit them") and the failed-header carry
+is dropped.
+
 ### 2.4 Feedback construction — G2 [unchanged, landed]
 
 Prompt compiler-output = `summarise_build_error()` with deduplication
-(≤2000 chars, invocation echo stripped) instead of the raw
-`(stderr+stdout)[-6000:]` tail. Operator and model see the same evidence.
+(invocation echo stripped) instead of the raw `(stderr+stdout)[-6000:]` tail.
+Operator and model see the same evidence. [V4-9] Budgets as actually landed:
+the function's **default budget is 1,200 chars**; the compile-fix call site
+passes **2,000** (`src/port_wasm_units.py:313` and `:1058`) — v3's "≤2000"
+described only the call site.
 
-### 2.5 Malformed replies are round-level — G2 [R2] [unchanged, landed]
+### 2.5 Malformed replies are round-level — G2 [R2] [landed; loophole closed V4-9]
 
 One immediate re-ask on no-extractable-header; if that fails, the round is
 recorded as `no_new_header` and the loop proceeds without rebuilding (§2.2
 exemption). An attempt is never failed over a missing fence. [V3-1 note: the
 re-ask is principle-compliant — it adds the one fact the model lacked ("your
 previous reply carried no usable code block"), so it is not same-input retry.]
+
+**[V4-9] The landed code has one surviving same-input round.** After the
+format-reminder re-ask also fails, the round records `no_new_header` and the
+loop `continue`s (`src/port_wasm_units.py:1055-1064` re-ask fall-through) —
+the *next* iteration then calls the model with **byte-identical inputs**: same
+header (nothing was applied), same summarised errors (nothing was rebuilt),
+same base prompt. That is exactly the retry §0.1 forbids, hiding inside the
+round-level rule. T2a fix, either arm acceptable:
+
+- a **second consecutive** `no_new_header` round **ENDS the attempt** (red,
+  retryable — the world-changed gate then governs, as for any red); or
+- the follow-up call must **carry the recorded reply-shape evidence** in its
+  prompt ("your last reply was: <shape>; emit exactly one fenced C header"),
+  making it informationally distinct the way the first re-ask already is.
+
+The first re-ask is fine; the bug is the unbounded repetition after it.
 
 ### 2.6 Oversize handling — G2 [R3] [unchanged]
 
@@ -219,7 +310,7 @@ the header). Line-level identifier tests discard dataflow. Therefore:
   only deprioritises and nominates the unit for the F4 replay sample, where a
   provable outcome decides.
 
-### 2.8 Retry lane → world-changed gating — G2, G4 [V3-4, generalises v2 §2.8]
+### 2.8 Retry lane → world-changed gating — G2, G4 [V3-4; world-hash + terminal protocol V4-3]
 
 v2's lane preferred reds whose error signature matched a code fix landed after
 their verdict (9 of the 13 reds in v2's evidence window). v3 generalises: a
@@ -233,14 +324,38 @@ red unit is **schedulable only when the world changed** since its verdict.
 - **Prompt delta:** the system prompt / injected rules changed
   (`prompt_version` bump).
 
-Mechanics: at verdict time `_fail` records
-`world_version = {registry_version, prompt_version, fix_ledger_version}` plus
-the unit's symbol set and final error class. At selection time `_next_unit`
-skips a red whose recorded world version still matches the current world *and*
-whose symbol set gained no registry entries. Ordering among schedulable reds:
-largest relevant delta first (error-class-fix match, then count of new
-registry entries touching the unit), then fewest-attempts — replacing the
-blind every-Nth rotation.
+**Mechanics [V4-3] — a mechanical world-hash, not a declared ledger.** v3's
+`fix_ledger_version` required someone to *declare* that a landed fix matches a
+unit's error class — a human bottleneck and a lie-by-omission channel: any
+world change nobody thought to declare (a serving-config bump, a toolchain
+upgrade) leaves schedulable retries unscheduled forever. Replaced: at verdict
+time `_fail` records a **world-hash** — sha256 over the tuple
+
+```
+(serving config: model id + served context length,
+ toolchain version: emcc -v string,
+ driver git rev,
+ PROMPT_VERSION,
+ registry_version)
+```
+
+— plus the unit's symbol set and final error class. Every component is read
+mechanically from the running system; nothing is declared. At selection time
+`_next_unit` skips a red whose recorded world-hash equals the current hash
+*and* whose symbol set gained no registry entries. Error-class-fix matching
+survives as an **ordering heuristic** among already-schedulable reds (largest
+relevant delta first: error-class match, then count of new registry entries
+touching the unit, then fewest-attempts — replacing the blind every-Nth
+rotation), never as the gate itself.
+
+**Encoded as a regression test [V4-3] — the live counterexample:** the two
+context-budget reds `auto-c0000-017` (required 34,008 tokens) and
+`auto-c0001-000` (required 33,974) were verdicted when the serving maximum was
+32,768; serving is now 262,144. No code fix was declared for them and no
+registry entry touches them — under v3's fix-ledger scheme they wait forever
+on a declaration nobody would think to make. Under the world-hash they MUST be
+schedulable (the serving-config component changed). This pair is the test
+fixture for the hash's composition.
 
 **If nothing changed, the retry is not scheduled** — this replaces
 retry-forever. Honest accounting (same pattern as §2.6): reds waiting on a
@@ -248,9 +363,28 @@ world change still count as work in `_work_remains()`, but a pass that finds
 only such units writes run-state `status="waiting_world_change"` and must NOT
 return `EXIT_PROGRESSED`; the supervisor reads the status from run-state.json
 (§2.9 — no new exit codes before Phase 3). Starvation risk is bounded in
-practice: 1,485 never-attempted units precede this situation, and every green
+practice: 1,381 never-attempted units precede this situation, and every green
 that harvests entries bumps the registry version, re-opening every red whose
 symbols it touches.
+
+**Terminal-state protocol [V4-3] — `waiting_world_change` must terminate in a
+decidable page, not a spin.** v3 named the state but not its end. When zero
+pending units remain and every red is zero-delta:
+
+1. Each such red receives exactly **one §2.12(b) diagnosis call** (already
+   bounded to once per unit lifetime, so re-entering the terminal state later
+   re-spends nothing). This narrow use of the diagnosis question is pulled
+   forward into T2a; the general escalation lane stays in T3 (§2.12).
+2. The driver writes the terminal run-state and a **dedicated §4 page row
+   fires with the diagnosis outputs attached** — the owner receives "here is
+   every stuck unit and the model's one-line reason for each": a work order,
+   not a stall report.
+
+**Run-state semantics, named now [V4-3]:** `run-state.json` gains a
+`run_state` field with values `progressing | waiting_world_change |
+provider_paused`. This is a **run-state field, not a new exit code** — exit
+codes stay frozen until Phase 3 per §2.9; the supervisor keeps reading the
+file it already reads.
 
 ### 2.9 Budgets, exit codes, counters — G3 [R3] [unchanged + V3-4 status]
 
@@ -266,14 +400,27 @@ symbols it touches.
   alongside. Live incoherence example preserved for the test suite:
   a green whose provenance says `model_requests=7` where all 7 were spent on
   an infra-outage attempt and the winning attempt used 0.
+- **Settles go through the journal — rule from a live precedent [V4-9].** The
+  2026-08-20 settled-verdict migration wrote 15 carried verdicts directly into
+  `wasm-units-state.json` via `port_queue_migrate` **without emitting a single
+  journal event** — `events.jsonl` has no migration or settle kind, so it now
+  shows 16 `wasm_unit_green` events against 12 greens in live state, and only
+  the side-car migration file explains the difference. The migration itself
+  was correct and documented; the *channel* was out-of-band. Rule (T2a, and
+  mirrored in `AGENTS.md` so agents inherit it): **any operation that settles,
+  carries, or unsettles a unit verdict MUST go through a code path that emits
+  the corresponding journal event** (`verdict_migrated`, `verdict_revoked`,
+  ...). G3 says pushes are the heartbeat; the journal is the heartbeat's
+  ledger, and a state file that can silently diverge from it is a G3 breach in
+  waiting.
 
 ### 2.10 Transient I/O is not structural — [unchanged, landed]
 
 `OSError` on the header seed ⇒ retryable, never settled.
 
-### 2.11 Knowledge registry: cross-unit accumulation — G1, G2 [V3-3, new]
+### 2.11 Knowledge registry: cross-unit accumulation — G1, G2 [V3-3; rewritten V4-1, V4-5, V4-6, V4-7, V4-8, V4-10]
 
-All 1,520 units are extractions of one program sharing one flat address space;
+All 1,396 units are extractions of one program sharing one flat address space;
 today each re-derives typedefs, `DAT_` typings, and prototypes from the same
 cold seed. The registry makes green-time decisions reusable and, by the same
 stroke, becomes the assembly reconciliation ledger (§3).
@@ -281,6 +428,16 @@ stroke, becomes the assembly reconciliation ledger (§3).
 **File:** `research/decomp/generated/finish-game-port/knowledge-registry.json`
 — in-repo, versioned by git *and* by a monotonic `version` counter (the counter
 is what §2.8's gating compares; git history is the audit trail).
+
+[V4-8] **The path as specced in v3 would have been silently untracked:**
+`research/decomp/generated/finish-game-port/` is gitignored wholesale
+(GotYaForce `.gitignore:63`; the tracked queue files predate or were
+force-added past the rule). "Versioned by git" was therefore false as written.
+T2c ships a negation exception
+(`!research/decomp/generated/finish-game-port/knowledge-registry.json`) **and
+a test that the path is trackable** (`git check-ignore` must reject it) —
+named explicitly in T2c's scope (§9) so it cannot be forgotten as a one-line
+afterthought.
 
 **Schema (registry_schema 1):**
 
@@ -336,54 +493,157 @@ Entry kinds: `dat_typing` (`DAT_`/`PTR_DAT_` macro with address), `prototype`,
 `pseudo_op` (CONCAT/SUB/ZEXT/SEXT macro forms), `typedef`. Tier ladder:
 `seed` < `compile_only` < `oracle_green`.
 
-**Harvest step (mechanical, no LLM):** at green/staged time, diff the winning
-`gnt4_shim.h` against the unit's seed; parse out `#define (PTR_)?DAT_<hex8>`
-lines, prototype declarations for symbols in the unit's prelude/callee set,
-and pseudo-op macro definitions. Only harvest entries whose symbol actually
-appears in the unit's verbatim `.c` (evidence-linked — a decl the model
-gratuitously added but nothing used is not knowledge). Record tier from the
-unit's tier. Bump `version` iff entries were added or changed.
+**Harvest step (mechanical, no LLM) — redefined [V4-1]:** at green/staged
+time, diff the winning `gnt4_shim.h` against the unit's *augmented* seed;
+parse out `#define (PTR_)?DAT_<hex8>` lines, prototype declarations, and
+pseudo-op macro definitions. Harvest = **decisions evidenced by the unit's
+verbatim `.c`**, with two exclusions that v3 lacked:
 
-**Injection step (unit start):** compute the unit's symbol set — `DAT_<hex8>` /
-`PTR_DAT_<hex8>` occurrences in the verbatim text, plus prelude/export/callee
-identifiers. Select registry entries whose key intersects that set (relevance
-= symbol/address intersection, nothing fuzzier). Append them to the seed
-header under a fenced block:
+- **Seed-inherited content is never harvested.** Any line already present in
+  the seed the unit started from (including injected registry lines) is not
+  that unit's decision; harvesting it would launder the seed back into
+  "evidence" and inflate agreement.
+- **Stub definitions for functions the unit calls but does not define are
+  never harvested.** A green unit necessarily stubs its callees; those stubs
+  are scaffolding assembly must *replace*, not knowledge it must honour.
 
-```c
-/* ==== REGISTRY (established by green units of this same program; authoritative) ==== */
-```
+This second exclusion is what makes the `oracle_green` tier **populatable at
+all** without poisoning: v3's harvest, applied to the PoC's oracle-verified
+units, would have imported their structural stubs as behaviourally-verified
+truth — the review's concrete objection to how the top tier gets its first
+entries. With the exclusions, an oracle-verified unit contributes exactly its
+evidenced `dat_typing`s, pseudo-op forms, and the prototypes of functions it
+*defines* — nothing it faked to link. Record tier from the unit's tier. Bump
+`version` iff entries were added or changed.
 
-The compile-fix prompt gains one rule: *registry-block lines were established
-by units of this same program that already passed their gates; treat them as
-authoritative and do not alter them — adapt your other declarations instead.*
-The driver checks after each applied header that injected registry lines
-survived verbatim (a string check); a mutation does not abort the round (the
-header may still compile) but is recorded as `registry_deviation` and, if the
-unit goes green with the deviation, becomes a conflict record at harvest.
+**Injection step (unit start) — a seed/prelude-aware MERGE, tiered by trust
+[V4-1, V4-5; REWRITTEN — this resolves the review's BLOCKING finding]:**
+compute the unit's symbol set — `DAT_<hex8>` / `PTR_DAT_<hex8>` occurrences in
+the verbatim text, plus prelude/export/callee identifiers. Select registry
+entries whose key intersects that set (relevance = symbol/address
+intersection, nothing fuzzier). Then merge, never append [V4-5]:
+
+- If the seed already carries a line for the symbol (a seed `#define` or
+  typedef), the entry **replaces the seed's line in place** — never both. v3's
+  append produced duplicate macro definitions: at best `-Wmacro-redefined`
+  noise polluting every fingerprint, at worst two silently divergent
+  definitions where position decides semantics.
+- A `prototype` entry for a symbol **the unit's prelude already declares is
+  not injected**: the prelude is generated from Ghidra's own signature for
+  this unit and outranks a sibling unit's compile-time guess. If the registry
+  entry disagrees with the prelude, that disagreement is recorded on the entry
+  as a **pending conflict** — data, surfaced; not an injection.
+- No symbol ever appears twice in the assembled header.
+
+**Tier decides HOW an entry is injected — v3's blanket-authoritative block was
+an echo chamber [V4-1]:** v3 injected `compile_only` entries with a
+do-not-alter rule and then defined conflicts as later units disagreeing. But a
+registry that instructs agreement measures *obedience*, not correctness: the
+first unit's guess for a shared address would propagate to every later unit
+touching it, each "confirming" it under instruction, while the conflict
+counter — the design's own G1 safety mechanism — read zero. One early wrong
+`dat_typing` on the 29% shared-`(&DAT_)[i]` class poisons the ledger exactly
+where the ledger matters most. Passing emcc proves a typing is
+*self-consistent within one unit*, not that it is the program's typing.
+Therefore:
+
+- **`oracle_green` entries — authoritative injection** (reserved for this tier
+  alone): fenced block, prompt rule *"these lines were established by
+  behaviourally-verified units of this same program; do not alter them — adapt
+  your other declarations instead"*, and the semantic survival check below.
+- **`compile_only` entries — ADVISORY ONLY**, injected as a commented block:
+
+  ```c
+  /* ==== REGISTRY (advisory): previous units of this program compiled with
+     the typings below. Verify each against THIS unit's use sites before
+     adopting it; you are free to disagree — a reasoned disagreement is
+     wanted data. ==== */
+  /* #define DAT_802c44f8 (*(unsigned char *)(unsigned int)0x802c44f8) */
+  ```
+
+  No do-not-alter rule and **no survival check of any kind** for advisory
+  entries — the unit derives its own typing with the hint in view. At harvest,
+  the unit's independent derivation is compared against the advisory entry;
+  disagreement is recorded as a conflict. **Independent derivation IS the
+  conflict detector** — the same LLM work that ports the unit doubles as the
+  registry's per-entry replication experiment, at zero extra calls. Agreement
+  under advisory injection is evidence; agreement under instruction was noise.
+
+**Injection size bound, written down [V4-10] (no cap imposed):** relevant-entry
+injection against the queue's symbol-set sizes lands around **~300 tokens
+median, ~2k tokens worst case** (a `(&DAT_)[i]`-heavy unit against a mature
+registry). The real cost is **output-side regurgitation**: the model rewrites
+the whole header every round, so injected lines are re-emitted in every reply
+— k rounds × block size at output-token prices. Against the measured 16.1-min
+median call this is noise relative to a single saved round, which is why no
+cap is needed; the bound is recorded so the F6 holdout window can falsify
+"noise" if the worst case grows.
+
+**Survival check — semantic, oracle-tier only [V4-6]:** v3's post-apply check
+was a verbatim string comparison — defeated by whitespace, comment stripping,
+or legitimate reordering; it would have spammed `registry_deviation` on
+cosmetic edits while missing a semantically-changed macro that kept its
+prefix. Replaced: re-parse the applied header, extract the macro definitions
+and declaration signatures for the injected **authoritative** symbols, and
+compare **normalized token sequences** (whitespace/comment-insensitive; for
+prototypes, the normalized signature). Applies **only to `oracle_green`
+authoritative entries** — advisory entries are free to be ignored; that is
+their point. A semantic mutation does not abort the round (the header may
+still compile) but is recorded as `registry_deviation` and, if the unit goes
+green with the deviation, becomes a conflict record at harvest.
 
 **Conflict policy — surfaced immediately, never deferred to assembly:**
 
 - Higher tier wins for injection: `oracle_green` over `compile_only` over
-  `seed`. The losing typing is appended to the entry's `conflicts[]` with unit
-  and timestamp — never silently dropped.
+  `seed` — where "wins" now means it is the entry *presented* (authoritatively
+  for `oracle_green`, advisorily for `compile_only` [V4-1]). The losing typing
+  is appended to the entry's `conflicts[]` with unit and timestamp — never
+  silently dropped.
 - Same-tier disagreement (two `compile_only` units typing one address
-  differently): the address becomes **contested** — no injection of that entry
-  (injecting a coin-flip is worse than a cold start), a `registry_conflict`
-  event is emitted, and the dashboard conflict counter increments the moment
-  the second unit lands, not at assembly time.
+  differently): the address becomes **contested** — not injected even
+  advisorily (presenting a coin-flip is worse than a cold start), a
+  `registry_conflict` event is emitted, and the dashboard conflict counter
+  increments the moment the second unit lands, not at assembly time.
 - `oracle_green` vs `oracle_green` disagreement: page the owner (§4). Two
   behaviourally-verified units disagreeing on one address's type is a real
   program-semantics finding (likely a union or a re-used region) and is
   exactly what assembly must know about first.
 
-The conflict list **is** the cross-unit DAT-type reconciliation report — it is
-generated as a by-product of porting instead of by archaeology afterwards (§3).
+**Re-tier / demote / revoke [V4-7] — tiers move in both directions.** v3 had
+promotion implicitly and no demotion path at all; a registry that can only
+gain confidence converges on its earliest mistakes. Every tier move bumps
+`version`, so §2.8's gating sees demotions the same as additions:
 
-**Failure containment (F6, §8):** injection must not poison easy units. The
-first-build error count with injection is compared against the unit-class
-baseline; if injected units regress at first build, the relevance filter is too
-loose and tightens to exact-address matches only.
+- **Promotion:** when a staged unit passes its oracle (T3 verification queue),
+  its harvested entries promote `compile_only` → `oracle_green` — and
+  promotion **recomputes conflicts**: a same-tier-contested address may now
+  have a winner (re-enabling injection); an entry that now collides with an
+  existing `oracle_green` escalates to the green-green page instead of
+  silently winning by recency.
+- **Demotion / revocation:** a **failed oracle re-run on a staged unit**
+  (F5's scenario) downgrades or removes every entry whose only source is that
+  unit — down to `compile_only` where independent compile-only sources agree,
+  otherwise removed with a tombstone recorded in `conflicts[]` (an entry that
+  vanishes without trace would un-explain past injections).
+
+The conflict list **is** the cross-unit DAT-type reconciliation report — it is
+generated as a by-product of porting instead of by archaeology afterwards
+(§3), and the §2.13 assembly gate [V4-11] is its **empirical** complement:
+harvest-time comparison catches the disagreements units wrote down; the link
+catches the ones they didn't.
+
+**Failure containment → holdout falsifier (F6, redefined [V4-1]):** v3's
+containment metric — first-build error count of injected units vs class
+baseline — measured *friction*, not *correctness*: an echo chamber lowers
+first-build errors precisely while being wrong, so the metric could not detect
+the design's worst failure mode. Replaced: **a deterministic N% of units
+(10%, by unit-name hash) receive no injection at all — the holdout.** Holdout
+units derive every typing independently. The registry-correctness metric is
+the **agreement rate between holdout-derived typings and registry entries**
+over the symbols both touch: sustained high agreement validates the registry;
+falling agreement on a symbol class indicts the harvest or the tier ladder.
+First-build error count is retained only as a cheap ops signal, no longer the
+falsifier.
 
 ### 2.12 Different-question escalation — G2, G4 [V3-5, new]
 
@@ -411,6 +671,74 @@ the measured 16.1-min median call:
 Escalation ships in T3 (§9): its value depends on the registry having first
 drained the failure pool, and its cost (a median-length call per use) is only
 justified against units the cheaper mechanisms have already failed twice.
+[V4-3] One narrow exception is pulled forward into T2a: §2.8's terminal-state
+protocol invokes the (b) diagnosis question once per zero-delta red when the
+queue is otherwise exhausted, so the `waiting_world_change` page carries a
+reason per stuck unit. Same prompt, same once-per-unit-lifetime bound; only
+the trigger ships early.
+
+### 2.13 Continuous assembly gate — THE interim G1 mechanism — G1, G4 [V4-11, new]
+
+Every mechanism above keeps units *individually* green; until v4 nothing ever
+linked two of them together — G1's first executable evidence sat behind a
+future assembly workstream. The review's verdict: make composition
+continuous, starting from the first handful of greens.
+
+**Mechanism — specced as the simplest form that can fail honestly:** on every
+green (or every Nth green; N configurable, default 5), take the last N
+green/staged units and run **one `emcc` invocation over their `unit.c` files
+together**:
+
+- **merged headers** — the registry's merge logic (§2.11 [V4-5]) already
+  defines precedence: authoritative entries win, contested/advisory conflicts
+  fail the merge loudly rather than picking silently;
+- **one shared arena** — the single `-sINITIAL_MEMORY=2155479040` flat image
+  every unit already assumes; no `-sIMPORTED_MEMORY` side modules — that
+  machinery is strictly more moving parts than a loadability gate needs, and
+  the gate's own failures will say when real assembly outgrows the single
+  invocation;
+- **externs deduplicated via prelude signatures** — two units both stubbing
+  the same callee keep exactly one definition; a signature mismatch between
+  their stubs is itself a filed conflict.
+
+The gate **passes iff the link produces a loadable wasm** (instantiation
+smoke-test under node; no behaviour asserted — behaviour stays the oracle
+tier's job). On failure: **page** (§4 row) and **file conflict records**
+against the implicated registry entries/symbols — the failing diagnostics
+name symbols, and symbols name entries.
+
+Two roles, one mechanism:
+
+1. **The interim G1 mechanism.** From T2b onward, "progress toward a buildable
+   game" is measured by the largest N the gate has passed — not by counting
+   individually-green units whose mutual composability is conjecture. §10's
+   G1 row traces here, not to a futures-only workstream.
+2. **The registry's empirical conflict detector [V4-1].** §2.11's harvest-time
+   comparison catches disagreements units wrote down; the linker catches the
+   ones they didn't — type-incompatible extern redeclarations, duplicate
+   definitions, layout-divergent macro use — with the compiler as arbiter
+   instead of string comparison.
+
+### 2.14 Queue ordering toward product gaps — G1, G2 [V4-2, new]
+
+The Tier-0 fixes (status header) corrected what the queue *contains*; this
+corrects what it serves first. Pending units are currently served in chunk
+order — an accident of the address-space walk, uncorrelated with what a
+playable game needs. The strategy doc
+(`research/decomp/port-strategy-research-2026-08-09.md`, option C,
+recommendation 1) already names the product-gap order: the 12 unbridged
+family files, then the **71 missing + 234 partial action slots across 325**
+(the dominant combat-fidelity gap), then VERSUS wiring.
+
+**Spec: a sort key on the existing queue, not a new queue.** Each queue entry
+gains `product_priority` (int, lower serves first), assigned by the generator
+by mapping the audit scripts' family/action-slot gap lists onto the chunks
+containing those functions; unmapped chunks keep a default tail priority.
+`_next_unit` orders pending units by `(product_priority, chunk_order)`.
+Regeneration is cheap by construction: `port_queue_fill --rebuild` (landed in
+the Tier-0 commit) resweeps generated units while `port_queue_migrate`
+carries verdicts — re-keying is a regen, not a migration project. Ships in
+T2a as a generator/selector tweak.
 
 ## 3. G1: per-unit work feeds assembly by construction [V3-6, replaces v2 §3's disclaimer]
 
@@ -438,7 +766,8 @@ assembly input, and the facts on the ground make composition tractable:
 Assembly deliverables, restated as consumers of existing mechanisms:
 
 1. **Cross-unit DAT-type reconciliation report** = the registry conflict list
-   (§2.11) — generated continuously, zero archaeology.
+   (§2.11) plus the §2.13 gate's link-failure conflicts [V4-11] — generated
+   continuously, zero archaeology.
 2. **Shared-memory link plan** (single module vs shared-memory imports): the
    flat INITIAL_MEMORY image makes a single shared memory the default
    candidate; the registry's `dat_typing` entries enumerate every absolute
@@ -458,21 +787,27 @@ Unchanged from v2:
   header, an oracle-only stage, artifact move, provenance rewrite, commit
   path. Costed honestly as a subsystem.
 
-Final assembly remains its own workstream — but v3's units hand it a ledger and
+Final assembly remains its own workstream — but the units hand it a ledger and
 a conflict-free (or conflict-*known*) address map by construction, instead of
-1,520 independent headers to reconcile after the fact.
+1,396 independent headers to reconcile after the fact. [V4-11] And it no
+longer starts cold: the §2.13 gate has been continuously linking rolling
+N-unit windows since T2b, so assembly begins from a composition that already
+loads, with every known incompatibility filed as a conflict record.
 
 ## 4. Monitoring invariants — G3, G4 [R8] [+ V3-3 row]
 
 | Invariant | Threshold | Tranche | Action |
 |---|---|---|---|
-| Push silence while `running` | **4 h** (= 2.5 h ceiling + max observed stage 1.8 h + margin, boundary-enforced); T2 adds an hourly mid-unit heartbeat commit, after which the threshold drops to 2 h | T1 (threshold in existing cron) | alert + RCA |
+| Push silence while `running` | **4 h** (= 2.5 h ceiling + max observed stage 1.8 h + margin, boundary-enforced); T2 adds an hourly mid-unit heartbeat commit, after which the threshold drops to 2 h | T1 — **ownership caveat [V4-9]: the cron lives on the rig supervisor (2026-08-16 split), so this repo can request the threshold but cannot attest it; treat as landed-by-report, verifiable only rig-side** | alert + RCA |
 | Unit wall clock | 2.5 h, **boundary-enforced** (a synchronous model call can overshoot by one call — stated, not hidden) | T1 | abort attempt, retryable, move on |
 | Repair round | fingerprint unchanged after an applied header (§2.2) | T1 | abort attempt early |
 | Reds:greens | 3:1 over trailing 10 **model-call-consuming attempts** (instant structural settles excluded — a batch of free correct kills must not page; they serve G4) | T2 | pause-and-page: design-failure signal |
 | Verified fraction | falling while staged grows | T3 | flag unverifiable-inventory build-up |
-| Registry conflicts [V3-3] | any `oracle_green` vs `oracle_green` conflict; or contested-address count > 5% of registry `dat_typing` entries | T2 | page (green-green); relevance-filter review (contested growth) |
-| World-change starvation [V3-4] | run-state `waiting_world_change` while pending (never-attempted) units exist | T2 | bug: the selector must prefer pending work; page |
+| Registry conflicts [V3-3] | any `oracle_green` vs `oracle_green` conflict; or contested-address count > 5% of registry `dat_typing` entries | T2c | page (green-green); relevance-filter review (contested growth) |
+| World-change starvation [V3-4] | run-state `waiting_world_change` while pending (never-attempted) units exist | T2a | bug: the selector must prefer pending work; page |
+| Terminal `waiting_world_change` [V4-3] | zero pendings ∧ every red zero-delta | T2a | one §2.12(b) diagnosis per red, then page **with diagnoses attached** (a work order, not a stall report) |
+| Assembly-gate failure [V4-11] | any N-green link/instantiation failure (§2.13) | T2b | page + file conflicts against implicated registry entries/symbols |
+| Registry holdout agreement [V4-1] | agreement rate (holdout-derived vs registry, §2.11/F6) falling window-over-window | T2c | audit harvest + tier ladder; freeze advisory injection for the disagreeing symbol class |
 
 Expected post-T1 base rate is unknown until F1's window runs; the 3:1
 threshold is provisional and set from the first 30 post-T1 attempts.
@@ -497,10 +832,11 @@ Campaign-order estimate: **150–250 GPU-hours**, dominated by the depth cap and
 instant structural settling; the v1 figure (300–500) double-counted
 already-banked infra fixes. Extrapolation caveat unchanged: per-class green
 rates unmeasured. [V3-3/V3-4, directional, no invented numbers: registry
-injection can only reduce round counts if F6 holds (warmer starts on the 29%
-shared-`DAT_` class); world-changed gating eliminates the entire class of
-zero-delta retries, which v2 would have spent whole attempts on. Neither
-effect is quantified until the F2/F6 windows run.]
+injection can only reduce round counts if the registry is *correct* — which
+is now what F6's holdout agreement rate measures [V4-1], with first-build
+error count kept as the cheap warm-start ops signal; world-changed gating
+eliminates the entire class of zero-delta retries, which v2 would have spent
+whole attempts on. Neither effect is quantified until the F2/F6 windows run.]
 
 ## 7. Supervisor arbitration (requirement recorded; Phase 3, owner approval) [unchanged]
 
@@ -525,66 +861,109 @@ AGENTS.md (disable task; restore checklist).
   question feeds its sample, never the settle path.
 - **F5 (verification):** oracle re-runs failing at high rate on staged units ⇒
   verification must move earlier.
-- **F6 (registry injection [V3-3]):** injected units' first-build error counts
-  vs class baseline; regression ⇒ tighten relevance to exact-address matches.
-  Additionally: any injected entry that a unit had to *deviate from* to go
-  green is prima facie evidence the entry (or its tier) is wrong — audit it.
+- **F6 (registry holdout — redefined [V4-1], replaces the first-build-error
+  metric):** a deterministic 10% of units receive no injection; the
+  registry-correctness metric is the **agreement rate between holdout-derived
+  typings and registry entries** over shared symbols (§2.11). Falling
+  agreement ⇒ audit harvest/tier ladder and freeze advisory injection for the
+  disagreeing symbol class. First-build error count survives as an ops signal
+  only — it measured friction, and an echo chamber improves it while wrong.
+  Retained from v3: any injected *authoritative* entry a unit had to deviate
+  from to go green is prima facie evidence the entry (or its tier) is wrong —
+  audit it.
+- **F7 (post-mortem A/B [V4-4], new):** within world-changed retries, A/B the
+  post-mortem block on/off. Track conversion rate AND **resurrection rate** —
+  a `#define` that failed in attempt N re-emitted byte-identical in attempt
+  N+1. If the post-mortem arm converts no better, or resurrects more
+  (anchoring confirmed), the post-mortem is reduced to **diagnostics-only
+  phrased as prohibition** ("these lines were tried and failed; do not
+  re-emit them") and the failed-header carry is dropped.
 
-## 9. Migration [V3 re-scoped; T1 landed]
+## 9. Migration [V4-11 re-ordered: T2a → T2b → T2c; T1 + Tier-0 landed]
+
+The v3 tranche order put the registry first inside a monolithic T2. The
+review's re-order stands on two arguments: the small landed-code fixes (F9)
+close active §0.1 violations in code that is running the moment the port comes
+back online, and the assembly gate must exist **before** the registry so the
+registry's tiers are born with their empirical conflict detector already
+watching (§2.13). Registry last, in advisory mode.
 
 - **T1 — landed** (`src/port_wasm_units.py`): depth cap 4 + env
-  (`MAX_COMPILE_ITERS`); stage-aware stuck-abort (`classify_build_stage`,
+  (**`OGHIDRA_PORT_MAX_ITERS`** — v3 wrote the internal constant name
+  `MAX_COMPILE_ITERS` as the env var; that constant merely reads the env
+  [V4-9]); stage-aware stuck-abort (`classify_build_stage`,
   `diagnostic_fingerprint`, `is_stuck`, with the §2.5 exemption); clean
-  deduplicated feedback (`summarise_build_error`); malformed-reply re-ask +
-  unclosed-fence recovery; D14 fix; `-ferror-limit=0`; push-silence threshold
-  4 h in the existing cron.
-- **T2 — the information-monotone core [V3]:**
-  - *Registry module* (new file `src/port_knowledge_registry.py`: load/save,
-    `harvest(seed_text, final_header, unit_symbols, unit_name, tier)`,
-    `augment(seed_text, unit_symbols)`, `relevant_delta(unit_symbols,
-    since_version)`, conflict recording). Touch points in
-    `src/port_wasm_units.py`:
-    - `_process_unit` step 2 (header scaffold, ~line 995): after reading the
-      seed, call `augment()` with the unit symbol set (regex over the verbatim
-      text for `(PTR_)?DAT_[0-9a-fA-F]{8}` + prelude/export/callee
-      identifiers) and write the augmented header; record
-      `registry_version_used`.
-    - `_process_unit` step 5 (green/staged path, after artifact copy): call
-      `harvest()`; emit `registry_conflict` events; commit the registry file
-      with the unit's artifact commit (one push, G3-preserving).
-    - `SYSTEM_PROMPT`: add the registry-authoritative rule; introduce
-      `PROMPT_VERSION` constant recorded per attempt.
-    - post-applied-header check: injected-lines-survived string check;
-      `registry_deviation` event.
-  - *Post-mortem retry*: `_process_unit` already builds `rounds[]`; `_fail`
-    (~line 1310) persists `rounds`, best-round header path, final fingerprint,
-    error class, and `world_version` into the unit record; `_compile_fix`
-    prompt gains an optional post-mortem block on attempts ≥2.
-  - *World-changed gating*: `_next_unit` (~line 1420) skips reds whose
-    recorded `world_version` matches the current world and whose symbols
-    gained no registry entries; ordering = error-class-fix match, then
-    registry-delta size, then attempts+interruptions. `run()` writes
-    `waiting_world_change` run-state status when only such units remain (must
-    not report `EXIT_PROGRESSED`); `_work_remains` unchanged (reds are still
-    work).
-  - Carried from v2's T2: seed passthrough (tertiary, §2.3); conditional
-    carry (A/B under F2's new definition); oversize settle + preflight; run
-    budget; cumulative+per-attempt counters; pydantic state records; heartbeat
-    commit + 2 h threshold; verified/staged dashboard split; registry conflict
-    + starvation monitoring rows (§4).
-- **T3:** concrete-type structural classifier + F4 recheck; verification queue
-  subsystem; **question escalation (§2.12)** — targeted-symbol and diagnosis
-  prompts (cost-justified only after the registry has drained the failure
-  pool; each use is a ~16-min median call and the diagnosis question is
-  bounded to once per unit); supervisor arbitration + exit codes (with owner).
+  deduplicated feedback (`summarise_build_error`, default 1,200 chars /
+  call-site 2,000 [V4-9]); malformed-reply re-ask + unclosed-fence recovery;
+  D14 fix; `-ferror-limit=0`; push-silence threshold 4 h — cron ownership
+  caveat per §4 [V4-9].
+- **Tier-0 queue-generation fixes — landed [V4-2]** (OGhidra `05b94ea`,
+  GotYaForce `9fccede`): dual-separator `SKIP_PREFIXES`; non-C-identifier
+  export exclusion at generation + `wasm-units-skipped.json` report; queue
+  1520 → 1,396 units / 10,954 exports; `gnt4_shim_seed.h` integer seed
+  (PoC seed untouched); `port_queue_fill --rebuild` + `port_queue_migrate`
+  (15 verdicts carried, 6 recorded); 49 tests green.
+- **T2a — small landed-code fixes + honest gating [V4-9, V4-3, V4-4, V4-2]:**
+  - second-consecutive `no_new_header` ends the attempt, or the follow-up
+    call carries reply-shape evidence (§2.5 — kills the surviving same-input
+    round at `src/port_wasm_units.py:1055-1064`);
+  - settle-through-journal rule + `verdict_migrated`-class events (§2.9;
+    mirrored in `AGENTS.md`);
+  - **world-hash gating** (§2.8): `_fail` records the mechanical world-hash +
+    symbol set + error class; `_next_unit` skips zero-delta reds; ordering =
+    error-class match, registry-delta size, attempts. Regression test: the
+    two context-budget reds (`auto-c0000-017`, `auto-c0001-000`) must be
+    schedulable under the serving-config component;
+  - **terminal protocol** (§2.8): one §2.12(b) diagnosis per zero-delta red
+    at queue exhaustion; `run_state` field
+    (`progressing | waiting_world_change | provider_paused`); page with
+    diagnoses attached; no new exit codes;
+  - *post-mortem data capture* (§2.3 [V4-4]): `rounds[]` gains normalized
+    diagnostic sets + fingerprints; per-attempt best-header snapshots under
+    attempt-scoped filenames; `_fail` persists rounds, best-header path,
+    final fingerprint, error class; `_compile_fix` gains the post-mortem
+    block on attempts ≥2 (A/B-flagged for F7);
+  - `product_priority` sort key on the queue (§2.14) — generator assigns,
+    `_next_unit` orders by `(product_priority, chunk_order)`.
+- **T2b — continuous assembly gate (§2.13) [V4-11]:** header-merge tool
+  (reusing §2.11's merge precedence rules), N-green single-invocation `emcc`
+  link with shared arena + prelude-signature extern dedup, node instantiation
+  smoke, page + conflict filing on failure. Ships before the registry
+  deliberately: the gate is meaningful with zero registry entries (it links
+  whatever greens exist), and it is the empirical detector the registry's
+  tier ladder depends on.
+- **T2c — registry, advisory mode (§2.11) [V4-1, V4-5, V4-6, V4-7, V4-8]:**
+  new file `src/port_knowledge_registry.py` (load/save;
+  `harvest(...)` with the seed-inherited and callee-stub exclusions;
+  `augment(...)` as seed/prelude-aware merge; `relevant_delta(...)`; conflict
+  recording; re-tier/demote/revoke). Touch points in `src/port_wasm_units.py`:
+  `_process_unit` step 2 calls `augment()` and records
+  `registry_version_used`; step 5 (green/staged) calls `harvest()`, emits
+  `registry_conflict`, commits the registry with the unit's artifact commit
+  (one push, G3-preserving); `SYSTEM_PROMPT` gains the oracle-tier
+  authoritative rule + advisory-block wording and a `PROMPT_VERSION` constant
+  recorded per attempt; post-applied-header **semantic** survival check
+  (oracle-tier entries only) + `registry_deviation` event; **gitignore
+  negation exception + registry-path trackability test [V4-8]**; 10% holdout
+  assignment (F6). Carried from v2's T2: seed passthrough (tertiary, §2.3);
+  conditional carry (A/B under F2/F7); oversize settle + preflight; run
+  budget; cumulative+per-attempt counters; pydantic state records; heartbeat
+  commit + 2 h threshold; verified/staged dashboard split; §4 monitoring rows.
+- **T3 — unchanged scope:** concrete-type structural classifier + F4 recheck;
+  verification queue subsystem (now also the promotion driver for [V4-7]
+  re-tiering); **question escalation (§2.12)** — targeted-symbol and the
+  general diagnosis lane (the terminal-protocol trigger shipped in T2a);
+  supervisor arbitration + exit codes (with owner).
 
-Each tranche ships behind the cooperative driver recycle; F1–F6 windows run
+Each tranche ships behind the cooperative driver recycle; F1–F7 windows run
 before the next tranche.
 
-## 10. Goals traceability [V3-7]
+## 10. Goals traceability [V3-7; updated V4-11]
 
 Every mechanism traces to a goal; every goal traces to mechanisms — and no
-goal traces to a disclaimer.
+goal traces to a disclaimer. [V4-11] G1's **interim mechanism is the
+continuous assembly gate (§2.13, T2b)** — a running gate from the first N
+greens, not a futures-only workstream.
 
 | Mechanism | G1 | G2 | G3 | G4 |
 |---|---|---|---|---|
@@ -598,18 +977,20 @@ goal traces to a disclaimer.
 | §2.8 world-changed retry gating | | ✓ | | ✓ |
 | §2.9 budgets, run-state outcomes, counters | | | ✓ | |
 | §2.10 transient I/O retryable | | ✓ | | |
-| §2.11 knowledge registry (harvest/inject/conflict) | ✓ | ✓ | | |
+| §2.11 knowledge registry (advisory harvest/merge-inject/conflict/re-tier) | ✓ | ✓ | | |
 | §2.12 different-question escalation | | ✓ | | ✓ |
+| §2.13 continuous assembly gate [V4-11] | ✓ | | | ✓ |
+| §2.14 product-gap queue ordering [V4-2] | ✓ | ✓ | | |
 | §3 verification queue + assembly-by-construction | ✓ | | | |
 | §4 monitoring invariants (incl. conflict + starvation rows) | | | ✓ | ✓ |
 | commit-per-match + registry co-commit + heartbeat commit | | | ✓ | |
 
 | Goal | Served by |
 |---|---|
-| G1 playable, buildable game | §2.11 registry as assembly ledger; §3 verification queue, flat-memory composition plan, conflict report by construction |
-| G2 steady progress, no dead ends | §2.1–§2.6, §2.8 gating (no zero-delta retries), §2.10, §2.11 warmer starts, §2.12 cheaper questions |
-| G3 pushes are the heartbeat | §2.9 run-state outcomes + counters; §4 push-silence + starvation invariants; registry co-commit with unit commits |
-| G4 dead ends killed fast, provably | §2.2 stuck-abort, §2.7 provable settling + F4, §2.8 not-scheduling unchanged-world retries, §2.12 diagnosis (conservative feed), §4 reds:greens page |
+| G1 playable, buildable game | **§2.13 continuous assembly gate — the interim mechanism [V4-11]**; §2.14 product-gap ordering; §2.11 registry as assembly ledger; §3 verification queue, flat-memory composition plan, conflict report by construction |
+| G2 steady progress, no dead ends | §2.1–§2.6, §2.8 gating (no zero-delta retries; terminal protocol ends the wait decidably), §2.10, §2.11 warmer starts, §2.12 cheaper questions, §2.14 highest-value-first |
+| G3 pushes are the heartbeat | §2.9 run-state outcomes + counters + settle-through-journal rule [V4-9]; §4 push-silence + starvation invariants; registry co-commit with unit commits |
+| G4 dead ends killed fast, provably | §2.2 stuck-abort, §2.5 no-header attempt end [V4-9], §2.7 provable settling + F4, §2.8 not-scheduling unchanged-world retries, §2.12 diagnosis (conservative feed), §2.13 gate failures paged at N-greens not at assembly, §4 reds:greens page |
 
 ## Changelog v2 → v3
 
@@ -635,3 +1016,53 @@ goal traces to a disclaimer.
 - Evidence base (§1) and cost model (§6) numbers re-verified against v2's
   recomputation and kept unchanged; v3 adds no new measurements, only
   directional claims gated by F2/F6.
+
+## Changelog v3 → v4 (applying the adversarial review v3 failed; [V4-#] = finding #)
+
+- **[V4-1] BLOCKING — registry echo chamber resolved.** §2.11 rewritten:
+  `compile_only` entries inject as ADVISORY commented blocks (no do-not-alter
+  rule, no survival check); authoritative injection reserved for
+  `oracle_green`; independent derivation is the conflict detector. Harvest
+  redefined (evidence-linked to the unit's verbatim `.c`, excluding
+  seed-inherited content and callee stubs) so the oracle tier is populatable
+  without importing PoC structural stubs. F6 replaced by the 10% no-injection
+  holdout with agreement rate as the correctness metric.
+- **[V4-2]** Tier-0 queue fixes recorded as landed (status header; queue
+  1520 → 1,396 / 10,954); §2.14 added: `product_priority` sort key ordering
+  the queue toward strategy-doc option C's family/action-slot gaps.
+- **[V4-3]** §2.8: declared `fix_ledger_version` replaced by a mechanical
+  world-hash (serving config, toolchain, driver rev, prompt, registry);
+  terminal `waiting_world_change` protocol (one diagnosis per zero-delta red,
+  page with diagnoses); `run_state` field semantics named; the two
+  context-budget reds encoded as the schedulability regression test.
+- **[V4-4]** §2.3 coherence fix: a post-mortem never licenses scheduling
+  (world-delta does; post-mortem is prompt content); T2a data spec —
+  `rounds[]` normalized diagnostic sets + fingerprints, attempt-scoped
+  best-header snapshots; new falsifier F7 (post-mortem A/B, conversion +
+  resurrection rate; anchoring ⇒ diagnostics-only-as-prohibition, drop the
+  failed-header carry).
+- **[V4-5]** Injection is a seed/prelude-aware merge: replace covered seed
+  lines, never duplicate, skip prototypes the prelude declares (recorded as
+  pending conflicts).
+- **[V4-6]** Survival check is semantic (normalized macro token-sequences /
+  signatures on re-parse), and applies only to `oracle_green` entries.
+- **[V4-7]** Registry re-tier/demote/revoke semantics: promotion recomputes
+  conflicts; a failed oracle re-run downgrades/removes the unit's harvested
+  entries (with tombstones); every move bumps `version`.
+- **[V4-8]** Registry path is inside a wholesale-gitignored directory:
+  negation exception + trackability test, named in T2c scope.
+- **[V4-9]** Landed-code and doc corrections: second-consecutive
+  `no_new_header` ends the attempt (kills the same-input round at
+  `port_wasm_units.py:1055-1064`, T2a); env var is `OGHIDRA_PORT_MAX_ITERS`;
+  summarise budgets 1,200 default / 2,000 call-site; greens count stated
+  precisely (12 live green / 16 historical verdicts); cron ownership caveat
+  (rig-side, landed-by-report); the 2026-08-20 out-of-band migration recorded
+  as precedent and the settle-through-journal rule added (§2.9, AGENTS.md).
+- **[V4-10]** Injection bloat bound written down: ~300 tokens median, ~2k
+  worst case, plus the per-round output-regurgitation cost; no cap needed.
+- **[V4-11]** §2.13 added: continuous assembly gate (single-`emcc` link of the
+  last N greens, merged headers, shared arena, prelude-signature extern
+  dedup, node loadability smoke) — THE interim G1 mechanism (§10) and the
+  registry's empirical conflict detector. Tranches re-ordered: **T2a** small
+  fixes + world-hash gating + terminal protocol, **T2b** assembly gate,
+  **T2c** registry advisory-mode, **T3** unchanged.
