@@ -41,7 +41,23 @@ GLOBAL_REF = re.compile(
 CALLEE = re.compile(r"\b((?:zz_[0-9a-f]+_|FUN_[0-9a-f]{8}))\s*\(")
 QUEUE_DEFAULT = "research/decomp/generated/finish-game-port/wasm-units.json"
 HEADER_DIR = "research/decomp/generated/finish-game-port/headers"
-CORE_SEED = "research/decomp/poc/wasm-port-poc/gnt4_shim.h"
+# Generator's OWN seed: integer undefined8/CONCAT44, matching the driver's
+# SYSTEM_PROMPT. The PoC seed (research/decomp/poc/wasm-port-poc/gnt4_shim.h)
+# keeps its double-form CONCAT44 for the committed PoC units and is NOT used
+# here — handing the model a seed that contradicts the prompt cost a model
+# round per unit just to undo the typedef.
+CORE_SEED = "research/decomp/generated/finish-game-port/gnt4_shim_seed.h"
+
+# emcc -sEXPORTED_FUNCTIONS can only export C identifiers. Ghidra-export
+# markers also carry truncated demangled C++ ("cCameraManager::HasCamera(...")
+# and hyphenated SDK names; those must never reach a unit's export list
+# (the driver's runtime filter in port_wasm_units.py stays as a guard).
+C_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def is_c_identifier(name: str) -> bool:
+    """True when `name` can be an emcc EXPORTED_FUNCTIONS symbol."""
+    return bool(C_IDENTIFIER.fullmatch(name))
 
 WIDTH_BY_PREFIX = {
     "FLOAT": "GC_F32",
