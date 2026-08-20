@@ -26,6 +26,7 @@ import json
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -67,6 +68,8 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 QUEUE_SCHEMA = 1
 STATE_SCHEMA = 1
 MAX_COMPILE_ITERS = 8
+# emcc exports must be C identifiers; C++ signatures are not.
+EXPORT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 BUILD_TIMEOUT_SECONDS = 600
 ORACLE_TIMEOUT_SECONDS = 1800
 # Post-link import whitelist (POC finding: a missing CONCAT44 linked "fine" as a
@@ -561,7 +564,18 @@ class WasmUnitDriver:
     ) -> tuple[bool, str]:
         bash = resolve_bash()
         emsdk = self.repo_root / "research/tools/emsdk"
-        exports_flag = ",".join("_" + name for name in exports)
+        # A demangled C++ export (`cCameraManager::HasCamera(cBaseCamera*)`) took
+        # auto-c0000-011's whole build down with a bash syntax error on 2026-08-20:
+        # '(' opened a subshell, and the ',' split one symbol into two invalid ones.
+        # emcc can only export C identifiers, so anything else is dropped -- loudly,
+        # since a silently missing export becomes a confusing link failure later.
+        valid, dropped = [], []
+        for name in exports:
+            (valid if EXPORT_NAME.fullmatch(name) else dropped).append(name)
+        if dropped:
+            print(f"  skipping {len(dropped)} non-identifier export(s): "
+                  f"{', '.join(dropped[:3])}{' ...' if len(dropped) > 3 else ''}")
+        exports_flag = ",".join("_" + name for name in valid)
         # Paths converted in Python (no cygpath dependency), and the emsdk
         # source is NOT silenced: a toolchain that failed to load must name
         # itself rather than surface as a bare "emcc: command not found"
@@ -583,7 +597,7 @@ class WasmUnitDriver:
             "-Wno-incompatible-pointer-types -Wno-pointer-sign "
             "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
             "-sALLOW_MEMORY_GROWTH=0 "
-            f"-sEXPORTED_FUNCTIONS={exports_flag} "
+            f"-sEXPORTED_FUNCTIONS={shlex.quote(exports_flag)} "
             "-o unit.wasm"
         )
         completed = subprocess.run(
