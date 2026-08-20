@@ -146,6 +146,8 @@ SAMPLING = {
 }
 
 CODE_BLOCK = re.compile(r"```(?:c|cpp|h)?\s*\n(.*?)```", re.S)
+# An opening fence with no terminator: the model stopped before closing it.
+OPEN_FENCE = re.compile(r"```(?:c|cpp|h)?[ \t]*\n")
 
 
 def resolve_node_exe() -> str:
@@ -577,6 +579,17 @@ class WasmUnitDriver:
         )
         matches = CODE_BLOCK.findall(reply or "")
         if not matches:
+            # An UNCLOSED fence is recoverable and common: auto-c0001-001 emitted
+            # 7,466 chars of correct header behind a ```c that was never closed,
+            # and the entire round was discarded over a missing terminator. Take
+            # the body anyway -- if it is truly truncated the next compile names
+            # the error and the loop iterates, which beats losing the round.
+            opened = OPEN_FENCE.search(reply or "")
+            if opened and (reply or "").count("```") == 1:
+                body = (reply or "")[opened.end():].strip()
+                if body:
+                    self._last_reply_shape = None
+                    return body
             # Keep the shape of the reply: "no code block" with no evidence is
             # unactionable, and the interesting cases (refusal, prose, unfenced
             # header, truncation) are indistinguishable without it.

@@ -323,3 +323,35 @@ void caller(void) {
 }
 """
     assert void_result_contradictions(source) == []
+
+
+def test_unclosed_fence_is_recovered():
+    """A ```c with no terminator still carries a usable header.
+
+    auto-c0001-001 emitted 7,466 chars of correct header behind an unclosed
+    fence and the whole round was discarded over the missing terminator.
+    """
+    from src.port_wasm_units import CODE_BLOCK, OPEN_FENCE
+
+    reply = "```c\ntypedef unsigned long long undefined8;\nextern void zz_1_(short s);"
+    assert CODE_BLOCK.findall(reply) == []          # the old path finds nothing
+    opened = OPEN_FENCE.search(reply)
+    assert opened is not None and reply.count("```") == 1
+    body = reply[opened.end():].strip()
+    assert body.startswith("typedef unsigned long long undefined8;")
+
+
+def test_closed_fence_still_uses_the_normal_path():
+    from src.port_wasm_units import CODE_BLOCK
+
+    reply = "here you go\n```c\nint a;\n```\n"
+    assert CODE_BLOCK.findall(reply) == ["int a;\n"]
+
+
+def test_multi_block_reply_is_not_treated_as_unclosed():
+    """The guard is `exactly one fence`, so well-formed replies never hit it."""
+    from src.port_wasm_units import CODE_BLOCK
+
+    reply = "```c\nint a;\n```\nand\n```c\nint b;\n```\n"
+    assert reply.count("```") == 4
+    assert len(CODE_BLOCK.findall(reply)) == 2
