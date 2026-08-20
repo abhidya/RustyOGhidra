@@ -112,6 +112,22 @@ open to interpretation, and getting one wrong cascades through the whole file:
     typedef unsigned long long  ulonglong;
     typedef long long           longlong;
 
+Ghidra's pseudo-operations are pure INTEGER bit manipulation. They never
+return floating point, even when the surrounding code converts to double:
+
+    CONCAT44(hi, lo)  = ((unsigned long long)(unsigned int)(hi) << 32)
+                        | (unsigned int)(lo)
+    CONCAT13(hi, lo)  = ((unsigned int)(unsigned char)(hi) << 24)
+                        | ((lo) & 0xFFFFFF)
+    SUBxy(v, n)       = the y low-order bytes of v starting at byte offset n
+    ZEXTxy(v)         = zero-extend v to y bytes
+    SEXTxy(v)         = sign-extend v to y bytes
+
+`(double)(CONCAT44(0x43300000, x) ^ 0x80000000) - 4503599627370496.0` is the
+standard PowerPC int->double idiom. The xor and the cast belong to the CALLER;
+do NOT fold them into CONCAT44. A CONCAT that returns double makes the xor
+illegal ('invalid operands to binary expression') and the unit cannot compile.
+
 Function signatures must be read off the CALL SITES in the .c file, which is
 verbatim decompiler output and authoritative. If a call passes 16 arguments,
 declare 16 parameters; if a result is assigned, the return type must not be
