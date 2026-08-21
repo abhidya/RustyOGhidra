@@ -68,6 +68,7 @@ from src.port_knowledge_registry import (
     is_holdout,
     load_registry,
     prelude_prototypes,
+    record_surviving_deviations,
     registry_version,
     relevant_delta,
     save_registry,
@@ -1479,6 +1480,10 @@ class WasmUnitDriver:
         record["prompt_version"] = PROMPT_VERSION
         holdout = is_holdout(name)
         record["registry_holdout"] = holdout
+        # Deviations are ATTEMPT-scoped: a stale list from a previous attempt
+        # (different injection set) must never be folded into conflicts by
+        # this attempt's step 5b (review F1 fold-in).
+        record["registry_deviations"] = []
         authoritative_injected: list[dict[str, Any]] = []
         advisory_injected_count = 0
         registry = self._registry()
@@ -1828,10 +1833,24 @@ class WasmUnitDriver:
                 unit_c_text=unit_c,
                 holdout=holdout,
             )
-            if harvest.changed:
+            # Review F1: fold SURVIVING deviations into conflicts[] -- both
+            # pieces are in hand here (the round-recorded deviations and the
+            # registry). check_survival fired registry_deviation during the
+            # loop; a deviation the unit went green with is dissent the
+            # ledger must carry, or later units keep receiving the
+            # possibly-wrong authoritative line with zero recorded doubt.
+            # (harvest_unit already files re-expressions it can parse; this
+            # dedups against those and adds the deletion/unparseable cases.)
+            deviation_fold = record_surviving_deviations(
+                registry,
+                unit_name=name,
+                tier=TIER_COMPILE_ONLY if compile_only else TIER_ORACLE_GREEN,
+                deviations=record.get("registry_deviations") or [],
+            )
+            if harvest.changed or deviation_fold.changed:
                 self._save_registry(registry)
                 registry_rel = REGISTRY_RELPATH
-            for conflict in harvest.new_conflicts:
+            for conflict in harvest.new_conflicts + deviation_fold.new_conflicts:
                 payload = {
                     "unit": name,
                     "key": conflict.get("key"),
@@ -1841,6 +1860,7 @@ class WasmUnitDriver:
                     "against_tier": conflict.get("against_tier"),
                     "contested": conflict.get("contested"),
                     "green_green": conflict.get("green_green"),
+                    "deviation": conflict.get("deviation", False),
                 }
                 self.events.emit("registry_conflict", **payload)
                 if conflict.get("green_green"):
@@ -1848,14 +1868,15 @@ class WasmUnitDriver:
                     # units disagreeing on one symbol's typing is a real
                     # program-semantics finding -- page the owner.
                     self.events.emit("registry_green_green_conflict", **payload)
-            if harvest.changed:
+            if harvest.changed or deviation_fold.changed:
                 self.events.emit(
                     "registry_harvested",
                     unit=name,
-                    registry_version=harvest.version,
+                    registry_version=registry_version(registry),
                     added=len(harvest.added),
                     agreed=len(harvest.agreed),
-                    conflicts=len(harvest.new_conflicts),
+                    conflicts=len(harvest.new_conflicts)
+                    + len(deviation_fold.new_conflicts),
                 )
         except Exception as error:  # noqa: BLE001 - harvest never fails a unit
             self.events.emit(

@@ -744,6 +744,34 @@ parked here so they are not lost:
   after regressions it overstates current composability. Dashboards must read
   `last_run` for current truth, `largest_n_passed` only as best-ever.
 
+**T2c review follow-ups (2026-08-20 adversarial review of the registry).**
+The required findings are fixed in code: surviving deviations of
+authoritative lines (deletion or re-expression included) now fold into
+`conflicts[]` at green/staged, DAT-shaped `var_decl` chunks are harvested so
+macro-vs-variable typing divergence is detected generally, and
+`_replace_in_seed` consumes backslash continuations (a multi-line `#define`
+— the shape every live seed's CONCAT44 has — is replaced as one logical
+line, never leaving an orphaned continuation). One tightening is
+implemented, two minors recorded:
+
+- **Agreement never raises tier [implemented].** Harvest's agreement branch
+  previously promoted `compile_only` → `oracle_green` when one
+  oracle-verified unit merely ADOPTED the advisory hint — bypassing
+  [V4-7]'s promotion-recompute, so an adopted guess became do-not-alter law
+  after a single pass (the review's closest residual echo path).
+  Adoption-derived agreement now records evidence only; promotion to
+  `oracle_green` happens solely through the explicit promote path.
+- **F5 (advisory, not implemented): corrupt-registry fallback runs
+  `relevant_delta` cold.** When the registry file is unreadable the driver
+  degrades to an empty in-memory registry, so the §2.8 per-unit delta gate
+  computes against nothing. Tolerable only because `registry_unreadable`
+  pages the owner; do not let the fallback become silent.
+- **F6 (advisory, not implemented): augment-time version bumps are saved to
+  disk but committed only with the next harvest commit.** A
+  prelude-vs-registry pending conflict bumps `version` and saves the file at
+  unit START; the git audit trail catches up at the next green's co-commit,
+  so between those points the working tree is ahead of history.
+
 ### 2.14 Queue ordering toward product gaps — G1, G2 [V4-2, new]
 
 The Tier-0 fixes (status header) corrected what the queue *contains*; this

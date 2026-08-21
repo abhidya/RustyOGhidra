@@ -934,3 +934,244 @@ def test_registry_delta_reopens_only_reds_it_touches(tmp_path, monkeypatch):
     state = json.loads(state_path.read_text())
     picked = third._next_unit([{"name": "unit-a"}], state, set())
     assert picked is not None and picked["name"] == "unit-a"
+
+
+# ===========================================================================
+# 2026-08-20 T2c adversarial-review regressions (F1-F4)
+
+from src.port_knowledge_registry import record_surviving_deviations  # noqa: E402
+
+
+def test_f1_surviving_deletion_becomes_conflict_at_harvest():
+    """Review F1, deletion shape: the model DELETES the injected authoritative
+    macro outright. check_survival fires (found=None); harvest_candidates sees
+    no chunk for the symbol, so harvest alone files nothing -- the fold-in
+    must turn the surviving deviation into a conflict record, or later units
+    keep receiving the possibly-wrong line with zero recorded dissent."""
+    registry = _registry_with(_entry(tier=TIER_ORACLE_GREEN, macro=MACRO_INT))
+    augmented = augment_seed(
+        registry, unit_name="unit-b", seed_text=SEED, symbols={DAT_SYM}
+    )
+    assert MACRO_INT in augmented.header_text  # actively injected
+    final_header = SEED  # the macro is gone entirely
+    deviations = check_survival(augmented.authoritative, final_header)
+    assert deviations and deviations[0]["found"] is None
+    harvest = harvest_unit(
+        registry,
+        unit_name="unit-b",
+        tier=TIER_COMPILE_ONLY,
+        seed_text=augmented.header_text,
+        header_text=final_header,
+        unit_c_text=UNIT_C,
+    )
+    assert DAT_KEY not in [c.get("key") for c in harvest.new_conflicts]
+    version_before = registry_version(registry)
+    fold = record_surviving_deviations(
+        registry, unit_name="unit-b", tier=TIER_COMPILE_ONLY, deviations=deviations
+    )
+    entry = registry["entries"][DAT_KEY]
+    assert fold.changed and fold.new_conflicts
+    assert fold.new_conflicts[0]["deviation"] is True
+    assert fold.new_conflicts[0]["key"] == DAT_KEY
+    unit_b_conflicts = [c for c in entry["conflicts"] if c.get("unit") == "unit-b"]
+    assert len(unit_b_conflicts) == 1
+    assert registry_version(registry) > version_before  # gating sees it
+    assert entry["macro"] == MACRO_INT  # presentation untouched: dissent, no flip
+    # idempotent: re-folding the same deviation files nothing new
+    again = record_surviving_deviations(
+        registry, unit_name="unit-b", tier=TIER_COMPILE_ONLY, deviations=deviations
+    )
+    assert not again.changed
+    assert len([c for c in entry["conflicts"] if c.get("unit") == "unit-b"]) == 1
+
+
+def test_f1_var_decl_re_expression_is_detected_by_harvest():
+    """Review F1, re-expression shape: the model re-expresses the DAT symbol
+    as a variable declaration (`extern unsigned short DAT_...;`) -- the
+    parser's var_decl kind. Harvest must now catch macro-vs-variable typing
+    divergence generally, and check_survival must report the found form
+    instead of found=None."""
+    registry = _registry_with(_entry(tier=TIER_ORACLE_GREEN, macro=MACRO_INT))
+    augmented = augment_seed(
+        registry, unit_name="unit-b", seed_text=SEED, symbols={DAT_SYM}
+    )
+    var_decl = "extern unsigned short DAT_802c44f8;"
+    final_header = SEED + var_decl + "\n"
+    deviations = check_survival(augmented.authoritative, final_header)
+    assert deviations and deviations[0]["found"] is not None
+    assert "extern" in deviations[0]["found"]
+    harvest = harvest_unit(
+        registry,
+        unit_name="unit-b",
+        tier=TIER_COMPILE_ONLY,
+        seed_text=augmented.header_text,
+        header_text=final_header,
+        unit_c_text=UNIT_C,
+    )
+    entry = registry["entries"][DAT_KEY]
+    # the harvest itself files the divergence now (var_decl chunk harvested)
+    assert any(c.get("unit") == "unit-b" for c in entry["conflicts"])
+    assert harvest.new_conflicts and harvest.new_conflicts[0]["key"] == DAT_KEY
+    assert entry["macro"] == MACRO_INT  # oracle_green presentation unchanged
+    # the fold-in dedups against the harvest-filed conflict: no double record
+    record_surviving_deviations(
+        registry, unit_name="unit-b", tier=TIER_COMPILE_ONLY, deviations=deviations
+    )
+    assert len([c for c in entry["conflicts"] if c.get("unit") == "unit-b"]) == 1
+
+
+def test_f1_driver_folds_surviving_deletion_into_conflicts(tmp_path, monkeypatch):
+    """Review F1 end-to-end: unit goes green having DELETED the authoritative
+    line; step 5b must file the conflict and emit a registry_conflict event
+    (deviation=True) -- before the fix the deviation event fired and then
+    nothing reached the ledger."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    monkeypatch.setenv("OGHIDRA_PORT_REGISTRY_HOLDOUT_PCT", "0")
+    repo = _write_repo(tmp_path)
+    save_registry(
+        _registry_file(repo),
+        _registry_with(_entry(tier=TIER_ORACLE_GREEN, macro=MACRO_INT)),
+    )
+    builds = []
+
+    def flaky_build(workdir, exports, extra=None):
+        builds.append((workdir / "gnt4_shim.h").read_text())
+        if len(builds) == 1:
+            return False, "error: something"
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        build_runner=flaky_build,
+        llm=_HeaderLLM(SEED),  # deletes the authoritative line entirely
+    )
+    assert driver.run() == EXIT_NO_WORK  # deviation never costs the green
+    assert MACRO_INT in builds[0]  # it WAS injected
+    assert MACRO_INT not in builds[1]  # and then deleted
+    events = _events(repo)
+    assert any(e.get("kind") == "registry_deviation" for e in events)
+    conflicts = [e for e in events if e.get("kind") == "registry_conflict"]
+    assert any(e.get("deviation") for e in conflicts)
+    registry = load_registry(_registry_file(repo))
+    entry = registry["entries"][DAT_KEY]
+    assert any(c.get("unit") == "unit-a" for c in entry["conflicts"])
+
+
+def test_f2_replace_in_seed_consumes_backslash_continuations():
+    """Review F2: every live seed carries `#define CONCAT44(hi, lo) \\` with
+    its body on the next physical line. Replacing only the first physical
+    line orphans the continuation as a stray expression -- the augmented
+    header must stay syntactically whole (one macro chunk, no orphan)."""
+    seed = (
+        SEED
+        + "#define CONCAT44(hi, lo) \\\n"
+        + "  (((unsigned long long)(unsigned int)(hi) << 32) | (unsigned int)(lo))\n"
+        + "int zz_tail_marker_(void);\n"
+    )
+    registry = empty_registry()
+    registry["version"] = 1
+    registry["entries"]["macro:CONCAT44"] = {
+        "kind": "pseudo_op",
+        "symbol": "CONCAT44",
+        "macro": (
+            "#define CONCAT44(hi,lo) (((unsigned long long)(unsigned int)(hi)"
+            " << 32) | (unsigned int)(lo))"
+        ),
+        "tier": TIER_ORACLE_GREEN,
+        "source_units": ["unit-earlier"],
+        "source_tiers": {"unit-earlier": TIER_ORACLE_GREEN},
+        "contested": False,
+        "conflicts": [],
+        "updated_version": 1,
+    }
+    result = augment_seed(
+        registry, unit_name="unit-a", seed_text=seed, symbols={"CONCAT44"}
+    )
+    header = result.header_text
+    assert result.authoritative
+    # no dangling continuation and no orphaned macro body as a stray expression
+    assert not any(line.rstrip().endswith("\\") for line in header.splitlines())
+    orphans = [
+        line
+        for line in header.splitlines()
+        if line.lstrip().startswith("(((unsigned long long)")
+    ]
+    assert orphans == []
+    defines = [
+        line
+        for line in header.splitlines()
+        if line.strip().startswith("#define CONCAT44")
+    ]
+    assert len(defines) == 1 and "<< 32" in defines[0]
+    # the parser agrees the header is whole: exactly one CONCAT44 macro chunk,
+    # and the old body did not survive as a var_decl/directive orphan chunk
+    from src.port_assembly_gate import parse_header_chunks
+
+    chunks = parse_header_chunks(header)
+    concat = [c for c in chunks if c.symbol == "CONCAT44"]
+    assert len(concat) == 1 and concat[0].kind == "macro"
+    assert not any("<< 32" in c.text for c in chunks if c.symbol != "CONCAT44")
+    # the tail of the seed survived the splice
+    assert any(c.symbol == "zz_tail_marker_" for c in chunks)
+
+
+def test_f3_adoption_agreement_never_raises_tier():
+    """Review F3: one oracle-verified unit ADOPTING the advisory hint must
+    not promote the entry to oracle_green (do-not-alter law after a single
+    pass would bypass [V4-7]'s promotion-recompute). Agreement records
+    evidence; only the explicit promote path moves the tier."""
+    registry = _registry_with(_entry(macro=MACRO_INT))  # compile_only
+    augmented = augment_seed(
+        registry, unit_name="unit-b", seed_text=SEED, symbols={DAT_SYM}
+    )
+    result = harvest_unit(
+        registry,
+        unit_name="unit-b",
+        tier=TIER_ORACLE_GREEN,
+        seed_text=augmented.header_text,
+        header_text=augmented.header_text + "\n" + MACRO_INT + "\n",
+        unit_c_text=UNIT_C,
+    )
+    entry = registry["entries"][DAT_KEY]
+    assert DAT_KEY in result.agreed
+    assert "unit-b" in entry["source_units"]  # evidence recorded
+    assert entry["source_tiers"]["unit-b"] == TIER_ORACLE_GREEN
+    assert entry["tier"] == TIER_COMPILE_ONLY  # tier NOT raised by adoption
+    # the explicit promote path still works, with its conflict recompute
+    promoted = promote_unit_entries(registry, "unit-b")
+    assert DAT_KEY in promoted.promoted
+    assert entry["tier"] == TIER_ORACLE_GREEN
+
+
+def test_f4_supersede_resets_holdout_sources():
+    """Review F4: the new_wins branch resets source_units/source_tiers; the
+    holdout ledger must reset with them, not accumulate stale attributions."""
+    registry = _registry_with(
+        _entry(macro=MACRO_INT, holdout_sources=["unit-earlier"])
+    )
+    harvest_unit(
+        registry,
+        unit_name="unit-green",
+        tier=TIER_ORACLE_GREEN,
+        seed_text=SEED,
+        header_text=SEED + MACRO_CHAR + "\n",
+        unit_c_text=UNIT_C,
+    )
+    entry = registry["entries"][DAT_KEY]
+    assert entry["source_units"] == ["unit-green"]
+    assert "holdout_sources" not in entry  # stale ledger cleared with the reset
+    # a HOLDOUT superseder is attributed fresh, not appended after the stale one
+    registry2 = _registry_with(
+        _entry(macro=MACRO_INT, holdout_sources=["unit-earlier"])
+    )
+    harvest_unit(
+        registry2,
+        unit_name="unit-holdout",
+        tier=TIER_ORACLE_GREEN,
+        seed_text=SEED,
+        header_text=SEED + MACRO_CHAR + "\n",
+        unit_c_text=UNIT_C,
+        holdout=True,
+    )
+    assert registry2["entries"][DAT_KEY]["holdout_sources"] == ["unit-holdout"]

@@ -335,6 +335,17 @@ def harvest_candidates(
                 continue
             push(KIND_PROTOTYPE, chunk.symbol, chunk.text, derivation="call_site")
             continue
+        if chunk.kind == "var_decl" and _DAT_NAME.match(chunk.symbol):
+            # Review F1: a unit that re-expresses a DAT symbol as a VARIABLE
+            # declaration (`extern unsigned short DAT_...;`) has made a typing
+            # decision every bit as consequential as a macro -- and one that
+            # diverges from the flat-memory absolute-address model. Harvesting
+            # it lets the normal disagreement machinery detect macro-vs-
+            # variable typing divergence instead of silently dropping it.
+            if ("var_decl", f"{chunk.symbol}|{_macro_normal(chunk.text)}") in inherited:
+                continue
+            push(KIND_DAT, chunk.symbol, chunk.text, derivation="var_decl")
+            continue
 
     # Definition-derived prototypes: the prelude prototype of a function the
     # unit DEFINES comes from Ghidra's own signature for the defining chunk --
@@ -445,8 +456,12 @@ def harvest_unit(
                 entry.setdefault("source_tiers", {})[unit_name] = tier
                 if holdout:
                     entry.setdefault("holdout_sources", []).append(unit_name)
-                if TIER_RANK.get(tier, 0) > TIER_RANK.get(entry.get("tier", TIER_SEED), 0):
-                    entry["tier"] = tier
+                # Review F3 tightening: agreement records EVIDENCE but never
+                # raises tier. An oracle-verified unit that merely ADOPTED the
+                # advisory hint would otherwise promote the entry to
+                # oracle_green in one pass, bypassing [V4-7]'s
+                # promotion-recompute -- the closest residual echo path. Tier
+                # promotion happens only through promote_unit_entries.
                 touched_keys.add(key)
             result.agreed.append(key)
             continue
@@ -517,8 +532,13 @@ def harvest_unit(
                 entry["derivation"] = derivation
             entry["harvested_at"] = now
             entry["contested"] = False
+            # Review F4: supersede resets source_units/source_tiers, so the
+            # holdout ledger must reset with them -- appending would leave
+            # stale holdout attributions on an entry they no longer sourced.
             if holdout:
-                entry.setdefault("holdout_sources", []).append(unit_name)
+                entry["holdout_sources"] = [unit_name]
+            else:
+                entry.pop("holdout_sources", None)
             touched_keys.add(key)
         else:
             if not _has_conflict(entry, unit_name, normal):
@@ -632,10 +652,20 @@ def _replace_in_seed(lines: list[str], entry: dict[str, Any]) -> bool:
     else:
         pattern = re.compile(rf"^\s*(?:extern\s+)?\w[\w\s\*]*\b{re.escape(symbol)}\s*\(.*;\s*$")
     replaced = False
-    for index, line in enumerate(lines):
-        if pattern.match(line):
-            lines[index] = replacement
+    index = 0
+    while index < len(lines):
+        if pattern.match(lines[index]):
+            # Review F2: replace the LOGICAL line -- a backslash-continued
+            # #define spans several physical lines (every live seed carries
+            # CONCAT44 in exactly this shape); replacing only the first line
+            # would orphan the continuation as a stray expression and hand
+            # the model a syntactically broken header.
+            end = index
+            while end < len(lines) and lines[end].rstrip().endswith("\\"):
+                end += 1
+            lines[index : end + 1] = [replacement]
             replaced = True
+        index += 1
     return replaced
 
 
@@ -784,6 +814,12 @@ def check_survival(
             found[("typedef", chunk.symbol)] = _macro_normal(chunk.text)
         elif chunk.kind == "function_decl":
             found[("decl", chunk.symbol)] = _declaration_normal(chunk.text)
+        elif chunk.kind == "var_decl":
+            # Review F1: a macro re-expressed as a variable declaration
+            # (`extern unsigned short DAT_...;`) is a deviation WITH a found
+            # form -- record it so the eventual conflict carries the unit's
+            # actual divergent typing instead of found=None.
+            found[("var_decl", chunk.symbol)] = _macro_normal(chunk.text)
     deviations: list[dict[str, Any]] = []
     for record in authoritative:
         kind = record.get("kind")
@@ -793,6 +829,8 @@ def check_survival(
             else ("typedef" if kind == KIND_TYPEDEF else "decl")
         )
         actual = found.get((bucket, record.get("symbol") or ""))
+        if actual is None and bucket == "macro":
+            actual = found.get(("var_decl", record.get("symbol") or ""))
         if actual != record.get("normal"):
             deviations.append(
                 {
@@ -804,6 +842,77 @@ def check_survival(
                 }
             )
     return deviations
+
+
+def record_surviving_deviations(
+    registry: dict[str, Any],
+    *,
+    unit_name: str,
+    tier: str,
+    deviations: list[dict[str, Any]],
+) -> HarvestResult:
+    """[V4-6] promise, closed (review F1): a semantic mutation of an
+    authoritative line that SURVIVES to green/staged becomes a conflict
+    record at harvest. ``harvest_candidates`` catches re-expressions that
+    still parse as macro/typedef/decl/DAT-var chunks; this catches the rest
+    -- outright DELETION of the injected line, or any re-expression the
+    harvest cannot see -- by folding the round-recorded deviations into the
+    entry's ``conflicts[]``. Without this, later units keep receiving the
+    possibly-wrong authoritative line with zero dissent on the record.
+
+    Dedup is by (unit, normalized found form), same as every other conflict
+    path, so a deviation the harvest already filed is not filed twice.
+    Bumps ``version`` iff anything changed."""
+    result = HarvestResult(version=registry_version(registry))
+    entries = registry.get("entries") or {}
+    touched: set[str] = set()
+    for deviation in deviations or []:
+        key = deviation.get("key")
+        entry = entries.get(key) if key else None
+        if entry is None or entry.get("revoked"):
+            continue
+        found = deviation.get("found")
+        normal = found or ""
+        if _has_conflict(entry, unit_name, normal):
+            continue  # the harvest comparison already filed this one
+        conflict = _conflict_entry(
+            unit_name,
+            found
+            or "(authoritative line deleted or re-expressed beyond the "
+            "parser's chunk kinds)",
+            "authoritative injection did not survive: unit went green with "
+            "a semantic deviation (design 2.11 [V4-6])",
+            tier=tier,
+        )
+        conflict["normal"] = normal
+        conflict["expected"] = deviation.get("expected")
+        entry.setdefault("conflicts", []).append(conflict)
+        green_green = (
+            tier == TIER_ORACLE_GREEN and entry.get("tier") == TIER_ORACLE_GREEN
+        )
+        if green_green:
+            entry["green_green"] = True
+        touched.add(key)
+        result.new_conflicts.append(
+            {
+                "key": key,
+                "symbol": deviation.get("symbol"),
+                "kind": deviation.get("kind"),
+                "unit": unit_name,
+                "tier": tier,
+                "against_tier": entry.get("tier"),
+                "contested": bool(entry.get("contested")),
+                "green_green": green_green,
+                "deviation": True,
+            }
+        )
+    if touched:
+        version = _bump_version(registry)
+        for key in touched:
+            entries[key]["updated_version"] = version
+        result.changed = True
+        result.version = version
+    return result
 
 
 # ---------------------------------------------------------------------------
