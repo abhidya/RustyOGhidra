@@ -82,12 +82,14 @@ from src.port_knowledge_registry import (
     TIER_ORACLE_GREEN,
     augment_seed,
     check_survival,
+    fold_assembly_conflict_ledger,
     harvest_unit,
     is_holdout,
     load_registry,
     prelude_prototypes,
     promote_unit_entries,
     record_surviving_deviations,
+    read_stable_assembly_ledger_bytes,
     registry_version,
     relevant_delta,
     restore_unit_entries,
@@ -4055,6 +4057,12 @@ class WasmUnitDriver:
         try:
             final_header = (workdir / "gnt4_shim.h").read_text(encoding="utf-8")
             registry = self._registry()
+            assembly_fold = None
+            if self.assembly_ledger_path.is_file():
+                assembly_fold = fold_assembly_conflict_ledger(
+                    registry,
+                    read_stable_assembly_ledger_bytes(self.assembly_ledger_path),
+                )
             harvest = harvest_unit(
                 registry,
                 unit_name=name,
@@ -4078,9 +4086,21 @@ class WasmUnitDriver:
                 tier=TIER_COMPILE_ONLY if compile_only else TIER_ORACLE_GREEN,
                 deviations=record.get("registry_deviations") or [],
             )
-            if harvest.changed or deviation_fold.changed:
+            if (
+                (assembly_fold is not None and assembly_fold.changed)
+                or harvest.changed
+                or deviation_fold.changed
+            ):
                 self._save_registry(registry)
                 registry_rel = REGISTRY_RELPATH
+            if assembly_fold is not None and assembly_fold.changed:
+                self.events.emit(
+                    "registry_assembly_conflicts_imported",
+                    unit=name,
+                    registry_version=registry_version(registry),
+                    imported=assembly_fold.imported,
+                    ledger_sha256=assembly_fold.ledger_sha256,
+                )
             for conflict in harvest.new_conflicts + deviation_fold.new_conflicts:
                 payload = {
                     "unit": name,

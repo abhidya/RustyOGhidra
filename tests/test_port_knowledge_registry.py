@@ -12,11 +12,18 @@ contested coin-flip.
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from src.port_assembly_gate import (
+    CLASS_COLLISION_STUB,
+    CLASS_LINK_FAILURE,
+    conflicts_from_link_error,
+    record_gate_result,
+)
 from src.port_knowledge_registry import (
     REGISTRY_RELPATH,
     TIER_COMPILE_ONLY,
@@ -24,6 +31,8 @@ from src.port_knowledge_registry import (
     augment_seed,
     check_survival,
     empty_registry,
+    fold_assembly_conflict_ledger,
+    harvest_candidates,
     harvest_unit,
     is_holdout,
     load_registry,
@@ -78,6 +87,414 @@ def _registry_with(entry) -> dict:
     registry["version"] = 1
     registry["entries"][DAT_KEY] = entry
     return registry
+
+
+def _assembly_ledger_bytes(records: dict[str, dict]) -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema": 1,
+                "created_at": "2026-08-21T00:00:00Z",
+                "updated_at": "2026-08-21T00:01:00Z",
+                "largest_n_passed": 5,
+                "runs_total": 1,
+                "conflicts": records,
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _synthetic_41_conflict_ledger() -> bytes:
+    """Public, synthetic census with the historical T2b cardinality.
+
+    The shapes exercise every assembly-only evidence family without copying
+    byte-exact game candidates into a public fixture.
+    """
+    variants = {
+        "undefined8": {
+            "unit-a": "typedef double undefined8;",
+            "unit-b": "typedef unsigned long long undefined8;",
+        },
+        "CONCAT44": {
+            "unit-a": "#define CONCAT44(a,b) double_form(a,b)",
+            "unit-b": "#define CONCAT44(a,b) integer_form(a,b)",
+        },
+        "DAT_804361fc": {
+            "unit-a": "#define DAT_804361fc GC_U8(0x804361fc)",
+            "unit-b": "#define DAT_804361fc GC_IPTR(0x804361fc)",
+        },
+        "zz_00f0104_": {
+            "unit-a": "int zz_00f0104_();",
+            "unit-b": "void zz_00f0104_(int,int,int);",
+        },
+        "zz_00076d0_": {},
+    }
+    for index in range(36):
+        symbol = f"zz_synthetic_{index:02d}_"
+        variants[symbol] = {
+            "unit-a": f"int {symbol}();",
+            "unit-b": f"void {symbol}(int);",
+        }
+    records = {}
+    for index, (symbol, unit_variants) in enumerate(variants.items()):
+        conflict_class = (
+            "undefined8_fork"
+            if symbol in {"undefined8", "CONCAT44"}
+            else "dat_width_divergence"
+            if symbol.startswith("DAT_")
+            else "collision_stub"
+        )
+        units = ["unit-a", "unit-b"]
+        records[f"source-ledger-key-{index:02d}"] = {
+            "symbol": symbol,
+            "class": conflict_class,
+            "units": units,
+            "variants": unit_variants,
+            "detail": (
+                f"synthetic unresolved link reference: {symbol}"
+                if not unit_variants
+                else f"synthetic divergent declarations: {symbol}"
+            ),
+            "first_seen": "2026-08-21T00:00:00Z",
+            "last_seen": "2026-08-21T00:01:00Z",
+            "times_seen": 2,
+        }
+    assert len(records) == 41
+    return _assembly_ledger_bytes(records)
+
+
+# ---------------------------------------------------- T2b -> T2c evidence fold
+
+
+def test_assembly_conflict_fold_imports_41_symbols_without_a_silent_winner():
+    registry = empty_registry()
+    ledger_bytes = _synthetic_41_conflict_ledger()
+    digest = hashlib.sha256(ledger_bytes).hexdigest()
+
+    result = fold_assembly_conflict_ledger(registry, ledger_bytes)
+
+    assert result.changed is True
+    assert result.imported == 41
+    assert result.ledger_sha256 == digest
+    assert registry_version(registry) == 1
+    assert len(registry["entries"]) == 41
+    conflict_ids = set()
+    for entry in registry["entries"].values():
+        assert entry["assembly_only"] is True
+        assert entry["behavioral_authority"] is False
+        assert entry["contested"] is True
+        assert "macro" not in entry and "declaration" not in entry
+        assert len(entry["assembly_conflicts"]) == 1
+        evidence = entry["assembly_conflicts"][0]
+        assert evidence["ledger_sha256"] == digest
+        assert evidence["evidence_domain"] == "assembly"
+        assert evidence["injectable"] is False
+        assert evidence["first_seen"] == "2026-08-21T00:00:00Z"
+        assert evidence["last_seen"] == "2026-08-21T00:01:00Z"
+        conflict_ids.add(evidence["conflict_id"])
+    assert len(conflict_ids) == 41
+
+    for symbol in (
+        "undefined8",
+        "CONCAT44",
+        "DAT_804361fc",
+        "zz_00f0104_",
+        "zz_00076d0_",
+    ):
+        augmented = augment_seed(
+            registry, unit_name="later-unit", seed_text=SEED, symbols={symbol}
+        )
+        assert augmented.injected_any is False
+        assert augmented.skipped_contested
+
+    link_only = registry["entries"]["fn:zz_00076d0_"]["assembly_conflicts"][0]
+    assert link_only["variants"] == {}
+    assert link_only["resolution"] == "unresolved"
+
+
+def test_assembly_conflict_fold_is_byte_and_version_idempotent():
+    registry = empty_registry()
+    ledger_bytes = _synthetic_41_conflict_ledger()
+    first = fold_assembly_conflict_ledger(registry, ledger_bytes)
+    first_bytes = json.dumps(registry, sort_keys=True, indent=2).encode("utf-8")
+    first_version = registry_version(registry)
+
+    second = fold_assembly_conflict_ledger(registry, ledger_bytes)
+
+    assert first.changed is True
+    assert second.changed is False
+    assert second.imported == 0
+    assert registry_version(registry) == first_version
+    assert json.dumps(registry, sort_keys=True, indent=2).encode("utf-8") == first_bytes
+
+
+def test_assembly_conflict_fold_ignores_recurrence_only_ledger_churn():
+    registry = empty_registry()
+    ledger_bytes = _synthetic_41_conflict_ledger()
+    fold_assembly_conflict_ledger(registry, ledger_bytes)
+    first_bytes = json.dumps(registry, sort_keys=True, indent=2).encode("utf-8")
+    first_version = registry_version(registry)
+    churned = json.loads(ledger_bytes)
+    churned["updated_at"] = "2026-08-21T02:00:00Z"
+    churned["runs_total"] = 99
+    for conflict in churned["conflicts"].values():
+        conflict["last_seen"] = "2026-08-21T02:00:00Z"
+        conflict["times_seen"] = 99
+    churned_bytes = (json.dumps(churned, sort_keys=True, indent=2) + "\n").encode()
+
+    result = fold_assembly_conflict_ledger(registry, churned_bytes)
+
+    assert result.changed is False
+    assert registry_version(registry) == first_version
+    assert json.dumps(registry, sort_keys=True, indent=2).encode("utf-8") == first_bytes
+
+
+def test_assembly_conflict_fold_rejects_malformed_snapshot_atomically():
+    registry = _registry_with(_entry())
+    before = json.dumps(registry, sort_keys=True)
+    malformed = _assembly_ledger_bytes(
+        {
+            "a-valid": {
+                "symbol": "zz_valid_",
+                "class": "collision_stub",
+                "units": ["unit-a", "unit-b"],
+                "variants": {
+                    "unit-a": "int zz_valid_();",
+                    "unit-b": "void zz_valid_(int);",
+                },
+                "detail": "valid fixture before malformed record",
+                "first_seen": "2026-08-21T00:00:00Z",
+                "last_seen": "2026-08-21T00:01:00Z",
+                "times_seen": 1,
+            },
+            "z-invalid": {"symbol": "zz_invalid_", "class": "collision_stub"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="nonempty units"):
+        fold_assembly_conflict_ledger(registry, malformed)
+
+    assert json.dumps(registry, sort_keys=True) == before
+
+
+def test_assembly_only_fold_does_not_reopen_source_retry_delta():
+    registry = empty_registry()
+    fold_assembly_conflict_ledger(registry, _synthetic_41_conflict_ledger())
+
+    assert relevant_delta(registry, {"zz_00f0104_"}, since_version=0) == []
+    assert relevant_delta(registry, {"zz_00076d0_"}, since_version=0) == []
+
+
+def test_assembly_fold_preserves_revocation_tombstone_and_existing_tier():
+    entry = _entry(
+        tier=TIER_ORACLE_GREEN,
+        revoked=True,
+        contested=False,
+        conflicts=[
+            {
+                "unit": "unit-earlier",
+                "tombstone": True,
+                "reason": "oracle re-run failed",
+            }
+        ],
+    )
+    registry = _registry_with(entry)
+    ledger = _assembly_ledger_bytes(
+        {
+            "dat-conflict": {
+                "symbol": DAT_SYM,
+                "class": "dat_width_divergence",
+                "units": ["unit-a", "unit-b"],
+                "variants": {"unit-a": MACRO_CHAR, "unit-b": MACRO_INT},
+                "detail": "synthetic divergence",
+                "first_seen": "2026-08-21T00:00:00Z",
+                "last_seen": "2026-08-21T00:01:00Z",
+                "times_seen": 1,
+            }
+        }
+    )
+
+    fold_assembly_conflict_ledger(registry, ledger)
+
+    imported = registry["entries"][DAT_KEY]
+    assert imported["revoked"] is True
+    assert imported["tier"] == TIER_ORACLE_GREEN
+    assert imported["macro"] == MACRO_INT
+    assert imported["source_units"] == ["unit-earlier"]
+    assert imported["conflicts"] == entry["conflicts"]
+    assert imported["assembly_conflicts"]
+    assert augment_seed(
+        registry, unit_name="later-unit", seed_text=SEED, symbols={DAT_SYM}
+    ).injected_any is False
+
+    harvest_unit(
+        registry,
+        unit_name="fresh-source",
+        tier=TIER_COMPILE_ONLY,
+        seed_text=SEED,
+        header_text=SEED + MACRO_CHAR + "\n",
+        unit_c_text=UNIT_C,
+    )
+    assert registry["entries"][DAT_KEY]["assembly_conflicts"]
+
+
+def _harvest_definition_over_assembly_conflict(tier: str) -> dict:
+    registry = empty_registry()
+    fold_assembly_conflict_ledger(
+        registry,
+        _assembly_ledger_bytes(
+            {
+                "definition-conflict": {
+                    "symbol": "zz_demo_",
+                    "class": CLASS_COLLISION_STUB,
+                    "units": ["caller-a", "caller-b"],
+                    "variants": {
+                        "caller-a": "int zz_demo_();",
+                        "caller-b": "void zz_demo_(int);",
+                    },
+                    "detail": "synthetic declaration disagreement",
+                    "first_seen": "2026-08-21T00:00:00Z",
+                    "last_seen": "2026-08-21T00:01:00Z",
+                    "times_seen": 1,
+                }
+            }
+        ),
+    )
+    harvest_unit(
+        registry,
+        unit_name="owner",
+        tier=tier,
+        seed_text="",
+        header_text="",
+        unit_c_text=(
+            "void zz_demo_(int a);\n\n"
+            "/* ==== VERBATIM ==== */\n"
+            "void zz_demo_(int a) { (void)a; }\n"
+        ),
+    )
+    return registry
+
+
+def test_compile_definition_normalizes_assembly_only_entry_to_mixed_contested():
+    registry = _harvest_definition_over_assembly_conflict(TIER_COMPILE_ONLY)
+    entry = registry["entries"]["fn:zz_demo_"]
+    assert entry["assembly_only"] is False
+    assert entry["behavioral_authority"] is False
+    assert entry["tier"] == TIER_COMPILE_ONLY
+    assert entry["source_units"] == ["owner"]
+    assert entry["source_tiers"] == {"owner": TIER_COMPILE_ONLY}
+    assert entry["contested"] is True
+    assert entry["assembly_conflicts"][0]["behavioral_authority"] is False
+    assert augment_seed(
+        registry, unit_name="later", seed_text=SEED, symbols={"zz_demo_"}
+    ).injected_any is False
+
+
+def test_oracle_definition_normalizes_mixed_source_authority_but_not_assembly():
+    registry = _harvest_definition_over_assembly_conflict(TIER_ORACLE_GREEN)
+    entry = registry["entries"]["fn:zz_demo_"]
+    assert entry["assembly_only"] is False
+    assert entry["behavioral_authority"] is True
+    assert entry["tier"] == TIER_ORACLE_GREEN
+    assert entry["source_units"] == ["owner"]
+    assert entry["source_tiers"] == {"owner": TIER_ORACLE_GREEN}
+    assert entry["contested"] is True
+    assert entry["assembly_conflicts"][0]["behavioral_authority"] is False
+    assert augment_seed(
+        registry, unit_name="later", seed_text=SEED, symbols={"zz_demo_"}
+    ).injected_any is False
+
+
+def test_unattributed_producer_link_failure_does_not_block_named_import(tmp_path):
+    units = ["unit-a", "unit-b"]
+    conflicts = conflicts_from_link_error("linker exited without a symbol", units)
+    conflicts += conflicts_from_link_error(
+        "wasm-ld: error: function signature mismatch: zz_ok_", units
+    )
+    assert conflicts[0]["symbol"] is None
+    ledger_path = tmp_path / "assembly-gate.json"
+    record_gate_result(
+        ledger_path,
+        {
+            "passed": False,
+            "n": 2,
+            "units": units,
+            "checked_at": "2026-08-21T00:00:00Z",
+            "stage": "link",
+            "detail": "synthetic link failure",
+            "conflicts": conflicts,
+        },
+    )
+    registry = empty_registry()
+
+    result = fold_assembly_conflict_ledger(registry, ledger_path.read_bytes())
+
+    assert result.imported == 2
+    assert "fn:zz_ok_" in registry["entries"]
+    unattributed = registry["assembly_unattributed_conflicts"]
+    assert len(unattributed) == 1
+    assert unattributed[0]["class"] == CLASS_LINK_FAILURE
+    assert unattributed[0]["symbol"] is None
+    assert unattributed[0]["injectable"] is False
+    assert unattributed[0]["resolution"] == "unresolved"
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"class": "not-a-gate-class"}, "unknown class"),
+        ({"units": []}, "nonempty units"),
+        ({"units": ["unit-a", "unit-a"]}, "unique units"),
+        (
+            {"variants": {"ghost-unit": "int zz_bad_();"}},
+            "variant units",
+        ),
+        ({"first_seen": 123}, "first_seen.*ISO"),
+        ({"last_seen": "not-a-timestamp"}, "last_seen.*ISO"),
+        ({"times_seen": -7}, "nonnegative times_seen"),
+    ],
+)
+def test_assembly_conflict_fold_rejects_adversarial_provenance_atomically(
+    patch, message
+):
+    conflict = {
+        "symbol": "zz_bad_",
+        "class": CLASS_COLLISION_STUB,
+        "units": ["unit-a", "unit-b"],
+        "variants": {
+            "unit-a": "int zz_bad_();",
+            "unit-b": "void zz_bad_(int);",
+        },
+        "detail": "synthetic disagreement",
+        "first_seen": "2026-08-21T00:00:00Z",
+        "last_seen": "2026-08-21T00:01:00Z",
+        "times_seen": 1,
+    }
+    conflict.update(patch)
+    registry = _registry_with(_entry())
+    before = json.dumps(registry, sort_keys=True)
+
+    with pytest.raises(ValueError, match=message):
+        fold_assembly_conflict_ledger(
+            registry, _assembly_ledger_bytes({"adversarial": conflict})
+        )
+
+    assert json.dumps(registry, sort_keys=True) == before
+
+
+def test_new_definition_harvest_emits_one_semicolon():
+    candidates = harvest_candidates(
+        SEED,
+        SEED,
+        '#include "gnt4_shim.h"\n\nint zz_defined_(int a);\n\n'
+        "/* ==== VERBATIM ==== */\nint zz_defined_(int a) { return a; }\n",
+    )
+    definition = next(c for c in candidates if c["symbol"] == "zz_defined_")
+    assert definition["text"].endswith(";")
+    assert not definition["text"].endswith(";;")
 
 
 # ---------------------------------------------------------------- injection
@@ -689,12 +1106,60 @@ def _write_repo(tmp_path: Path) -> Path:
     return repo
 
 
+class _FakeJournal:
+    """Deterministic durable journal used by driver-integration fixtures."""
+
+    def __init__(self):
+        self.checkpoints = []
+
+    def checkpoint(self, **kwargs):
+        transition = kwargs.get("transition")
+        transition_id = (
+            transition.extra.get("transition_id")
+            if transition is not None and isinstance(transition.extra, dict)
+            else None
+        )
+        if transition_id and any(
+            item.get("transition") is not None
+            and item["transition"].extra.get("transition_id") == transition_id
+            for item in self.checkpoints
+        ):
+            return {
+                "recorded": True,
+                "committed": True,
+                "pushed": True,
+                "idempotent": True,
+            }
+        self.checkpoints.append(kwargs)
+        return {"recorded": True, "committed": True, "pushed": True}
+
+    def authoritative_transition_receipt(self, transition_id):
+        records = [
+            item["transition"].to_record("", "")
+            for item in self.checkpoints
+            if item.get("transition") is not None
+            and item["transition"].extra.get("transition_id") == transition_id
+        ]
+        return {
+            "authoritative": True,
+            "remote": bool(records),
+            "remote_records": records,
+        }
+
+    def push_is_pending(self):
+        return False
+
+    def flush_pending_push(self):
+        pass
+
+
 def _driver(repo: Path, **kwargs) -> WasmUnitDriver:
     defaults = dict(
         repo_root=repo,
         build_runner=lambda workdir, exports, extra=None: (True, ""),
         oracle_runner=lambda unit, wasm: (True, "1/1", "PASS log"),
         git_runner=lambda *args: _completed(0, "abc123\n"),
+        journal=_FakeJournal(),
     )
     defaults.update(kwargs)
     return WasmUnitDriver(**defaults)
@@ -721,6 +1186,62 @@ class _HeaderLLM:
         return "```c\n" + self.header_body + "\n```"
 
 
+def test_driver_folds_assembly_evidence_through_registry_co_commit(
+    tmp_path, monkeypatch
+):
+    """The pure fold is consumed only inside the lock-taking green path;
+    its registry mutation rides the existing artifact/journal transaction."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    monkeypatch.setenv("OGHIDRA_PORT_REGISTRY_HOLDOUT_PCT", "0")
+    repo = _write_repo(tmp_path)
+    queue_path = repo / "research/decomp/generated/finish-game-port/wasm-units.json"
+    queue = json.loads(queue_path.read_text())
+    queue["units"][0]["oracle"] = {"type": "compile_only"}
+    queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    ledger_path = repo / "research/decomp/data/assembly-gate.json"
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_bytes(
+        _assembly_ledger_bytes(
+            {
+                "link-only": {
+                    "symbol": "zz_00076d0_",
+                    "class": "collision_stub",
+                    "units": ["unit-a", "unit-b"],
+                    "variants": {},
+                    "detail": "synthetic function signature mismatch",
+                    "first_seen": "2026-08-21T00:00:00Z",
+                    "last_seen": "2026-08-21T00:01:00Z",
+                    "times_seen": 1,
+                }
+            }
+        )
+    )
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        return _completed(0, "abc123\n")
+
+    def successful_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(repo, build_runner=successful_build, git_runner=fake_git)
+    assert driver.run() == EXIT_NO_WORK
+
+    registry = load_registry(_registry_file(repo))
+    imported = registry["entries"]["fn:zz_00076d0_"]
+    assert imported["assembly_only"] is True
+    assert imported["assembly_conflicts"][0]["variants"] == {}
+    assert any(
+        event.get("kind") == "registry_assembly_conflicts_imported"
+        for event in _events(repo)
+    )
+    assert any(
+        args[0] == "add" and REGISTRY_RELPATH in args for args in git_calls
+    )
+
+
 def test_green_unit_harvests_and_co_commits_the_registry(tmp_path, monkeypatch):
     """T2c section 9: step 5 calls harvest(), and the registry rides the
     unit's own artifact commit (one push, G3-preserving); step 2 records
@@ -732,7 +1253,7 @@ def test_green_unit_harvests_and_co_commits_the_registry(tmp_path, monkeypatch):
 
     def fake_git(*args):
         git_calls.append(args)
-        if args[0] == "rev-parse":
+        if args[0] in {"rev-parse", "ls-remote"}:
             return _completed(0, "deadbeef\n")
         return _completed(0)
 

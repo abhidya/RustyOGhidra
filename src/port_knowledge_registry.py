@@ -64,13 +64,21 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from src.port_assembly_gate import (
+    CLASS_COLLISION_STUB,
+    CLASS_DAT_DIVERGENCE,
+    CLASS_DECL_DIVERGENCE,
+    CLASS_INSTANTIATION_FAILURE,
+    CLASS_LINK_FAILURE,
+    CLASS_UNDEFINED8_FORK,
     _C_KEYWORDS,
     _declaration_normal,
     _function_declarations,
+    GATE_LEDGER_SCHEMA,
     parse_header_chunks,
     prelude_region,
     scan_function_definitions,
@@ -108,6 +116,17 @@ _TYPEDEFISH = re.compile(
 # F6 holdout fraction, percent. Deterministic by unit-name hash so the
 # assignment survives restarts and is auditable offline.
 DEFAULT_HOLDOUT_PERCENT = 10
+
+KNOWN_ASSEMBLY_CONFLICT_CLASSES = frozenset(
+    {
+        CLASS_UNDEFINED8_FORK,
+        CLASS_COLLISION_STUB,
+        CLASS_DAT_DIVERGENCE,
+        CLASS_DECL_DIVERGENCE,
+        CLASS_LINK_FAILURE,
+        CLASS_INSTANTIATION_FAILURE,
+    }
+)
 
 
 def holdout_percent() -> int:
@@ -201,6 +220,322 @@ def entry_key(kind: str, symbol: str) -> str:
     if kind == KIND_PSEUDO_OP:
         return f"macro:{symbol}"
     return f"typedef:{symbol}"
+
+
+# ---------------------------------------------------------------------------
+# T2b -> T2c assembly-conflict evidence fold
+
+
+@dataclass
+class AssemblyConflictFoldResult:
+    imported: int = 0
+    changed: bool = False
+    version: int = 0
+    ledger_sha256: str = ""
+    conflict_ids: list[str] = field(default_factory=list)
+
+
+def read_stable_assembly_ledger_bytes(path: Path) -> bytes:
+    """Read one path-bound byte snapshot, refusing a concurrent replacement.
+
+    ``assembly-gate.json`` is atomically replaced by its writer. Comparing the
+    path metadata before and after the read proves the bytes came from one
+    stable path generation instead of straddling two gate updates.
+    """
+    ledger_path = Path(path)
+    before = ledger_path.stat()
+    payload = ledger_path.read_bytes()
+    after = ledger_path.stat()
+    before_identity = (
+        getattr(before, "st_ino", 0),
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_identity = (
+        getattr(after, "st_ino", 0),
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_identity != after_identity or len(payload) != after.st_size:
+        raise RuntimeError(
+            f"assembly ledger changed while reading {ledger_path}; retry from "
+            "a stable snapshot"
+        )
+    return payload
+
+
+def _assembly_entry_kind(symbol: str, variants: dict[str, str]) -> str:
+    if _DAT_NAME.fullmatch(symbol):
+        return KIND_DAT
+    if symbol == "undefined8" or any(
+        text.lstrip().startswith("typedef") for text in variants.values()
+    ):
+        return KIND_TYPEDEF
+    if _PSEUDO_OP_NAME.fullmatch(symbol) or any(
+        text.lstrip().startswith("#define") for text in variants.values()
+    ):
+        return KIND_PSEUDO_OP
+    return KIND_PROTOTYPE
+
+
+def _normalize_assembly_source_state(entry: dict[str, Any]) -> bool:
+    """Keep source authority separate from unresolved assembly evidence."""
+    if not entry.get("assembly_conflicts"):
+        return False
+    changed = False
+    source_units = [
+        unit
+        for unit in (entry.get("source_units") or [])
+        if isinstance(unit, str) and unit
+    ]
+    desired = {
+        "assembly_only": not bool(source_units),
+        "behavioral_authority": bool(source_units)
+        and not entry.get("revoked")
+        and entry.get("tier") == TIER_ORACLE_GREEN
+        and any(
+            (entry.get("source_tiers") or {}).get(unit) == TIER_ORACLE_GREEN
+            for unit in source_units
+        ),
+        "contested": True,
+    }
+    for field_name, value in desired.items():
+        if entry.get(field_name) != value:
+            entry[field_name] = value
+            changed = True
+    return changed
+
+
+def _canonical_assembly_conflict(
+    source_key: str, conflict: dict[str, Any], ledger_sha256: str
+) -> dict[str, Any]:
+    symbol = conflict.get("symbol")
+    conflict_class = conflict.get("class")
+    units = conflict.get("units")
+    variants = conflict.get("variants")
+    if symbol is not None and (not isinstance(symbol, str) or not symbol):
+        raise ValueError(f"assembly conflict {source_key!r} has invalid symbol")
+    if conflict_class not in KNOWN_ASSEMBLY_CONFLICT_CLASSES:
+        raise ValueError(f"assembly conflict {source_key!r} has unknown class")
+    if symbol is None and conflict_class not in {
+        CLASS_LINK_FAILURE,
+        CLASS_INSTANTIATION_FAILURE,
+    }:
+        raise ValueError(f"assembly conflict {source_key!r} has no symbol")
+    if not isinstance(units, list) or not units or any(
+        not isinstance(unit, str) or not unit for unit in units
+    ):
+        raise ValueError(
+            f"assembly conflict {source_key!r} must have nonempty units"
+        )
+    if len(set(units)) != len(units):
+        raise ValueError(
+            f"assembly conflict {source_key!r} must have unique units"
+        )
+    if not isinstance(variants, dict) or any(
+        not isinstance(unit, str) or not isinstance(text, str)
+        for unit, text in variants.items()
+    ):
+        raise ValueError(f"assembly conflict {source_key!r} has invalid variants")
+    if not set(variants).issubset(units):
+        raise ValueError(
+            f"assembly conflict {source_key!r} has invalid variant units"
+        )
+    if symbol is None and variants:
+        raise ValueError(
+            f"assembly conflict {source_key!r} has unattributed variants"
+        )
+    timestamps: dict[str, str] = {}
+    for field_name in ("first_seen", "last_seen"):
+        value = conflict.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"assembly conflict {source_key!r} {field_name} must be an ISO string"
+            )
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(
+                f"assembly conflict {source_key!r} {field_name} must be an ISO string"
+            ) from error
+        timestamps[field_name] = value
+    times_seen = conflict.get("times_seen")
+    if (
+        not isinstance(times_seen, int)
+        or isinstance(times_seen, bool)
+        or times_seen < 0
+    ):
+        raise ValueError(
+            f"assembly conflict {source_key!r} must have nonnegative times_seen"
+        )
+    identity_material = {
+        "class": conflict_class,
+        "symbol": symbol,
+        "units": sorted(units),
+    }
+    evidence_material = {
+        **identity_material,
+        "detail": str(conflict.get("detail") or ""),
+        "variants": {unit: variants[unit] for unit in sorted(variants)},
+        "first_seen": timestamps["first_seen"],
+    }
+    identity_bytes = json.dumps(
+        identity_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    material_bytes = json.dumps(
+        evidence_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return {
+        "conflict_id": "assembly:" + hashlib.sha256(identity_bytes).hexdigest(),
+        "material_sha256": hashlib.sha256(material_bytes).hexdigest(),
+        "evidence_domain": "assembly",
+        "behavioral_authority": False,
+        "injectable": False,
+        "resolution": "unresolved",
+        "ledger_schema": GATE_LEDGER_SCHEMA,
+        "ledger_sha256": ledger_sha256,
+        "ledger_key": source_key,
+        **evidence_material,
+        "last_seen": timestamps["last_seen"],
+        "times_seen": times_seen,
+    }
+
+
+def fold_assembly_conflict_ledger(
+    registry: dict[str, Any], ledger_bytes: bytes
+) -> AssemblyConflictFoldResult:
+    """Fold schema-1 T2b conflicts into non-injectable T2c evidence.
+
+    This function chooses no declaration and performs no I/O. The caller owns
+    the stable snapshot, driver lock, journal, and registry co-commit. Existing
+    source evidence and revocation tombstones are retained byte-for-byte;
+    assembly evidence only adds a separate unresolved evidence domain.
+    """
+    if not isinstance(ledger_bytes, bytes):
+        raise TypeError("assembly ledger snapshot must be bytes")
+    ledger_sha256 = hashlib.sha256(ledger_bytes).hexdigest()
+    try:
+        ledger = json.loads(ledger_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("assembly ledger snapshot is not valid UTF-8 JSON") from error
+    if (
+        not isinstance(ledger, dict)
+        or ledger.get("schema") != GATE_LEDGER_SCHEMA
+        or not isinstance(ledger.get("conflicts"), dict)
+    ):
+        raise ValueError(
+            "assembly ledger has an unexpected schema; refusing to import"
+        )
+
+    result = AssemblyConflictFoldResult(
+        version=registry_version(registry), ledger_sha256=ledger_sha256
+    )
+    canonical_conflicts: list[tuple[dict[str, Any], str | None]] = []
+    for source_key, raw_conflict in sorted(ledger["conflicts"].items()):
+        if not isinstance(source_key, str) or not isinstance(raw_conflict, dict):
+            raise ValueError("assembly ledger conflict map is malformed")
+        evidence = _canonical_assembly_conflict(
+            source_key, raw_conflict, ledger_sha256
+        )
+        canonical_conflicts.append(
+            (
+                evidence,
+                _assembly_entry_kind(evidence["symbol"], evidence["variants"])
+                if evidence["symbol"] is not None
+                else None,
+            )
+        )
+
+    entries = registry.setdefault("entries", {})
+    touched: set[str] = set()
+    unattributed_touched = False
+    for evidence, kind in canonical_conflicts:
+        symbol = evidence["symbol"]
+        if symbol is None:
+            records = registry.setdefault("assembly_unattributed_conflicts", [])
+            matching_index = next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if record.get("conflict_id") == evidence["conflict_id"]
+                ),
+                None,
+            )
+            if matching_index is None:
+                records.append(evidence)
+                unattributed_touched = True
+                result.imported += 1
+            elif records[matching_index].get("material_sha256") != evidence.get(
+                "material_sha256"
+            ):
+                records[matching_index] = evidence
+                unattributed_touched = True
+                result.imported += 1
+            records.sort(key=lambda record: record["conflict_id"])
+            result.conflict_ids.append(evidence["conflict_id"])
+            continue
+        assert kind is not None
+        key = entry_key(kind, symbol)
+        entry = entries.get(key)
+        if entry is None:
+            entry = {
+                "kind": kind,
+                "symbol": symbol,
+                "tier": TIER_COMPILE_ONLY,
+                "source_units": [],
+                "source_tiers": {},
+                "harvested_at": evidence.get("first_seen")
+                or ledger.get("created_at"),
+                "contested": True,
+                "conflicts": [],
+                "assembly_only": True,
+                "behavioral_authority": False,
+            }
+            if kind == KIND_DAT:
+                entry["address"] = "0x" + symbol.split("DAT_")[-1].lower()
+            entries[key] = entry
+            touched.add(key)
+        records = entry.setdefault("assembly_conflicts", [])
+        matching_index = next(
+            (
+                index
+                for index, record in enumerate(records)
+                if record.get("conflict_id") == evidence["conflict_id"]
+            ),
+            None,
+        )
+        if matching_index is None:
+            records.append(evidence)
+            touched.add(key)
+            result.imported += 1
+        elif records[matching_index].get("material_sha256") != evidence.get(
+            "material_sha256"
+        ):
+            records[matching_index] = evidence
+            touched.add(key)
+            result.imported += 1
+        if records:
+            records.sort(key=lambda record: record["conflict_id"])
+            if not entry.get("contested"):
+                entry["contested"] = True
+                touched.add(key)
+            if _normalize_assembly_source_state(entry):
+                touched.add(key)
+        result.conflict_ids.append(evidence["conflict_id"])
+
+    if touched or unattributed_touched:
+        version = _bump_version(registry)
+        for key in touched:
+            entries[key]["assembly_updated_version"] = version
+            entries[key].setdefault(
+                "source_updated_version",
+                int(entries[key].get("updated_version", 0) or 0),
+            )
+        if unattributed_touched:
+            registry["assembly_unattributed_updated_version"] = version
+        result.changed = True
+        result.version = version
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +695,12 @@ def harvest_candidates(
                 # definition-derived form replaces the header's copy.
                 candidates[:] = [c for c in candidates if entry_key(c["kind"], c["symbol"]) != candidate_key]
                 seen.discard(candidate_key)
-            push(KIND_PROTOTYPE, symbol, normal + ";", derivation="definition")
+            push(
+                KIND_PROTOTYPE,
+                symbol,
+                normal.rstrip().rstrip(";") + ";",
+                derivation="definition",
+            )
     return candidates
 
 
@@ -422,6 +762,10 @@ def harvest_unit(
         derivation = candidate.get("derivation")
         entry = entries.get(key)
         if entry is None or entry.get("revoked"):
+            prior_entry = entry or {}
+            assembly_conflicts = list(
+                prior_entry.get("assembly_conflicts") or []
+            )
             entry = {
                 "kind": candidate["kind"],
                 "symbol": candidate["symbol"],
@@ -429,9 +773,14 @@ def harvest_unit(
                 "source_units": [unit_name],
                 "source_tiers": {unit_name: tier},
                 "harvested_at": now,
-                "contested": False,
-                "conflicts": list((entry or {}).get("conflicts") or []),
+                "contested": bool(assembly_conflicts),
+                "conflicts": list(prior_entry.get("conflicts") or []),
             }
+            if assembly_conflicts:
+                entry["assembly_conflicts"] = assembly_conflicts
+                entry["assembly_updated_version"] = prior_entry.get(
+                    "assembly_updated_version", 0
+                )
             if candidate["kind"] == KIND_DAT:
                 entry["address"] = "0x" + candidate["symbol"].split("DAT_")[-1].lower()
             if candidate["kind"] in (KIND_DAT, KIND_PSEUDO_OP):
@@ -442,6 +791,7 @@ def harvest_unit(
                 entry["derivation"] = derivation
             if holdout:
                 entry.setdefault("holdout_sources", []).append(unit_name)
+            _normalize_assembly_source_state(entry)
             entries[key] = entry
             result.added.append(key)
             touched_keys.add(key)
@@ -462,6 +812,8 @@ def harvest_unit(
                 # oracle_green in one pass, bypassing [V4-7]'s
                 # promotion-recompute -- the closest residual echo path. Tier
                 # promotion happens only through promote_unit_entries.
+                touched_keys.add(key)
+            if _normalize_assembly_source_state(entry):
                 touched_keys.add(key)
             result.agreed.append(key)
             continue
@@ -539,6 +891,7 @@ def harvest_unit(
                 entry["holdout_sources"] = [unit_name]
             else:
                 entry.pop("holdout_sources", None)
+            _normalize_assembly_source_state(entry)
             touched_keys.add(key)
         else:
             if not _has_conflict(entry, unit_name, normal):
@@ -554,6 +907,8 @@ def harvest_unit(
                 touched_keys.add(key)
             else:
                 continue
+        if _normalize_assembly_source_state(entry):
+            touched_keys.add(key)
         surfaced = {
             "key": key,
             "symbol": candidate["symbol"],
@@ -561,7 +916,7 @@ def harvest_unit(
             "unit": unit_name,
             "tier": tier,
             "against_tier": old_tier,
-            "contested": False,
+            "contested": bool(entry.get("contested")),
             "green_green": tier == TIER_ORACLE_GREEN and old_tier == TIER_ORACLE_GREEN,
         }
         result.new_conflicts.append(surfaced)
@@ -570,6 +925,7 @@ def harvest_unit(
         for key in touched_keys:
             if key in entries:
                 entries[key]["updated_version"] = version
+                entries[key]["source_updated_version"] = version
         result.changed = True
         result.version = version
     return result
@@ -625,7 +981,13 @@ def relevant_delta(
     return [
         key
         for key, entry in relevant_entries(registry, symbols)
-        if int(entry.get("updated_version", 0) or 0) > since_version
+        if int(
+            entry.get(
+                "source_updated_version", entry.get("updated_version", 0)
+            )
+            or 0
+        )
+        > since_version
     ]
 
 
@@ -701,7 +1063,7 @@ def augment_seed(
     for key, entry in relevant_entries(registry, symbols):
         if entry.get("revoked"):
             continue
-        if entry.get("contested"):
+        if entry.get("contested") or entry.get("assembly_conflicts"):
             result.skipped_contested.append(key)
             continue
         tier = entry.get("tier", TIER_SEED)
@@ -751,6 +1113,7 @@ def augment_seed(
             entry = (registry.get("entries") or {}).get(pending["key"])
             if entry is not None:
                 entry["updated_version"] = version
+                entry["source_updated_version"] = version
         result.registry_changed = True
     if not authoritative and not advisory:
         return result
@@ -910,6 +1273,7 @@ def record_surviving_deviations(
         version = _bump_version(registry)
         for key in touched:
             entries[key]["updated_version"] = version
+            entries[key]["source_updated_version"] = version
         result.changed = True
         result.version = version
     return result
@@ -961,14 +1325,17 @@ def promote_unit_entries(registry: dict[str, Any], unit_name: str) -> RetierResu
             if conflicting_greens:
                 entry["green_green"] = True
                 result.green_green.append(key)
-            else:
+            elif not entry.get("assembly_conflicts"):
                 entry["contested"] = False
                 result.reopened.append(key)
+            touched.append(key)
+        if _normalize_assembly_source_state(entry):
             touched.append(key)
     if touched:
         version = _bump_version(registry)
         for key in set(touched):
             entries[key]["updated_version"] = version
+            entries[key]["source_updated_version"] = version
         result.changed = True
         result.version = version
     return result
@@ -1016,11 +1383,13 @@ def revoke_unit_entries(registry: dict[str, Any], unit_name: str) -> RetierResul
                 }
             )
             result.revoked.append(key)
+        _normalize_assembly_source_state(entry)
         touched.append(key)
     if touched:
         version = _bump_version(registry)
         for key in set(touched):
             entries[key]["updated_version"] = version
+            entries[key]["source_updated_version"] = version
         result.changed = True
         result.version = version
     return result
@@ -1066,12 +1435,14 @@ def restore_unit_entries(registry: dict[str, Any], unit_name: str) -> RetierResu
                 "recorded_at": utc_now(),
             }
         )
+        _normalize_assembly_source_state(entry)
         result.restored.append(key)
         touched.append(key)
     if touched:
         version = _bump_version(registry)
         for key in set(touched):
             entries[key]["updated_version"] = version
+            entries[key]["source_updated_version"] = version
         result.changed = True
         result.version = version
     return result

@@ -2774,16 +2774,71 @@ def test_revoked_replacement_registry_phase_crash_restores_artifact_and_registry
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     destination, old_digest = _seed_revoked_replacement(repo)
-    git_calls = []
+    registry_path = (
+        repo
+        / "research/decomp/generated/finish-game-port/knowledge-registry.json"
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "registry_schema": 1,
+                "program": "gnt4",
+                "version": 7,
+                "updated_at": "2026-08-21T13:00:00Z",
+                "entries": {},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    registry_preimage = registry_path.read_bytes()
+    ledger_path = repo / "research/decomp/data/assembly-gate.json"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "created_at": "2026-08-21T12:00:00Z",
+                "updated_at": "2026-08-21T12:01:00Z",
+                "conflicts": {
+                    "collision_stub:zz_assembly_crash_": {
+                        "symbol": "zz_assembly_crash_",
+                        "class": "collision_stub",
+                        "units": ["prior-unit", "unit-a"],
+                        "variants": {
+                            "prior-unit": "int zz_assembly_crash_(void);",
+                            "unit-a": "void zz_assembly_crash_(int);",
+                        },
+                        "detail": "durable registry rollback fixture",
+                        "first_seen": "2026-08-21T12:00:00Z",
+                        "last_seen": "2026-08-21T12:01:00Z",
+                        "times_seen": 1,
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    remote, baseline = _init_bare_origin(repo, tmp_path)
+    run_root = repo / "research/decomp/generated/finish-game-port"
+    progress_worktree = tmp_path / "progress-wt-registry-crash"
 
     def fake_build(workdir, exports, extra=None):
         (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
         return True, ""
 
+    journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="registry-crash-run",
+        enable_push=True,
+    )
     driver = _driver(
         repo,
-        journal=FakeJournal(),
-        git_runner=lambda *args: git_calls.append(args) or _completed(0, "abc123\n"),
+        journal=journal,
+        git_runner=None,
         build_runner=fake_build,
     )
 
@@ -2794,13 +2849,62 @@ def test_revoked_replacement_registry_phase_crash_restores_artifact_and_registry
     driver._promotion_phase_boundary = crash
     with pytest.raises(KeyboardInterrupt, match="after registry"):
         driver.run()
+    crash_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert crash_registry["version"] == 9
+    assert len(
+        crash_registry["entries"]["fn:zz_assembly_crash_"][
+            "assembly_conflicts"
+        ]
+    ) == 1
     state = driver._load_state()
-    restarted = _driver(repo, journal=FakeJournal())
+    restarted_journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="registry-restart-run",
+        enable_push=True,
+    )
+    restarted = _driver(
+        repo,
+        journal=restarted_journal,
+        git_runner=None,
+        build_runner=fake_build,
+    )
     assert restarted._reconcile_orphan_promotion_attempts(state) is True
     assert unit_artifact_sha256(destination) == old_digest
-    assert not restarted.registry_path.exists()
+    assert registry_path.read_bytes() == registry_preimage
     assert not list(restarted.promotion_attempt_root.glob("*"))
-    assert not [call for call in git_calls if call[0] in {"commit", "push"}]
+
+    assert restarted.run() == EXIT_NO_WORK
+    final_registry_bytes = registry_path.read_bytes()
+    final_registry = json.loads(final_registry_bytes)
+    evidence = final_registry["entries"]["fn:zz_assembly_crash_"][
+        "assembly_conflicts"
+    ]
+    assert len(evidence) == 1
+    assert evidence[0]["resolution"] == "unresolved"
+    assert evidence[0]["injectable"] is False
+    assert final_registry["version"] == 9
+    import_events = [
+        json.loads(line)
+        for line in (run_root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind")
+        == "registry_assembly_conflicts_imported"
+        and json.loads(line).get("run_id") == restarted.run_id
+    ]
+    assert len(import_events) == 1
+    progress_events = _remote_progress_events(remote)
+    assert len(
+        [
+                event
+                for event in progress_events
+                if event.get("unit") == "unit-a"
+                and event.get("result") == "green"
+        ]
+    ) == 1
+    assert _git(repo, "rev-list", "--count", f"{baseline}..HEAD").stdout.strip() == "1"
+    assert restarted.run() == EXIT_NO_WORK
+    assert registry_path.read_bytes() == final_registry_bytes
 
 
 def test_revoked_replacement_state_or_preimage_race_never_overwrites_destination(
