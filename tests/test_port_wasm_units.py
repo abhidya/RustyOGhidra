@@ -527,12 +527,12 @@ def test_reask_recovers_a_malformed_reply(tmp_path, monkeypatch):
     assert "Your previous reply contained no usable" in prompts[1]
 
 
-def test_no_new_header_round_skips_rebuild_and_never_fails_the_attempt(
-    tmp_path, monkeypatch
-):
-    """A round with no extractable header neither rebuilds (identical input,
-    identical output) nor compares fingerprints; the attempt only fails when
-    the last allowed iteration ends without a link."""
+def test_two_consecutive_no_header_rounds_end_the_attempt(tmp_path, monkeypatch):
+    """Design 2.5 [V4-9]: after the format-reminder re-ask has also failed, a
+    THIRD identical ask would be the same-input retry section 0.1 forbids. A
+    second consecutive no_new_header round ends the attempt (red, retryable)
+    with the reply shapes in the reason -- and never rebuilds the unchanged
+    header."""
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     builds, prompts = [], []
@@ -550,19 +550,53 @@ def test_no_new_header_round_skips_rebuild_and_never_fails_the_attempt(
 
     driver = _driver(repo, build_runner=counting_build, llm=ProseLLM())
     assert driver.run() == EXIT_PROGRESSED
-    # the seed header was built exactly once; every no_new_header round reused it
+    # the seed header was built exactly once; no_new_header rounds reused it
     assert len(builds) == 1
-    # each of the 3 fix rounds (cap 4 => 3 fix slots) asked twice: ask + re-ask
-    assert len(prompts) == 6
+    # round 1: ask + re-ask; round 2: ask + re-ask; then the attempt ENDS --
+    # the old behaviour spent a third round (6 prompts) on identical inputs
+    assert len(prompts) == 4
     assert "Your previous reply contained no usable" in prompts[1]
     state = json.loads(
         (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
     )
     record = state["units"]["unit-a"]
     assert record["status"] == "red_retryable"
-    assert record["last_stage"] == "wasm-link"  # ran out of iterations, not failed mid-round
-    assert "not linked" in record["error"]
+    assert record["last_stage"] == "compile-fix"
+    assert "two consecutive" in record["error"]
     assert "no code block" in record["error"]
+    # the reason carries the recorded reply shapes as evidence
+    assert "len=" in record["error"]
+
+
+def test_single_no_header_round_recovers_when_next_round_extracts(
+    tmp_path, monkeypatch
+):
+    """One no_new_header round stays ROUND-level: a usable header on the next
+    round resets the consecutive count and the attempt proceeds to green."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    replies = ["prose only", "still prose", "```c\n/* fixed */\n```"]
+
+    def fake_build(workdir, exports, extra=None):
+        if replies:  # until the fix lands, keep failing
+            return False, "error: bad"
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    class RecoveringLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            return replies.pop(0)
+
+    driver = _driver(repo, build_runner=fake_build, llm=RecoveringLLM())
+    assert driver.run() == EXIT_NO_WORK
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    record = state["units"]["unit-a"]
+    assert record["status"] == "green"
+    assert record["model_requests"] == 3  # ask + re-ask (missed) + recovered ask
 
 
 # --------------------------------------------------- T1: feedback construction
@@ -611,3 +645,416 @@ def test_header_seed_read_error_is_retryable_not_structural(tmp_path, monkeypatc
     assert record["status"] == "red_retryable"
     assert record["status"] != "structural_ineligible"
     assert "header seed" in record["error"]
+
+
+# ------------------------------------------- T2a: post-mortem data capture, 2.3
+
+
+def _state(repo: Path) -> dict:
+    return json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+
+
+def _state_path(repo: Path) -> Path:
+    return repo / "research/decomp/generated/finish-game-port/wasm-units-state.json"
+
+
+WORLD_KEYS = {
+    "config_hash", "toolchain_hash", "driver_rev", "prompt_version", "registry_version",
+}
+
+
+def test_fail_records_rounds_with_diagnostics_fingerprint_and_world_version(
+    tmp_path, monkeypatch
+):
+    """Design 2.3 [V4-4]: rounds[] gains the normalized diagnostic set and its
+    fingerprint per round ("never cleared" becomes a set intersection), and
+    every verdict records the world-version it was reached under (2.8)."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+
+    def same_error_build(workdir, exports, extra=None):
+        return False, "unit.c:9:3: error: use of undeclared identifier 'x'"
+
+    class FixLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            return "```c\n/* a new header that changes nothing */\n```"
+
+    driver = _driver(repo, build_runner=same_error_build, llm=FixLLM())
+    assert driver.run() == EXIT_PROGRESSED
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "red_retryable"
+    rounds = record["rounds"]
+    assert len(rounds) == 2  # first build + the post-fix rebuild that aborted
+    for entry in rounds:
+        assert entry["diagnostics"] == [
+            "unit.c:9:3: error: use of undeclared identifier 'x'"
+        ]
+        assert len(entry["fingerprint"]) == 64
+    assert rounds[0]["fingerprint"] == rounds[1]["fingerprint"]
+    assert set(record["world_version"]) == WORLD_KEYS
+
+
+def test_header_snapshots_are_attempt_scoped_and_never_overwritten(
+    tmp_path, monkeypatch
+):
+    """Design 2.3 [V4-4]: per-attempt best-header snapshots live under
+    header-attempt{A}-iter{I}.h; a later attempt must never destroy the
+    artifact the post-mortem carry decision needs."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    counter = {"build": 0, "reply": 0}
+
+    def changing_error_build(workdir, exports, extra=None):
+        counter["build"] += 1
+        return False, f"unit.c:{counter['build']}:1: error: diag {counter['build']}"
+
+    class CountingLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            counter["reply"] += 1
+            return f"```c\n/* header from call {counter['reply']} */\n```"
+
+    driver = _driver(repo, build_runner=changing_error_build, llm=CountingLLM())
+    assert driver.run() == EXIT_PROGRESSED  # depth cap, red_retryable
+    workdir = repo / "research/decomp/generated/finish-game-port/wasm-units/unit-a"
+    first = workdir / "header-attempt1-iter1.h"
+    assert first.is_file()
+    first_content = first.read_text()
+
+    # Attempt 2 is only schedulable when the world changed (2.8): simulate a
+    # prompt-rule change by rewriting the recorded component.
+    state_path = _state_path(repo)
+    state = json.loads(state_path.read_text())
+    state["units"]["unit-a"]["world_version"]["prompt_version"] = "0"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    driver2 = _driver(repo, build_runner=changing_error_build, llm=CountingLLM())
+    assert driver2.run() == EXIT_PROGRESSED
+    assert (workdir / "header-attempt2-iter1.h").is_file()
+    # the earlier attempt's snapshot survives byte-identical
+    assert first.read_text() == first_content
+    record = _state(repo)["units"]["unit-a"]
+    assert record["attempts"] == 2
+    # rounds reference the attempt-scoped snapshot paths
+    assert any("header-attempt2-iter" in r["header"] for r in record["rounds"])
+
+
+# ------------------------------------------------ T2a: world-hash gating, 2.8
+
+
+def test_zero_delta_red_is_skipped_and_run_state_says_waiting_world_change(
+    tmp_path, monkeypatch
+):
+    """Design 2.8 [V4-3]: a red whose recorded world-version equals the current
+    one in every component is not schedulable; a pass finding only such reds
+    (and no pendings) writes run_state="waiting_world_change" and journals the
+    event -- no new exit code."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+
+    class ProseLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            return "no fence"
+
+    red_driver = _driver(
+        repo,
+        build_runner=lambda workdir, exports, extra=None: (False, "error: bad"),
+        llm=ProseLLM(),
+    )
+    assert red_driver.run() == EXIT_PROGRESSED
+    assert _state(repo)["units"]["unit-a"]["status"] == "red_retryable"
+
+    # Same world, fresh pass: the red is zero-delta, nothing is schedulable.
+    calls = []
+    second = _driver(
+        repo,
+        build_runner=lambda workdir, exports, extra=None: calls.append(1) or (True, ""),
+    )
+    assert second.run() == EXIT_NO_WORK
+    assert calls == []  # the unit was never attempted
+    run_state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/run-state.json").read_text()
+    )
+    assert run_state["run_state"] == "waiting_world_change"
+    assert run_state["status"] == "waiting_world_change"
+    events = [
+        json.loads(line)
+        for line in (
+            repo / "research/decomp/generated/finish-game-port/events.jsonl"
+        ).read_text().splitlines()
+        if line.strip()
+    ]
+    waiting = [e for e in events if e.get("kind") == "waiting_world_change"]
+    assert waiting and waiting[-1]["reds"] == 1
+
+
+def test_world_delta_in_any_component_makes_a_red_schedulable(tmp_path, monkeypatch):
+    """A change in ANY world-version component re-opens the red."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+
+    class ProseLLM:
+        default_model = "fake"
+
+        def generate(self, **_kwargs):
+            return "no fence"
+
+    red_driver = _driver(
+        repo,
+        build_runner=lambda workdir, exports, extra=None: (False, "error: bad"),
+        llm=ProseLLM(),
+    )
+    assert red_driver.run() == EXIT_PROGRESSED
+
+    state_path = _state_path(repo)
+    state = json.loads(state_path.read_text())
+    state["units"]["unit-a"]["world_version"]["driver_rev"] = "an-older-rev"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    second = _driver(
+        repo,
+        build_runner=lambda workdir, exports, extra=None: (False, "error: bad"),
+        llm=ProseLLM(),
+    )
+    assert second.run() == EXIT_PROGRESSED  # the unit was attempted again
+    assert _state(repo)["units"]["unit-a"]["attempts"] == 2
+
+
+def test_red_without_recorded_world_version_stays_schedulable(tmp_path, monkeypatch):
+    """Reds verdicted before the gate landed carry no world-version; their
+    world is unknown, so a delta cannot be excluded and they stay in the pool."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo)
+    state = {"units": {"unit-a": {"status": "red_retryable", "attempts": 3}}}
+    queue = [{"name": "unit-a"}]
+    assert driver._next_unit(queue, state, set()) is not None
+
+
+def test_context_budget_red_verdicted_at_32768_is_schedulable_at_262144(
+    tmp_path, monkeypatch
+):
+    """Design 2.8 [V4-3] regression fixture -- the live counterexample: the two
+    context-budget reds (auto-c0000-017 required 34,008 tokens) were verdicted
+    when the serving maximum was 32,768. Serving is now 262,144: no code fix
+    was declared and no registry entry touches them, yet the serving-config
+    component changed, so they MUST be schedulable."""
+    from src.port_wasm_units import serving_config_hash
+
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo)
+    base = {
+        "toolchain_hash": "t" * 64,
+        "driver_rev": "r" * 40,
+        "prompt_version": "1",
+        "registry_version": "0",
+    }
+    recorded = dict(base, config_hash=serving_config_hash("qwen-27b", 32768, 1200))
+    current = dict(base, config_hash=serving_config_hash("qwen-27b", 262144, 1200))
+    driver._world_version_cache = current
+    state = {
+        "units": {
+            "auto-c0000-017": {
+                "status": "red_retryable",
+                "attempts": 1,
+                "required_tokens": 34008,
+                "world_version": recorded,
+            }
+        }
+    }
+    queue = [{"name": "auto-c0000-017"}]
+    picked = driver._next_unit(queue, state, set())
+    assert picked is not None and picked["name"] == "auto-c0000-017"
+    # control: an identical serving config really is zero-delta
+    state["units"]["auto-c0000-017"]["world_version"] = dict(current)
+    assert driver._next_unit(queue, state, set()) is None
+
+
+def test_pending_work_always_precedes_waiting_world_change(tmp_path, monkeypatch):
+    """Section 4 starvation invariant: waiting_world_change while pending
+    (never-attempted) units exist would be a selector bug -- a zero-delta red
+    next to a pending unit must yield the pending unit."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo)
+    current = driver._world_version()
+    state = {
+        "units": {
+            "unit-red": {
+                "status": "red_retryable",
+                "attempts": 2,
+                "world_version": dict(current),
+            },
+            "unit-new": {"status": "pending", "attempts": 0},
+        }
+    }
+    queue = [{"name": "unit-red"}, {"name": "unit-new"}]
+    picked = driver._next_unit(queue, state, set())
+    assert picked is not None and picked["name"] == "unit-new"
+    assert driver._only_zero_delta_reds(state) is False
+
+
+# --------------------------------------------- T2a: settle-through-journal, 2.9
+
+
+class FakeJournal:
+    def __init__(self):
+        self.checkpoints = []
+
+    def checkpoint(self, **kwargs):
+        self.checkpoints.append(kwargs)
+
+    def push_is_pending(self):
+        return False
+
+    def flush_pending_push(self):
+        pass
+
+
+def test_settle_unit_backs_up_edits_and_emits_journal_events(tmp_path, monkeypatch):
+    """Design 2.9 [V4-9]: every settle goes through a code path that emits the
+    journal event. settle-unit backs up the state file, edits the record,
+    checkpoints the progress journal, journals events.jsonl, and saves."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    state_path = _state_path(repo)
+    state_path.write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {"unit-a": {"status": "red_retryable", "attempts": 4}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal = FakeJournal()
+    driver = _driver(repo, journal=journal)
+    result = driver.settle_unit(
+        "unit-a", "structural_ineligible", "hand-verified: no extractable code"
+    )
+    assert result["previous_status"] == "red_retryable"
+    assert result["backup"] and result["backup"].startswith(
+        "wasm-units-state.json.settle-backup-"
+    )
+    backup_path = state_path.parent / result["backup"]
+    assert backup_path.is_file()
+    # the backup preserves the PRE-settle record
+    assert json.loads(backup_path.read_text())["units"]["unit-a"]["status"] == "red_retryable"
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "structural_ineligible"
+    assert record["settled_via"] == "settle-unit"
+    assert record["settle_reason"] == "hand-verified: no extractable code"
+    assert set(record["world_version"]) == WORLD_KEYS
+    # the progress journal saw the transition
+    assert len(journal.checkpoints) == 1
+    transition = journal.checkpoints[0]["transition"]
+    assert transition.unit == "unit-a"
+    assert transition.result == "structural_ineligible"
+    assert transition.stage == "manual-settle"
+    assert transition.extra["settled_via"] == "settle-unit"
+    # events.jsonl carries the settle event
+    events = [
+        json.loads(line)
+        for line in (
+            repo / "research/decomp/generated/finish-game-port/events.jsonl"
+        ).read_text().splitlines()
+        if line.strip()
+    ]
+    settled = [e for e in events if e.get("kind") == "verdict_settled"]
+    assert settled and settled[-1]["unit"] == "unit-a"
+    assert settled[-1]["via"] == "settle-unit"
+
+
+def test_settle_unit_rejects_bad_status_unknown_unit_and_empty_reason(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo, journal=FakeJournal())
+    with pytest.raises(ValueError):
+        driver.settle_unit("unit-a", "red_retryable", "not a settle status")
+    with pytest.raises(ValueError):
+        driver.settle_unit("no-such-unit", "structural_ineligible", "reason")
+    with pytest.raises(ValueError):
+        driver.settle_unit("unit-a", "structural_ineligible", "   ")
+
+
+def test_settle_unit_cli_subcommand(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    from src.port_wasm_units import main
+
+    repo = _write_repo(tmp_path)
+    rc = main(
+        [
+            "settle-unit",
+            "--unit", "unit-a",
+            "--status", "structural_ineligible",
+            "--reason", "cli settle test",
+            "--repo-root", str(repo),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unit"] == "unit-a"
+    assert _state(repo)["units"]["unit-a"]["status"] == "structural_ineligible"
+
+
+# ------------------------------------------ T2a: product_priority ordering, 2.14
+
+
+def test_priority_sidecar_leads_the_selection_order(tmp_path, monkeypatch):
+    """Design 2.14 [V4-2]: product_priority (higher first) leads the sort key;
+    queue order stays the tie-break; an absent sidecar preserves the previous
+    ordering exactly."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo)
+    queue = [{"name": "unit-a"}, {"name": "unit-b"}]
+    state = {
+        "units": {
+            "unit-a": {"status": "pending", "attempts": 0},
+            "unit-b": {"status": "pending", "attempts": 0},
+        }
+    }
+    # absent sidecar: queue order wins
+    assert driver._next_unit(queue, state, set())["name"] == "unit-a"
+
+    data_dir = repo / "research/decomp/data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "unit-priority.json").write_text(
+        json.dumps({"priorities": {"unit-b": 305, "unit-a": 12}}), encoding="utf-8"
+    )
+    fresh = _driver(repo)
+    assert fresh._next_unit(queue, state, set())["name"] == "unit-b"
+    # priority never resurrects a zero-delta red or a settled unit
+    state["units"]["unit-b"]["status"] = "green"
+    assert fresh._next_unit(queue, state, set())["name"] == "unit-a"
+
+
+def test_priority_ties_fall_back_to_attempts_then_queue_order(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    data_dir = repo / "research/decomp/data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "unit-priority.json").write_text(
+        json.dumps({"priorities": {"unit-a": 100, "unit-b": 100}}), encoding="utf-8"
+    )
+    driver = _driver(repo)
+    queue = [{"name": "unit-a"}, {"name": "unit-b"}]
+    state = {
+        "units": {
+            "unit-a": {"status": "red_retryable", "attempts": 2},
+            "unit-b": {"status": "pending", "attempts": 0},
+        }
+    }
+    # equal priority: the less-attempted unit still wins
+    assert driver._next_unit(queue, state, set())["name"] == "unit-b"

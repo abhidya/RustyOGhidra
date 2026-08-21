@@ -18,7 +18,21 @@ Design rules carried over from the POC (POC-RESULTS-2026-08-09.md):
   - Never trust link success: undefined symbols silently become wasm env
     imports; only the gnt4_* SDK seam may remain imported (whitelist gate).
   - Only the oracle decides green. Failed units stay retryable forever
-    (no countdowns); rotation is least-attempted-first.
+    (no countdowns); rotation is least-attempted-first -- but a red unit is
+    only SCHEDULABLE when the world changed since its verdict (design section
+    2.8 [V4-3]: the recorded world-version must differ in at least one
+    component from the current one; zero-delta reds are skipped and a pass
+    that finds nothing else writes run_state="waiting_world_change").
+
+Settle-through-journal rule (design section 2.9 [V4-9], mirrored in the
+GotYaForce AGENTS.md): any operation that settles, carries, or unsettles a
+unit verdict MUST go through a code path that emits the corresponding journal
+event. Hand-editing wasm-units-state.json is FORBIDDEN -- the 2026-08-20
+migration wrote 15 verdicts straight into the state file without a single
+journal event, and events.jsonl has disagreed with live state ever since.
+Use ``settle_unit`` (driver method, or the ``settle-unit`` CLI subcommand of
+this module), which backs up the state file, edits the record, emits the
+journal checkpoint + events.jsonl event, and saves atomically.
 """
 
 from __future__ import annotations
@@ -407,9 +421,12 @@ def normalise_diagnostic(line: str) -> str:
     return line.strip()
 
 
-def diagnostic_fingerprint(error_text: str) -> str:
-    """sha256 over the sorted, deduplicated, normalised `error:` lines.
+def normalized_diagnostics(error_text: str) -> list[str]:
+    """The sorted, deduplicated, normalised diagnostic lines of a build.
 
+    This is the per-round set the post-mortem needs (design section 2.3
+    [V4-4]): "never cleared" is the intersection of these sets across rounds,
+    and cross-attempt oscillation detection is a fingerprint comparison.
     Gate messages (link gate / import gate) carry no `error:` lines, so they
     fall back to the full normalised text: their content is stable symbol
     names, not churning line numbers, and two different missing-symbol sets
@@ -418,8 +435,14 @@ def diagnostic_fingerprint(error_text: str) -> str:
     lines = extract_error_lines(error_text)
     if not lines:
         lines = [line for line in (error_text or "").splitlines() if line.strip()]
-    diagnostics = sorted({normalise_diagnostic(line) for line in lines})
-    return hashlib.sha256("\n".join(diagnostics).encode("utf-8")).hexdigest()
+    return sorted({normalise_diagnostic(line) for line in lines})
+
+
+def diagnostic_fingerprint(error_text: str) -> str:
+    """sha256 over the sorted, deduplicated, normalised `error:` lines."""
+    return hashlib.sha256(
+        "\n".join(normalized_diagnostics(error_text)).encode("utf-8")
+    ).hexdigest()
 
 
 def is_stuck(
@@ -439,6 +462,113 @@ def is_stuck(
         and stage == previous_stage
         and fingerprint == previous_fingerprint
     )
+
+
+# ---------------------------------------------------------------------------
+# World-version (design section 2.8 [V4-3]): a mechanical hash of everything
+# that could make a retry informationally different from the failed attempt.
+# Every component is READ from the running system; nothing is declared by a
+# human. A red unit is schedulable only when the current world-version differs
+# from the one recorded at its verdict in AT LEAST ONE component.
+
+# Version of the prompt content the compile-fix loop injects (SYSTEM_PROMPT
+# plus any injected rules). BUMP RULE: increment whenever the instructions the
+# model receives change SEMANTICALLY -- a new rule, a changed idiom, a
+# reworded constraint. Pure typo/whitespace fixes that cannot change model
+# behaviour do not count. Bumping it is a world-change: every zero-delta red
+# becomes schedulable again, so bump deliberately, never casually.
+PROMPT_VERSION = 1
+
+# Knowledge-registry version component. The registry does not exist until T2c
+# (design section 2.11); a constant 0 keeps the world-hash shape stable so
+# verdicts recorded now stay comparable when the registry lands.
+REGISTRY_VERSION = 0
+
+
+def serving_config_hash(model: str, context_length: int, timeout: int) -> str:
+    """Hash of the serving configuration a verdict was reached under.
+
+    Model id + served context length + request timeout: the three knobs whose
+    change can make a previously impossible unit possible (the live
+    counterexample: two context-budget reds verdicted at 32,768 served tokens
+    were unschedulable forever under declared-ledger gating after serving
+    moved to 262,144 -- design section 2.8's regression fixture).
+    """
+    return hashlib.sha256(
+        f"{model}|{context_length}|{timeout}".encode("utf-8")
+    ).hexdigest()
+
+
+def _resolve_serving_timeout() -> int:
+    """CUSTOM_API_TIMEOUT with the same .env-wins precedence as the rest of
+    the port-model configuration (src/port_model_config.py)."""
+    from src.port_model_config import read_env_file
+
+    values = read_env_file()
+    raw = values.get("CUSTOM_API_TIMEOUT") or os.environ.get("CUSTOM_API_TIMEOUT") or "120"
+    try:
+        return int(raw)
+    except ValueError:
+        return 120
+
+
+def emcc_version_string(repo_root: Path) -> str:
+    """The pinned emscripten toolchain version, read mechanically.
+
+    Read from the emsdk checkout's version file rather than by invoking
+    ``emcc --version`` -- sourcing the toolchain costs seconds and needs Git
+    Bash, while the version file IS what the invocation would print. An
+    absent/unreadable file degrades to "unknown" (still a stable component:
+    the hash only needs to CHANGE when the toolchain does).
+    """
+    path = (
+        Path(repo_root)
+        / "research/tools/emsdk/upstream/emscripten/emscripten-version.txt"
+    )
+    try:
+        text = path.read_text(encoding="utf-8-sig").strip().strip('"').strip()
+        return text or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def driver_git_rev() -> str:
+    """HEAD of the OGhidra checkout this driver is running from."""
+    try:
+        completed = subprocess.run(
+            [
+                "git", "-C", str(Path(__file__).resolve().parent.parent),
+                "rev-parse", "HEAD",
+            ],
+            capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW,
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            return completed.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
+
+
+def compute_world_version(repo_root: Path, model_config: Any) -> dict[str, str]:
+    """The five-component world-version recorded at verdict time.
+
+    Kept as a component DICT rather than one flat hash so a later reader can
+    see WHICH component moved (the §2.8 ordering heuristic and the post-mortem
+    both want that); equality across all components is the zero-delta test.
+    """
+    return {
+        "config_hash": serving_config_hash(
+            getattr(model_config, "model", "") or "",
+            getattr(model_config, "max_seq_length", 0) or 0,
+            _resolve_serving_timeout(),
+        ),
+        "toolchain_hash": hashlib.sha256(
+            emcc_version_string(repo_root).encode("utf-8")
+        ).hexdigest(),
+        "driver_rev": driver_git_rev(),
+        "prompt_version": str(PROMPT_VERSION),
+        "registry_version": str(REGISTRY_VERSION),
+    }
 
 
 VOID_DECL = re.compile(r"^\s*void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
@@ -538,6 +668,16 @@ class WasmUnitDriver:
         self._previous_result: str | None = None
         self._model_config = resolve_port_model_config()
         self._provider_paused_detail: str | None = None
+        # World-version (section 2.8 [V4-3]): computed once per run -- the
+        # serving config, toolchain, driver rev and prompt version cannot
+        # change under a running driver, and git/emsdk reads are not free.
+        self._world_version_cache: dict[str, str] | None = None
+        # product_priority sidecar (section 2.14 [V4-2]). Lives in the tracked
+        # data dir, NOT under generated/finish-game-port/ (that directory is
+        # wholesale-gitignored in GotYaForce, .gitignore:63). Absent file =>
+        # every unit priority 0 => ordering unchanged.
+        self.priority_path = self.repo_root / "research/decomp/data/unit-priority.json"
+        self._unit_priorities: dict[str, int] | None = None
 
     # ------------------------------------------------------------------- state
 
@@ -584,6 +724,31 @@ class WasmUnitDriver:
     def _unit_state(self, state: dict[str, Any], name: str) -> dict[str, Any]:
         return state["units"].setdefault(name, {"status": "pending", "attempts": 0})
 
+    def _world_version(self) -> dict[str, str]:
+        if self._world_version_cache is None:
+            self._world_version_cache = compute_world_version(
+                self.repo_root, self._model_config
+            )
+        return self._world_version_cache
+
+    def _unit_priority(self, name: str) -> int:
+        """product_priority from the sidecar (section 2.14): higher serves
+        first; a missing file or an unmapped unit is priority 0."""
+        if self._unit_priorities is None:
+            try:
+                payload = json.loads(self.priority_path.read_text(encoding="utf-8-sig"))
+                # Either {"priorities": {unit: int}} (the generator's shape,
+                # with provenance metadata alongside) or a flat {unit: int}.
+                mapping = payload.get("priorities", payload) if isinstance(payload, dict) else {}
+                self._unit_priorities = {
+                    str(unit): int(value)
+                    for unit, value in mapping.items()
+                    if isinstance(value, (int, float, str)) and str(value).lstrip("-").isdigit()
+                }
+            except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, AttributeError):
+                self._unit_priorities = {}
+        return self._unit_priorities.get(name, 0)
+
     # ----------------------------------------------------------------- control
 
     def _control_command(self) -> str:
@@ -621,7 +786,14 @@ class WasmUnitDriver:
         except OSError:
             pass  # telemetry never blocks port work
 
-    def _write_progress(self, state: dict[str, Any], status: str, *, unit: str | None = None) -> None:
+    def _write_progress(
+        self,
+        state: dict[str, Any],
+        status: str,
+        *,
+        unit: str | None = None,
+        run_state: str = "progressing",
+    ) -> None:
         units = state.get("units", {})
         greens = sum(1 for record in units.values() if record.get("status") == "green")
         total = max(len(units), 1)
@@ -631,6 +803,11 @@ class WasmUnitDriver:
             "objective": "Port verbatim Ghidra C units to oracle-gated wasm (wasm_units mode)",
             "run_id": self.run_id,
             "status": status,
+            # Section 2.8 [V4-3] run-state semantics: progressing |
+            # waiting_world_change | provider_paused. A run-state FIELD, not a
+            # new exit code -- exit codes stay frozen until Phase 3 (section
+            # 2.9); the supervisor keeps reading the file it already reads.
+            "run_state": run_state,
             "updated_at": utc_now(),
             "progress": {
                 "completed_work": greens,
@@ -1001,10 +1178,20 @@ class WasmUnitDriver:
         previous_fingerprint: str | None = None
         header_applied = False
         no_new_header_rounds = 0
+        # Section 2.5 [V4-9]: a SECOND consecutive no_new_header round ends
+        # the attempt -- after the format-reminder re-ask has also failed, the
+        # next iteration would call the model with byte-identical inputs (same
+        # header, same errors, same base prompt), which is exactly the retry
+        # section 0.1 forbids. Tracked separately from the total because a
+        # recovered round (header applied) resets the consecutive count.
+        consecutive_no_header = 0
+        no_header_shapes: list[str] = []
         current_header_path = str(header_seed)
-        # Per-round memory: error count + header path, recorded to select the
-        # best round when T2's carry logic lands (section 2.2 drops the old
-        # count-increase abort). Not used further in T1.
+        # Per-round memory (section 2.3 [V4-4]): stage, error count, header
+        # path, plus the NORMALIZED DIAGNOSTIC SET and its fingerprint --
+        # "never cleared" is then a set intersection and cross-attempt
+        # oscillation detection a fingerprint comparison. Persisted into the
+        # unit state record on _fail for the post-mortem carry.
         rounds: list[dict[str, Any]] = []
         for iteration in range(1, MAX_COMPILE_ITERS + 1):
             iterations = iteration
@@ -1033,6 +1220,8 @@ class WasmUnitDriver:
                         "stage": stage,
                         "error_count": count_error_lines(build_error),
                         "header": current_header_path,
+                        "diagnostics": normalized_diagnostics(build_error),
+                        "fingerprint": fingerprint,
                     }
                 )
                 if is_stuck(
@@ -1042,7 +1231,7 @@ class WasmUnitDriver:
                     return self._fail(
                         state, record, name,
                         "stuck: identical diagnostics after applied fix",
-                        stage="compile-fix",
+                        stage="compile-fix", extra={"rounds": rounds},
                     )
                 previous_stage, previous_fingerprint = stage, fingerprint
             # else: section 2.5 exemption -- the previous round applied no new
@@ -1079,11 +1268,13 @@ class WasmUnitDriver:
                         return self._fail(
                             state, record, name, f"context budget: {error}",
                             stage="context-budget", result=RESULT_GATE_FAILED,
+                            extra={"rounds": rounds},
                         )
                     if self._is_provider_fault(error):
                         return self._provider_pause(state, record, name, str(error))
                     return self._fail(
-                        state, record, name, f"compile-fix LLM: {error}", stage="compile-fix",
+                        state, record, name, f"compile-fix LLM: {error}",
+                        stage="compile-fix", extra={"rounds": rounds},
                     )
                 record["model_requests"] = record.get("model_requests", 0) + 1
                 model_used = getattr(self._llm, "default_model", None) or model_used
@@ -1098,22 +1289,43 @@ class WasmUnitDriver:
                 # header is unchanged, so the failing build result stands),
                 # and give the next iteration a fresh model call.
                 no_new_header_rounds += 1
+                consecutive_no_header += 1
+                shape = (
+                    getattr(self, "_last_reply_shape", None) or "no reply captured"
+                )
+                no_header_shapes.append(shape)
                 header_applied = False
                 self.events.emit(
                     "wasm_unit_no_new_header",
                     unit=name,
                     iteration=iteration,
-                    reply_shape=(
-                        getattr(self, "_last_reply_shape", None)
-                        or "no reply captured"
-                    ),
+                    reply_shape=shape,
                 )
+                if consecutive_no_header >= 2:
+                    # Section 2.5 [V4-9]: the first re-ask carried new
+                    # information ("your reply had no code block"); a THIRD
+                    # identical ask would not. Two consecutive extraction
+                    # misses end the attempt -- red, retryable, and the
+                    # world-changed gate (section 2.8) then governs like any
+                    # other red.
+                    return self._fail(
+                        state, record, name,
+                        "no new header: two consecutive compile-fix rounds "
+                        "(ask + format-reminder re-ask each) returned no code "
+                        "block; a further same-input round is forbidden "
+                        "(section 0.1). Reply shapes: "
+                        + " | ".join(no_header_shapes[-2:]),
+                        stage="compile-fix", extra={"rounds": rounds},
+                    )
                 continue
+            consecutive_no_header = 0
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
-            (workdir / f"header-iter{iteration}.h").write_text(
-                fixed, encoding="utf-8", newline="\n"
-            )
-            current_header_path = str(workdir / f"header-iter{iteration}.h")
+            # Section 2.3 [V4-4]: snapshots are ATTEMPT-scoped
+            # (header-attempt{A}-iter{I}.h) so a later attempt can never
+            # overwrite the artifact the post-mortem carry decision needs.
+            snapshot = workdir / f"header-attempt{record['attempts']}-iter{iteration}.h"
+            snapshot.write_text(fixed, encoding="utf-8", newline="\n")
+            current_header_path = str(snapshot)
             header_applied = True
         if not linked:
             detail = f"not linked: {summarise_build_error(build_error)}"
@@ -1126,6 +1338,7 @@ class WasmUnitDriver:
             return self._fail(
                 state, record, name, detail,
                 stage="wasm-link", result=RESULT_GATE_FAILED,
+                extra={"rounds": rounds},
             )
 
         # 4. oracle gate. Tier "compile_only" (auto-generated chunk units) has no
@@ -1152,6 +1365,7 @@ class WasmUnitDriver:
             return self._fail(
                 state, record, name, f"oracle red: {summary}",
                 stage="oracle", result=RESULT_GATE_FAILED,
+                extra={"rounds": rounds},
             )
 
         # 5. green: artifacts + provenance + commit-per-match
@@ -1310,6 +1524,7 @@ class WasmUnitDriver:
         *,
         stage: str = "port",
         result: str = RESULT_RETRYABLE,
+        extra: dict[str, Any] | None = None,
     ) -> str:
         # Owner design: no countdown kills a unit; red units sink behind
         # less-attempted work and come around again. `structural_ineligible` is
@@ -1320,6 +1535,12 @@ class WasmUnitDriver:
             if result == RESULT_STRUCTURAL_INELIGIBLE
             else "red_retryable"
         )
+        # Section 2.8 [V4-3]: every verdict records the world it was reached
+        # under; section 2.3 [V4-4]: the rounds summary rides along so the
+        # post-mortem is assemblable later without the workdir.
+        world = self._world_version()
+        payload: dict[str, Any] = dict(extra or {})
+        payload["world_version"] = world
         transition = UnitTransition(
             unit=name,
             result=result,
@@ -1329,16 +1550,19 @@ class WasmUnitDriver:
             model=self._model_config.model,
             product_commit_failed=stage == "commit",
             product_commit_detail=error if stage == "commit" else "",
+            extra=payload,
         )
+        record_update = dict(payload)
+        record_update.update(status=status, error=error[:2000], last_stage=stage)
         if status in self.SETTLED_STATUSES:
             # Settling removes the unit from the queue permanently, and
             # `_reconcile_interrupted` only rescues units left as `porting`.
             # Record it remotely BEFORE it becomes unrecoverable locally.
             self._checkpoint(state, transition)
-            record.update(status=status, error=error[:2000], last_stage=stage)
+            record.update(record_update)
             self._save_state(state)
         else:
-            record.update(status=status, error=error[:2000], last_stage=stage)
+            record.update(record_update)
             self._save_state(state)
             self._checkpoint(state, transition)
         self.events.emit(
@@ -1353,6 +1577,102 @@ class WasmUnitDriver:
     # (pending, porting, red_retryable) still counts as work: red units are
     # retried forever by design, so only these two end the queue.
     SETTLED_STATUSES = {"green", "structural_ineligible"}
+
+    # ------------------------------------------------------------------ settle
+
+    _SETTLE_RESULTS = {
+        "structural_ineligible": RESULT_STRUCTURAL_INELIGIBLE,
+        "green": RESULT_GREEN,
+    }
+
+    def settle_unit(self, unit_name: str, status: str, reason: str) -> dict[str, Any]:
+        """Settle one unit verdict THROUGH the journal (section 2.9 [V4-9]).
+
+        The only sanctioned way to hand-settle, carry, or migrate a verdict:
+        backs up the state file, edits the record, emits the journal
+        checkpoint and the events.jsonl event, then saves. Hand-editing
+        wasm-units-state.json is forbidden (module docstring / AGENTS.md) --
+        the 2026-08-20 migration wrote verdicts out-of-band and events.jsonl
+        has disagreed with live state ever since.
+        """
+        if status not in self._SETTLE_RESULTS:
+            raise ValueError(
+                f"settle status must be one of {sorted(self._SETTLE_RESULTS)}, "
+                f"got {status!r}"
+            )
+        if not (reason or "").strip():
+            raise ValueError("a settle requires a non-empty reason")
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "settling under a running driver would race its state writes"
+            )
+        try:
+            state = self._load_state()
+            known: set[str] = set(state.get("units", {}))
+            try:
+                known.update(unit["name"] for unit in self._load_queue())
+            except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+                pass  # a queue-less checkout can still settle a known record
+            if unit_name not in known:
+                raise ValueError(
+                    f"unknown unit {unit_name!r}: not in the queue or the state file"
+                )
+            # Backup BEFORE any edit: a settle is permanent, and the backup is
+            # what makes a mistaken one recoverable.
+            backup: str | None = None
+            if self.state_path.is_file():
+                backup_path = self.state_path.with_name(
+                    f"{self.state_path.name}.settle-backup-"
+                    + utc_now().replace(":", "").replace("-", "")
+                )
+                shutil.copyfile(self.state_path, backup_path)
+                backup = backup_path.name
+            record = self._unit_state(state, unit_name)
+            previous_status = record.get("status")
+            transition = UnitTransition(
+                unit=unit_name,
+                result=self._SETTLE_RESULTS[status],
+                stage="manual-settle",
+                attempt=record.get("attempts", 0),
+                detail=f"settled via settle-unit: {reason}",
+                model=self._model_config.model,
+                extra={
+                    "settled_via": "settle-unit",
+                    "previous_status": previous_status,
+                    "world_version": self._world_version(),
+                },
+            )
+            # Settling removes the unit from the pool permanently: record it
+            # remotely BEFORE it becomes unrecoverable locally (same order as
+            # _fail's settled branch).
+            self._checkpoint(state, transition)
+            record.update(
+                status=status,
+                error=reason if status == "structural_ineligible" else None,
+                last_stage="manual-settle",
+                settle_reason=reason,
+                settled_via="settle-unit",
+                world_version=self._world_version(),
+            )
+            self._save_state(state)
+            self.events.emit(
+                "verdict_settled",
+                unit=unit_name,
+                status=status,
+                previous_status=previous_status,
+                reason=reason[:600],
+                via="settle-unit",
+            )
+            return {
+                "unit": unit_name,
+                "status": status,
+                "previous_status": previous_status,
+                "backup": backup,
+                "state_file": str(self.state_path),
+            }
+        finally:
+            self.lock.release()
 
     def _reconcile_interrupted(self, state: dict[str, Any]) -> None:
         """A unit left `porting` by a killed run never got a transition record.
@@ -1405,6 +1725,17 @@ class WasmUnitDriver:
             for record in state.get("units", {}).values()
         )
 
+    def _is_zero_delta_red(self, record: dict[str, Any]) -> bool:
+        """Section 2.8 [V4-3]: a red whose recorded world-version equals the
+        current one in EVERY component. Retrying it would feed the model the
+        exact inputs that already failed -- the section 0.1 forbidden retry.
+        A red with no recorded world-version predates the gate and stays
+        schedulable (its world is unknown, so a delta cannot be excluded)."""
+        if record.get("status") != "red_retryable":
+            return False
+        recorded = record.get("world_version")
+        return isinstance(recorded, dict) and recorded == self._world_version()
+
     def _next_unit(
         self,
         queue: list[dict[str, Any]],
@@ -1417,15 +1748,36 @@ class WasmUnitDriver:
             record = self._unit_state(state, name)
             if record.get("status") in self.SETTLED_STATUSES or name in processed:
                 continue
+            if self._is_zero_delta_red(record):
+                # World-changed gating: not schedulable until any world-version
+                # component moves. Still counted by _work_remains -- skipped,
+                # never settled.
+                continue
             # attempts + interruptions: a verdict and a crash both cost the
             # unit its place in line, so neither a failing unit nor a
             # driver-killing one can monopolise the selector.
             cost = int(record.get("attempts", 0)) + int(record.get("interruptions", 0))
-            candidates.append((cost, index, unit))
+            # Section 2.14 [V4-2]: product_priority leads the key (higher
+            # serves first, hence negated); chunk/queue order stays the tail
+            # tie-break. An absent sidecar makes every priority 0 and the
+            # ordering collapses to the previous (cost, index) behaviour.
+            candidates.append((-self._unit_priority(name), cost, index, unit))
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates[0][2]
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        return candidates[0][3]
+
+    def _only_zero_delta_reds(self, state: dict[str, Any]) -> bool:
+        """True when every unsettled unit is a zero-delta red: nothing is
+        schedulable and nothing will be until the world changes."""
+        reds = 0
+        for record in state.get("units", {}).values():
+            if record.get("status") in self.SETTLED_STATUSES:
+                continue
+            if not self._is_zero_delta_red(record):
+                return False
+            reds += 1
+        return reds > 0
 
     def run(self) -> int:
         if not self.lock.acquire():
@@ -1464,6 +1816,41 @@ class WasmUnitDriver:
                 unit = self._next_unit(queue, state, processed)
                 if unit is None:
                     work_left = self._work_remains(state)
+                    if (
+                        work_left
+                        and steps_done == 0
+                        and self._only_zero_delta_reds(state)
+                    ):
+                        # Terminal protocol (section 2.8 [V4-3]): the pass
+                        # found only zero-delta reds and no pendings. Honest
+                        # accounting: the reds still count as work, but the
+                        # pass did not progress -- say so in run-state (the
+                        # channel the supervisor already reads; NO new exit
+                        # code) and journal the event.
+                        waiting = sorted(
+                            unit_name
+                            for unit_name, rec in state.get("units", {}).items()
+                            if rec.get("status") == "red_retryable"
+                        )
+                        self._write_progress(
+                            state, "waiting_world_change",
+                            run_state="waiting_world_change",
+                        )
+                        self.events.emit(
+                            "waiting_world_change",
+                            reds=len(waiting),
+                            units=waiting[:20],
+                            world_version=self._world_version(),
+                        )
+                        self.events.emit(
+                            "driver_stopped", reason="waiting_world_change"
+                        )
+                        self._checkpoint(
+                            state, None,
+                            workflow_state="waiting_world_change",
+                            driver_running=False,
+                        )
+                        return EXIT_NO_WORK
                     self._write_progress(state, "running" if work_left else "completed")
                     self.events.emit(
                         "driver_stopped",
@@ -1493,7 +1880,10 @@ class WasmUnitDriver:
                     # The provider is out. Stop the pass rather than marching
                     # the rest of the queue into the same wall, and tell the
                     # machine layer in the vocabulary it already understands.
-                    self._write_progress(state, "paused_provider_unavailable")
+                    self._write_progress(
+                        state, "paused_provider_unavailable",
+                        run_state="provider_paused",
+                    )
                     self.events.emit(
                         "driver_stopped", reason="provider_unavailable",
                         detail=(self._provider_paused_detail or "")[:300],
@@ -1515,3 +1905,39 @@ class WasmUnitDriver:
         finally:
             self._heartbeat("wasm_units:idle")
             self.lock.release()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Maintenance CLI. ``settle-unit`` is the settle-through-journal path
+    (section 2.9 [V4-9]): the ONLY sanctioned way to settle a verdict by hand.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    settle = sub.add_parser(
+        "settle-unit",
+        help="settle one unit verdict through the journal (backup + edit + "
+        "journal event + save); never hand-edit wasm-units-state.json",
+    )
+    settle.add_argument("--unit", required=True, help="queue unit name")
+    settle.add_argument(
+        "--status", required=True,
+        choices=sorted(WasmUnitDriver._SETTLE_RESULTS),
+        help="permanent status to record",
+    )
+    settle.add_argument(
+        "--reason", required=True,
+        help="why this verdict is being settled by hand (journaled verbatim)",
+    )
+    settle.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    args = parser.parse_args(argv)
+    if args.command == "settle-unit":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        print(json.dumps(driver.settle_unit(args.unit, args.status, args.reason), indent=2))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
