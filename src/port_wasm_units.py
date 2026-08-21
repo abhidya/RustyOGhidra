@@ -1831,21 +1831,23 @@ class WasmUnitDriver:
         record_gate_result(self.assembly_ledger_path, result)
         return result
 
-    def _maybe_run_assembly_gate(self, unit_name: str) -> None:
-        """Driver-side gate hook, called after every green/staged unit.
+    def _maybe_run_assembly_gate(self, unit_name: str) -> dict[str, Any]:
+        """Run the pre-publication assembly gate for ``unit_name``.
 
-        Telemetry-with-teeth: the gate NEVER changes the unit's verdict (the
-        unit already earned green), but a failure pages (assembly_gate_failed
-        event, the section 4 [V4-11] invariant row) and files conflict
-        records in the tracked ledger. Any internal fault degrades to an
-        event, never to a lost unit."""
+        The candidate artifact has been materialized but is not committed,
+        settled, or registry-authoritative yet. A failed gate (including an
+        internal link/smoke fault) is therefore a blocking result for the
+        caller. Fewer than two artifacts is an explicit no-composition-needed
+        result (``passed is None``). Ledger commit bookkeeping remains
+        best-effort and never changes an already-computed gate result.
+        """
         try:
             material_before = gate_ledger_material(
                 read_gate_ledger(self.assembly_ledger_path)
             )
             result = self.run_assembly_gate_now(assembly_window_size())
             if result.get("passed") is None:
-                return  # fewer than 2 units: composition is not yet a claim
+                return result  # fewer than 2 units: composition is not yet a claim
             self.events.emit(
                 "assembly_gate",
                 unit=unit_name,
@@ -1870,6 +1872,20 @@ class WasmUnitDriver:
                     ],
                     detail=(result.get("detail") or "")[:600],
                 )
+        except Exception as error:  # noqa: BLE001 - fail the candidate closed
+            self.events.emit(
+                "assembly_gate_error", unit=unit_name, error=str(error)[:400]
+            )
+            return {
+                "passed": False,
+                "n": None,
+                "units": [unit_name],
+                "stage": "internal",
+                "conflicts": [],
+                "detail": str(error)[:1200],
+            }
+
+        try:
             # Best-effort ledger commit: the conflict records are the
             # cross-unit reconciliation report (section 3) and belong in
             # history next to the unit that surfaced them. Never fatal.
@@ -1902,10 +1918,11 @@ class WasmUnitDriver:
                         "--",
                         rel,
                     )
-        except Exception as error:  # noqa: BLE001 - the gate never fails a unit
+        except Exception as error:  # noqa: BLE001 - gate result already known
             self.events.emit(
-                "assembly_gate_error", unit=unit_name, error=str(error)[:400]
+                "assembly_gate_ledger_error", unit=unit_name, error=str(error)[:400]
             )
+        return result
 
     # ------------------------------------------------------------------ oracle
 
@@ -2572,6 +2589,36 @@ class WasmUnitDriver:
             ),
         }
         atomic_write_json(artifact_dir / "provenance.json", provenance)
+        # 5a. T2b is a verdict gate, not post-publication telemetry. The
+        # candidate exists in the artifact tree so select_recent_green_units
+        # can compose it with the current window, but it has not yet mutated
+        # the knowledge registry, entered git, been pushed, or been settled.
+        assembly_result = self._maybe_run_assembly_gate(name)
+        if assembly_result.get("passed") is False:
+            assembly_evidence = {
+                "passed": False,
+                "n": assembly_result.get("n"),
+                "units": assembly_result.get("units") or [],
+                "stage": assembly_result.get("stage"),
+                "conflicts": (assembly_result.get("conflicts") or [])[:20],
+                "detail": (assembly_result.get("detail") or "")[:1200],
+            }
+            # A failed candidate must not be selected by a later gate merely
+            # because its temporary provenance directory still exists.
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+            detail = assembly_evidence["detail"] or (
+                f"{len(assembly_evidence['conflicts'])} conflict(s)"
+            )
+            return self._fail(
+                state,
+                record,
+                name,
+                f"assembly gate {assembly_evidence['stage']} failed before "
+                f"promotion: {detail}",
+                stage="assembly",
+                result=RESULT_GATE_FAILED,
+                extra={"rounds": rounds, "assembly_gate": assembly_evidence},
+            )
         # 5b. registry harvest (section 2.11, T2c [V4-1]): mechanical, no LLM.
         # The unit's own decisions (diffed against the AUGMENTED seed, minus
         # callee stubs) enter the registry at the unit's tier; the unit's
@@ -2705,10 +2752,6 @@ class WasmUnitDriver:
         # Section 4 T3 row: verified fraction falling while staged grows pages
         # (unverifiable-inventory build-up).
         self._flag_unverified_inventory(state)
-        # Continuous assembly gate (section 2.13 [V4-11]): every green feeds
-        # the rolling N-unit link. Runs after the unit's own commit so a gate
-        # fault can never cost a green; failures page + file conflicts.
-        self._maybe_run_assembly_gate(name)
         return "green"
 
     @staticmethod

@@ -1133,11 +1133,19 @@ def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
     gate_calls = []
+    operation_order = []
 
     def fake_link(workdir, c_files, exports, allowed_extra):
+        operation_order.append("assembly_link")
         gate_calls.append((sorted(c_files), exports))
         (workdir / "assembly.wasm").write_bytes(b"\x00asm")
         return True, ""
+
+    def fake_git(*args):
+        operation_order.append(("git", *args))
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
         (workdir / "unit.wasm").write_bytes(b"\x00asm")
@@ -1145,6 +1153,7 @@ def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
 
     driver = _driver(
         repo,
+        git_runner=fake_git,
         build_runner=fake_build,
         assembly_link_runner=fake_link,
         assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK exports=2"),
@@ -1155,45 +1164,92 @@ def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
     c_files, exports = gate_calls[0]
     assert c_files == ["prior-unit.c", "unit-a.c"]
     assert exports == ["zz_prior_", "zz_test_"]
+    assembly_index = operation_order.index("assembly_link")
+    artifact_add_index = next(
+        i
+        for i, operation in enumerate(operation_order)
+        if isinstance(operation, tuple)
+        and operation[1] == "add"
+        and "port-units/unit-a" in " ".join(map(str, operation))
+    )
+    push_index = next(
+        i
+        for i, operation in enumerate(operation_order)
+        if isinstance(operation, tuple) and operation[1] == "push"
+    )
+    assert assembly_index < artifact_add_index < push_index
     ledger = json.loads(
         (repo / "research/decomp/data/assembly-gate.json").read_text()
     )
     assert ledger["largest_n_passed"] == 2
     assert ledger["last_run"]["passed"] is True
-    events = (
+    events_text = (
         repo / "research/decomp/generated/finish-game-port/events.jsonl"
     ).read_text()
-    assert '"assembly_gate"' in events
-    assert '"assembly_gate_failed"' not in events
+    assert '"assembly_gate"' in events_text
+    assert '"assembly_gate_failed"' not in events_text
+    events = [json.loads(line) for line in events_text.splitlines() if line.strip()]
+    kinds = [event["kind"] for event in events]
+    assert kinds.index("assembly_gate") < kinds.index("wasm_unit_green")
 
 
-def test_assembly_gate_failure_pages_but_never_costs_the_green(tmp_path, monkeypatch):
+def test_assembly_gate_failure_blocks_green_commit_and_push(tmp_path, monkeypatch):
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
         (workdir / "unit.wasm").write_bytes(b"\x00asm")
         return True, ""
 
+    journal = FakeJournal()
     driver = _driver(
         repo,
+        git_runner=fake_git,
+        journal=journal,
         build_runner=fake_build,
         assembly_link_runner=lambda *a: (
             False, "wasm-ld: error: duplicate symbol: zz_prior_"
         ),
         assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
     )
-    assert driver.run() == EXIT_NO_WORK
+    assert driver.run() == EXIT_PROGRESSED
     state = json.loads(
         (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
     )
-    # The unit's verdict is untouched by the gate failure.
-    assert state["units"]["unit-a"]["status"] == "green"
+    record = state["units"]["unit-a"]
+    assert record["status"] == "red_retryable"
+    assert record["last_stage"] == "assembly"
+    assert record["assembly_gate"]["passed"] is False
+    # The candidate is materialized only long enough to run the gate. A failed
+    # candidate must not remain selectable as a green/staged artifact.
+    assert not (repo / "research/decomp/port-units/unit-a").exists()
+    assert not (repo / "research/decomp/port-units-staging/unit-a").exists()
+    assert not driver.registry_path.exists()
+    artifact_git_calls = [
+        args for args in git_calls if "port-units" in " ".join(map(str, args))
+    ]
+    assert artifact_git_calls == []
+    assert not [args for args in git_calls if args[0] == "push"]
     events = (
         repo / "research/decomp/generated/finish-game-port/events.jsonl"
     ).read_text()
     assert '"assembly_gate_failed"' in events
+    assert '"wasm_unit_red"' in events
+    assert '"wasm_unit_green"' not in events
+    assert len(journal.checkpoints) == 1
+    transition = journal.checkpoints[0]["transition"]
+    assert transition.unit == "unit-a"
+    assert transition.result == "gate_failed"
+    assert transition.stage == "assembly"
+    assert transition.extra["assembly_gate"]["passed"] is False
     ledger = json.loads(
         (repo / "research/decomp/data/assembly-gate.json").read_text()
     )
@@ -1202,7 +1258,7 @@ def test_assembly_gate_failure_pages_but_never_costs_the_green(tmp_path, monkeyp
     assert any("zz_prior_" in key for key in keys)
 
 
-def test_assembly_gate_internal_fault_degrades_to_an_event(tmp_path, monkeypatch):
+def test_assembly_gate_internal_fault_fails_closed(tmp_path, monkeypatch):
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
@@ -1217,15 +1273,18 @@ def test_assembly_gate_internal_fault_degrades_to_an_event(tmp_path, monkeypatch
     driver = _driver(
         repo, build_runner=fake_build, assembly_link_runner=exploding_link
     )
-    assert driver.run() == EXIT_NO_WORK
+    assert driver.run() == EXIT_PROGRESSED
     state = json.loads(
         (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
     )
-    assert state["units"]["unit-a"]["status"] == "green"
+    assert state["units"]["unit-a"]["status"] == "red_retryable"
+    assert state["units"]["unit-a"]["last_stage"] == "assembly"
+    assert not (repo / "research/decomp/port-units/unit-a").exists()
     events = (
         repo / "research/decomp/generated/finish-game-port/events.jsonl"
     ).read_text()
     assert '"assembly_gate_error"' in events
+    assert '"wasm_unit_green"' not in events
 
 
 def test_single_green_unit_skips_the_gate_quietly(tmp_path, monkeypatch):
@@ -1253,8 +1312,8 @@ def test_single_green_unit_skips_the_gate_quietly(tmp_path, monkeypatch):
 def test_assembly_gate_never_pushes(tmp_path, monkeypatch):
     """Regression: the gate's ledger commit must NOT carry its own push --
     a bare `git push` here landed one port-assembly commit on origin/main
-    per green. The only push in a green run is the unit's own product push;
-    every git call after the ledger enters the picture is push-free."""
+    per green. The only push in a green run is the unit's own product push,
+    and it happens only after the gate succeeds."""
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
@@ -1289,15 +1348,16 @@ def test_assembly_gate_never_pushes(tmp_path, monkeypatch):
         if any("assembly-gate.json" in str(a) for a in args)
     ]
     assert ledger_indices, "the material first gate run must commit the ledger"
-    after_ledger = git_calls[ledger_indices[0]:]
-    assert all(args[0] != "push" for args in after_ledger)
     # The ledger commit itself is pathspec'd (never a tree-wide sweep).
     ledger_commits = [
-        args for args in after_ledger
+        args for args in git_calls[ledger_indices[0]:]
         if args[0] == "commit" and "assembly-gate.json" in " ".join(map(str, args))
     ]
     assert len(ledger_commits) == 1
     assert "--" in ledger_commits[0]
+    ledger_commit_index = git_calls.index(ledger_commits[0])
+    product_push_index = next(i for i, args in enumerate(git_calls) if args[0] == "push")
+    assert ledger_commit_index < product_push_index
 
 
 def _gate_driver_with_two_greens(repo, git_calls, *, link_ok=True, conflicts=None):
