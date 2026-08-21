@@ -30,9 +30,9 @@ unit verdict MUST go through a code path that emits the corresponding journal
 event. Hand-editing wasm-units-state.json is FORBIDDEN -- the 2026-08-20
 migration wrote 15 verdicts straight into the state file without a single
 journal event, and events.jsonl has disagreed with live state ever since.
-Use ``settle_unit`` (driver method, or the ``settle-unit`` CLI subcommand of
-this module), which backs up the state file, edits the record, emits the
-journal checkpoint + events.jsonl event, and saves atomically.
+Use ``settle_unit`` / ``revoke_unit`` (driver methods, or the corresponding
+CLI subcommands of this module), which back up the state file, emit the
+journal checkpoint + events.jsonl event, and save atomically.
 """
 
 from __future__ import annotations
@@ -1609,6 +1609,7 @@ class WasmUnitDriver:
         current_attempt: int = 0,
         workflow_state: str = "running",
         driver_running: bool = True,
+        require_progress_push: bool = False,
     ) -> bool:
         """Emit one progress checkpoint and report whether it is durable.
 
@@ -1620,9 +1621,14 @@ class WasmUnitDriver:
         machine = MachineState(
             workflow_state=workflow_state,
             driver_status="running" if driver_running else "stopped",
+            manual_paused=workflow_state == "manual_paused",
             configured_model=self._model_config.model,
-            active_model=self._model_config.model,
-            context_length=self._model_config.max_seq_length or None,
+            active_model=self._model_config.model if driver_running else None,
+            context_length=(
+                self._model_config.max_seq_length or None
+                if driver_running
+                else None
+            ),
         )
         try:
             result = self._journal.checkpoint(
@@ -1640,10 +1646,21 @@ class WasmUnitDriver:
             self.events.emit("progress_checkpoint_failed", error=str(error)[:400])
             return False
         durable = not isinstance(result, dict) or bool(result.get("recorded", True))
+        if require_progress_push:
+            durable = bool(
+                isinstance(result, dict)
+                and result.get("recorded")
+                and result.get("committed")
+                and result.get("pushed")
+            )
         if not durable:
             self.events.emit(
                 "progress_checkpoint_failed",
-                error=str(result.get("detail") or "journal did not record transition")[:400],
+                error=str(
+                    result.get("detail")
+                    if isinstance(result, dict)
+                    else "journal did not return a durable receipt"
+                )[:400],
             )
             return False
         if transition is not None:
@@ -3843,6 +3860,198 @@ class WasmUnitDriver:
         finally:
             self.lock.release()
 
+    def revoke_unit(self, unit_name: str, reason: str) -> dict[str, Any]:
+        """Revoke one settled verdict and requeue it through the journal.
+
+        This is the generic recovery counterpart to ``settle_unit``. The stale
+        staged artifact remains as audit evidence and is overwritten by the
+        next successful attempt. No product ref is rewound or pushed; the one
+        required remote write is the append-only ``port-progress`` journal.
+
+        The transition id is deterministic for the verdict preimage + reason.
+        If a crash happens after the journal checkpoint but before the
+        registry/state saves, rerunning the exact command completes the same
+        transition without duplicating its durable journal record.
+        """
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("a revocation requires a non-empty reason")
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "revoking under a running driver would race its state writes"
+            )
+        try:
+            state = self._load_state()
+            known: set[str] = set(state.get("units", {}))
+            try:
+                known.update(unit["name"] for unit in self._load_queue())
+            except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+                pass
+            if unit_name not in known:
+                raise ValueError(
+                    f"unknown unit {unit_name!r}: not in the queue or the state file"
+                )
+            record = self._unit_state(state, unit_name)
+            prior_revocation = record.get("revoked") or {}
+            if (
+                record.get("status") == "pending"
+                and prior_revocation.get("via") == "revoke-unit"
+                and prior_revocation.get("reason") == reason
+            ):
+                return {
+                    "unit": unit_name,
+                    "status": "pending",
+                    "previous_status": prior_revocation.get("previous_status"),
+                    "transition_id": prior_revocation.get("transition_id"),
+                    "backup": None,
+                    "already_requeued": True,
+                    "state_file": str(self.state_path),
+                }
+            previous_status = record.get("status")
+            if previous_status not in self.SETTLED_STATUSES:
+                raise ValueError(
+                    f"unit {unit_name!r} has no settled verdict to revoke "
+                    f"(status={previous_status!r})"
+                )
+
+            backup = self._backup_state()
+            previous_tier = record.get("tier")
+            previous_commit = record.get("commit")
+            previous_record = json.loads(json.dumps(record))
+            previous_record_sha256 = hashlib.sha256(
+                json.dumps(
+                    previous_record, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            transition_preimage = {
+                "schema": 2,
+                "unit": unit_name,
+                "reason": reason,
+                # The full canonical unit record is the verdict preimage. A
+                # changed oracle binding, push receipt, world version, or
+                # promotion identity must mint a distinct revocation even when
+                # status/tier/commit happen to match.
+                "previous_record": previous_record,
+            }
+            transition_id = "verdict-revoke-" + hashlib.sha256(
+                json.dumps(
+                    transition_preimage, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            revoked_at = utc_now()
+            revoked = {
+                "via": "revoke-unit",
+                "at": revoked_at,
+                "reason": reason,
+                "previous_status": previous_status,
+                "previous_tier": previous_tier,
+                "previous_commit": previous_commit,
+                "previous_oracle_summary": record.get("oracle_summary"),
+                "previous_record_sha256": previous_record_sha256,
+                "transition_id": transition_id,
+            }
+            projected = self._project_record_update(
+                state,
+                unit_name,
+                {
+                    "status": "pending",
+                    "error": None,
+                    "last_stage": "manual-revoke",
+                    "revoked": revoked,
+                },
+            )
+            projected_record = projected["units"][unit_name]
+            for stale_key in (
+                "tier",
+                "oracle_summary",
+                "commit",
+                "pushed",
+                "settle_reason",
+                "settled_via",
+                "promotion_transaction_id",
+                "promotion_transition_id",
+                "candidate_sha256",
+                "world_version",
+            ):
+                projected_record.pop(stale_key, None)
+
+            transition = UnitTransition(
+                unit=unit_name,
+                result=RESULT_DEFERRED,
+                stage="manual-revoke",
+                attempt=record.get("attempts", 0),
+                detail=f"verdict revoked and requeued: {reason}",
+                model=self._model_config.model,
+                extra={
+                    "revoked_via": "revoke-unit",
+                    "previous_status": previous_status,
+                    "previous_tier": previous_tier,
+                    "previous_commit": previous_commit,
+                    "previous_record_sha256": previous_record_sha256,
+                    "transition_id": transition_id,
+                },
+            )
+            if not self._checkpoint(
+                projected,
+                transition,
+                workflow_state="maintenance",
+                driver_running=False,
+                require_progress_push=True,
+            ):
+                raise RuntimeError(
+                    "revocation was not committed and pushed to port-progress; "
+                    "canonical state remains unchanged"
+                )
+
+            registry_existed = self.registry_path.is_file()
+            registry_preimage = json.loads(json.dumps(self._registry()))
+            registry = json.loads(json.dumps(registry_preimage))
+            retier = revoke_unit_entries(registry, unit_name)
+            if retier.changed:
+                self._save_registry(registry)
+            try:
+                self._save_state(projected)
+            except BaseException:
+                # Keep canonical state and the registry in the same verdict
+                # world on an ordinary exception. A hard process loss between
+                # these two atomic writes is recovered by rerunning the same
+                # deterministic transition id.
+                if retier.changed:
+                    if registry_existed:
+                        atomic_write_json(self.registry_path, registry_preimage)
+                    else:
+                        self.registry_path.unlink(missing_ok=True)
+                    self._registry_cache = None
+                raise
+            state.clear()
+            state.update(projected)
+            self.events.emit(
+                "verdict_revoked",
+                unit=unit_name,
+                previous_status=previous_status,
+                previous_tier=previous_tier,
+                previous_commit=previous_commit,
+                reason=reason[:600],
+                transition_id=transition_id,
+                registry_version=retier.version,
+                via="revoke-unit",
+            )
+            return {
+                "unit": unit_name,
+                "status": "pending",
+                "previous_status": previous_status,
+                "previous_tier": previous_tier,
+                "previous_commit": previous_commit,
+                "transition_id": transition_id,
+                "registry_changed": retier.changed,
+                "backup": backup,
+                "already_requeued": False,
+                "state_file": str(self.state_path),
+            }
+        finally:
+            self.lock.release()
+
     # ------------------------------------------- D5 migration (design D5-6)
 
     def _backup_state(self) -> str | None:
@@ -4658,7 +4867,7 @@ class WasmUnitDriver:
             header_applied = True
         return False, f"not linked: {summarise_build_error(build_error)[:300]}"
 
-    def _reconcile_interrupted(self, state: dict[str, Any]) -> None:
+    def _reconcile_interrupted(self, state: dict[str, Any]) -> bool:
         """A unit left `porting` by a killed run never got a transition record.
 
         The supervisor kills the driver tree on player join / manual pause, so
@@ -4666,35 +4875,70 @@ class WasmUnitDriver:
         emit the checkpoint the killed run owed -- otherwise GitHub shows unit A
         as still in flight while the selector has already moved to unit B.
         """
-        for name, record in state.get("units", {}).items():
+        for name, record in list(state.get("units", {}).items()):
             if record.get("status") != "porting":
                 continue
-            record["status"] = "deferred"
-            record["error"] = "interrupted before a verdict (driver killed or crashed)"
+            previous_record = json.loads(json.dumps(record))
+            transition_id = "interrupted-reconcile-" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "unit": name,
+                        "previous_record": previous_record,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            refunded_attempts = max(0, int(record.get("attempts", 1)) - 1)
+            interruptions = int(record.get("interruptions", 0)) + 1
+            projected = self._project_record_update(
+                state,
+                name,
+                {
+                    "status": "pending",
+                    "error": "interrupted before a verdict (driver killed or crashed)",
+                    "attempts": refunded_attempts,
+                    "interruptions": interruptions,
+                    "interrupted_reconcile_transition_id": transition_id,
+                },
+            )
             # Refund the ATTEMPT (the unit earned no verdict, and charging it
             # would push it behind the entire queue every time the supervisor
             # kills the driver for a player join or a manual pause -- a
             # starvation machine), but COUNT the interruption. Ordering uses
             # attempts + interruptions, so a unit that keeps taking the driver
             # down with it still sinks instead of being retried forever.
-            record["attempts"] = max(0, record.get("attempts", 1) - 1)
-            record["interruptions"] = int(record.get("interruptions", 0)) + 1
-            self._save_state(state)
-            self._checkpoint(
-                state,
+            if not self._checkpoint(
+                projected,
                 UnitTransition(
                     unit=name,
                     result=RESULT_DEFERRED,
-                    stage=record.get("last_stage") or "port",
-                    attempt=record.get("attempts", 0),
+                    stage=previous_record.get("last_stage") or "port",
+                    attempt=refunded_attempts,
                     detail="interrupted before a verdict; requeued",
                     model=self._model_config.model,
+                    extra={
+                        "transition_id": transition_id,
+                        "reconciled_from_status": "porting",
+                    },
                 ),
-            )
-            # Deferred is a transient class: the unit re-enters the pool as
-            # pending so `_next_unit` treats it like any other retry candidate.
-            record["status"] = "pending"
-            self._save_state(state)
+            ):
+                self.events.emit(
+                    "interrupted_reconcile_blocked",
+                    unit=name,
+                    transition_id=transition_id,
+                    reason="progress checkpoint was not durable",
+                )
+                return False
+            # Journal first: only after the exact projected pending/refund
+            # record is durable may canonical state change. A crash after the
+            # checkpoint replays the same transition id from the unchanged
+            # porting preimage on the next lifecycle.
+            self._save_state(projected)
+            state.clear()
+            state.update(projected)
+        return True
 
     def _flush_pending_progress(self) -> None:
         try:
@@ -4816,7 +5060,11 @@ class WasmUnitDriver:
                     "driver_stopped", reason="promotion_attempt_quarantine_failed"
                 )
                 return EXIT_STOPPED
-            self._reconcile_interrupted(state)
+            if not self._reconcile_interrupted(state):
+                self.events.emit(
+                    "driver_stopped", reason="interrupted_reconcile_not_durable"
+                )
+                return EXIT_STOPPED
             self._reconcile_promoted(state)
             self._save_state(state)
             self.events.emit(
@@ -5052,6 +5300,18 @@ def main(argv: list[str] | None = None) -> int:
         help="why this verdict is being settled by hand (journaled verbatim)",
     )
     settle.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    revoke = sub.add_parser(
+        "revoke-unit",
+        help="revoke one settled verdict and requeue it through the journal; "
+        "takes the driver lock, leaves the stale artifact as audit evidence, "
+        "pushes only the port-progress journal, and never pushes a product ref",
+    )
+    revoke.add_argument("--unit", required=True, help="settled queue unit name")
+    revoke.add_argument(
+        "--reason", required=True,
+        help="why this verdict is invalid (journaled verbatim)",
+    )
+    revoke.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
     gate = sub.add_parser(
         "assembly-gate",
         help="run the continuous assembly gate (section 2.13) over the last N "
@@ -5108,6 +5368,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "settle-unit":
         driver = WasmUnitDriver(repo_root=args.repo_root)
         print(json.dumps(driver.settle_unit(args.unit, args.status, args.reason), indent=2))
+        return 0
+    if args.command == "revoke-unit":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        print(json.dumps(driver.revoke_unit(args.unit, args.reason), indent=2))
         return 0
     if args.command == "assembly-gate":
         driver = WasmUnitDriver(repo_root=args.repo_root)

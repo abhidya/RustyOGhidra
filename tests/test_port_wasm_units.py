@@ -61,6 +61,40 @@ def _completed(rc: int = 0, stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=["git"], returncode=rc, stdout=stdout, stderr="")
 
 
+def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    completed = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True
+    )
+    if check:
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+    return completed
+
+
+def _init_bare_origin(repo: Path, tmp_path: Path) -> tuple[Path, str]:
+    remote = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "port-test@example.invalid")
+    _git(repo, "config", "user.name", "Port Test")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "baseline")
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-u", "origin", "main")
+    return remote, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _remote_progress_events(remote: Path) -> list[dict]:
+    shown = _git(
+        remote.parent,
+        "--git-dir",
+        str(remote),
+        "show",
+        f"refs/heads/port-progress:{PROGRESS_DIR}/events.jsonl",
+    )
+    return [json.loads(line) for line in shown.stdout.splitlines() if line.strip()]
+
+
 def test_extract_verbatim_is_byte_faithful(tmp_path):
     repo = _write_repo(tmp_path)
     text, records = extract_verbatim(
@@ -964,7 +998,25 @@ class FakeJournal:
         self.checkpoints = []
 
     def checkpoint(self, **kwargs):
+        transition = kwargs.get("transition")
+        transition_id = (
+            transition.extra.get("transition_id")
+            if transition is not None and isinstance(transition.extra, dict)
+            else None
+        )
+        if transition_id and any(
+            item.get("transition") is not None
+            and item["transition"].extra.get("transition_id") == transition_id
+            for item in self.checkpoints
+        ):
+            return {
+                "recorded": True,
+                "committed": True,
+                "pushed": True,
+                "idempotent": True,
+            }
         self.checkpoints.append(kwargs)
+        return {"recorded": True, "committed": True, "pushed": True}
 
     def push_is_pending(self):
         return False
@@ -1060,6 +1112,642 @@ def test_settle_unit_cli_subcommand(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["unit"] == "unit-a"
     assert _state(repo)["units"]["unit-a"]["status"] == "structural_ineligible"
+
+
+def test_revoke_unit_backs_up_journals_projected_pending_and_is_idempotent(
+    tmp_path, monkeypatch
+):
+    """A false green is unsettled through one durable, replay-safe event."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    state_path = _state_path(repo)
+    state_path.write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {
+                    "unit-a": {
+                        "status": "green",
+                        "attempts": 1,
+                        "tier": "compile_only",
+                        "oracle_summary": "compile-only (UNVERIFIED)",
+                        "commit": "badc0ffee",
+                        "pushed": True,
+                        "world_version": {"driver_rev": "old"},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal = FakeJournal()
+    driver = _driver(repo, journal=journal)
+    reason = "assembly gate failed after the legacy promotion ordering"
+
+    result = driver.revoke_unit("unit-a", reason)
+    assert result["previous_status"] == "green"
+    assert result["previous_commit"] == "badc0ffee"
+    assert result["backup"] and result["backup"].startswith(
+        "wasm-units-state.json.settle-backup-"
+    )
+    assert result["transition_id"].startswith("verdict-revoke-")
+    assert json.loads(
+        (state_path.parent / result["backup"]).read_text()
+    )["units"]["unit-a"]["status"] == "green"
+
+    assert len(journal.checkpoints) == 1
+    checkpoint = journal.checkpoints[0]
+    transition = checkpoint["transition"]
+    assert checkpoint["units"]["unit-a"]["status"] == "pending"
+    assert checkpoint["machine"].workflow_state == "maintenance"
+    assert checkpoint["driver_running"] is False
+    assert checkpoint["machine"].active_model is None
+    assert checkpoint["machine"].context_length is None
+    assert transition.result == "deferred"
+    assert transition.stage == "manual-revoke"
+    assert transition.extra["previous_commit"] == "badc0ffee"
+    assert transition.extra["transition_id"] == result["transition_id"]
+
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "pending"
+    assert record["last_stage"] == "manual-revoke"
+    assert record["revoked"]["reason"] == reason
+    assert record["revoked"]["previous_tier"] == "compile_only"
+    for stale_key in ("tier", "oracle_summary", "commit", "pushed", "world_version"):
+        assert stale_key not in record
+    events = [
+        json.loads(line)
+        for line in (
+            repo / "research/decomp/generated/finish-game-port/events.jsonl"
+        ).read_text().splitlines()
+        if line.strip()
+    ]
+    revoked = [event for event in events if event.get("kind") == "verdict_revoked"]
+    assert len(revoked) == 1
+    assert revoked[0]["transition_id"] == result["transition_id"]
+
+    replay = driver.revoke_unit("unit-a", reason)
+    assert replay["already_requeued"] is True
+    assert replay["transition_id"] == result["transition_id"]
+    assert len(journal.checkpoints) == 1
+
+
+def test_revoke_unit_rejects_unsettled_unknown_and_empty_reason(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo, journal=FakeJournal())
+    with pytest.raises(ValueError, match="no settled verdict"):
+        driver.revoke_unit("unit-a", "not actually settled")
+    with pytest.raises(ValueError, match="unknown unit"):
+        driver.revoke_unit("no-such-unit", "reason")
+    with pytest.raises(ValueError, match="non-empty reason"):
+        driver.revoke_unit("unit-a", "   ")
+
+
+def test_revoke_unit_replays_same_transition_after_state_save_crash(
+    tmp_path, monkeypatch
+):
+    """Journal-first recovery must finish without a duplicate transition."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {
+                    "unit-a": {
+                        "status": "green",
+                        "attempts": 1,
+                        "tier": "compile_only",
+                        "commit": "badc0ffee",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal = FakeJournal()
+    first = _driver(repo, journal=journal)
+    first.registry_path.write_text(
+        json.dumps(
+            {
+                "registry_schema": 1,
+                "program": "gnt4",
+                "version": 1,
+                "updated_at": "2026-08-20T00:00:00Z",
+                "entries": {
+                    "fn:zz_test_": {
+                        "kind": "prototype",
+                        "symbol": "zz_test_",
+                        "declaration": "int zz_test_(int a);",
+                        "tier": "compile_only",
+                        "source_units": ["unit-a"],
+                        "source_tiers": {"unit-a": "compile_only"},
+                        "contested": False,
+                        "conflicts": [],
+                        "updated_version": 1,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry_preimage = json.loads(first.registry_path.read_text())
+    real_save = first._save_state
+    failed = {"once": False}
+
+    def fail_once(state):
+        if not failed["once"]:
+            failed["once"] = True
+            raise OSError("injected state-save crash")
+        real_save(state)
+
+    first._save_state = fail_once
+    reason = "post-promotion composition gate failed"
+    with pytest.raises(OSError, match="injected state-save crash"):
+        first.revoke_unit("unit-a", reason)
+    assert _state(repo)["units"]["unit-a"]["status"] == "green"
+    assert json.loads(first.registry_path.read_text()) == registry_preimage
+    assert len(journal.checkpoints) == 1
+    transition_id = journal.checkpoints[0]["transition"].extra["transition_id"]
+
+    restarted = _driver(repo, journal=journal)
+    result = restarted.revoke_unit("unit-a", reason)
+    assert result["transition_id"] == transition_id
+    assert len(journal.checkpoints) == 1
+    assert _state(repo)["units"]["unit-a"]["status"] == "pending"
+    registry = json.loads(restarted.registry_path.read_text())
+    assert registry["entries"]["fn:zz_test_"]["revoked"] is True
+    assert registry["version"] == 2
+
+
+def test_revoke_unit_real_progress_push_is_idempotent_across_crash(
+    tmp_path, monkeypatch
+):
+    """The CLI contract is a real port-progress commit+push, not a fake receipt."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {
+                    "unit-a": {
+                        "status": "green",
+                        "attempts": 1,
+                        "tier": "compile_only",
+                        "oracle_summary": "compile-only (UNVERIFIED)",
+                        "commit": "badc0ffee",
+                        "pushed": True,
+                        "push_detail": "legacy ordering",
+                        "world_version": {"driver_rev": "old", "registry_version": "4"},
+                        "promotion_transaction_id": "legacy-promotion-a",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    remote, product_main = _init_bare_origin(repo, tmp_path)
+    journal = ProgressJournal(
+        repo,
+        run_root=repo / "research/decomp/generated/finish-game-port",
+        worktree=tmp_path / "progress-wt",
+        run_id="revoke-crash-run",
+        enable_push=True,
+    )
+    driver = _driver(repo, journal=journal)
+    real_save = driver._save_state
+    failed = {"once": False}
+
+    def fail_once(state):
+        if not failed["once"]:
+            failed["once"] = True
+            raise OSError("injected state-save crash")
+        real_save(state)
+
+    driver._save_state = fail_once
+    reason = "post-promotion composition gate failed"
+    with pytest.raises(OSError, match="injected state-save crash"):
+        driver.revoke_unit("unit-a", reason)
+    assert _state(repo)["units"]["unit-a"]["status"] == "green"
+    first_events = _remote_progress_events(remote)
+    matching = [
+        event
+        for event in first_events
+        if event.get("extra", {}).get("transition_id", "").startswith(
+            "verdict-revoke-"
+        )
+    ]
+    assert len(matching) == 1
+    transition_id = matching[0]["extra"]["transition_id"]
+
+    restarted_journal = ProgressJournal(
+        repo,
+        run_root=repo / "research/decomp/generated/finish-game-port",
+        worktree=tmp_path / "progress-wt",
+        run_id="revoke-restart-run",
+        enable_push=True,
+    )
+    restarted = _driver(repo, journal=restarted_journal)
+    result = restarted.revoke_unit("unit-a", reason)
+    assert result["transition_id"] == transition_id
+    assert _state(repo)["units"]["unit-a"]["status"] == "pending"
+    matching = [
+        event
+        for event in _remote_progress_events(remote)
+        if event.get("extra", {}).get("transition_id") == transition_id
+    ]
+    assert len(matching) == 1
+    assert _git(repo, "rev-parse", "origin/main").stdout.strip() == product_main
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging"
+    ).stdout == ""
+
+
+def test_revoke_unit_two_lifecycles_mint_distinct_full_preimage_ids(
+    tmp_path, monkeypatch
+):
+    """Same visible verdict/reason but changed oracle/world/promotion is new."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    state_path = _state_path(repo)
+    state_path.write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {
+                    "unit-a": {
+                        "status": "green",
+                        "attempts": 1,
+                        "tier": "compile_only",
+                        "oracle_summary": "oracle-a",
+                        "commit": "same-commit",
+                        "pushed": True,
+                        "push_detail": "push-a",
+                        "world_version": {"driver_rev": "world-a"},
+                        "promotion_transaction_id": "promotion-a",
+                        "promotion_transition_id": "green-a",
+                        "candidate_sha256": "candidate-a",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    remote, _ = _init_bare_origin(repo, tmp_path)
+    journal = ProgressJournal(
+        repo,
+        run_root=repo / "research/decomp/generated/finish-game-port",
+        worktree=tmp_path / "progress-wt-two",
+        run_id="two-lifecycle-run",
+        enable_push=True,
+    )
+    driver = _driver(repo, journal=journal)
+    reason = "same composition failure"
+    first = driver.revoke_unit("unit-a", reason)
+
+    state = _state(repo)
+    state["units"]["unit-a"].update(
+        status="green",
+        attempts=2,
+        tier="compile_only",
+        oracle_summary="oracle-b",
+        commit="same-commit",
+        pushed=True,
+        push_detail="push-b",
+        world_version={"driver_rev": "world-b"},
+        promotion_transaction_id="promotion-b",
+        promotion_transition_id="green-b",
+        candidate_sha256="candidate-b",
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    second = driver.revoke_unit("unit-a", reason)
+
+    assert first["transition_id"] != second["transition_id"]
+    events = _remote_progress_events(remote)
+    ids = [
+        event.get("extra", {}).get("transition_id")
+        for event in events
+        if event.get("stage") == "manual-revoke"
+    ]
+    assert ids.count(first["transition_id"]) == 1
+    assert ids.count(second["transition_id"]) == 1
+
+
+def test_revoke_unit_real_progress_push_failure_leaves_verdict_untouched(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {"unit-a": {"status": "green", "attempts": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _init_bare_origin(repo, tmp_path)
+    journal = ProgressJournal(
+        repo,
+        run_root=repo / "research/decomp/generated/finish-game-port",
+        worktree=tmp_path / "progress-wt-fail",
+        run_id="push-failure-run",
+        remote="missing-remote",
+        enable_push=True,
+    )
+    driver = _driver(repo, journal=journal)
+    with pytest.raises(RuntimeError, match="not committed and pushed"):
+        driver.revoke_unit("unit-a", "composition failure")
+    assert _state(repo)["units"]["unit-a"]["status"] == "green"
+
+
+def test_revoke_unit_journal_failure_leaves_state_registry_artifact_and_git_untouched(
+    tmp_path, monkeypatch
+):
+    """No local journal record means no canonical or product-side mutation."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {
+                    "unit-a": {
+                        "status": "green",
+                        "attempts": 1,
+                        "tier": "compile_only",
+                        "commit": "badc0ffee",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact = repo / "research/decomp/port-units-staging/unit-a"
+    artifact.mkdir(parents=True)
+    sentinel = artifact / "unit.wasm"
+    sentinel.write_bytes(b"bad-but-auditable")
+    registry_path = (
+        repo / "research/decomp/generated/finish-game-port/knowledge-registry.json"
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "registry_schema": 1,
+                "program": "gnt4",
+                "version": 0,
+                "updated_at": "2026-08-20T00:00:00Z",
+                "entries": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_preimage = _state_path(repo).read_bytes()
+    registry_preimage = registry_path.read_bytes()
+    git_calls = []
+
+    class RejectingJournal(FakeJournal):
+        def checkpoint(self, **kwargs):
+            self.checkpoints.append(kwargs)
+            return {"recorded": False, "detail": "injected local journal failure"}
+
+    driver = _driver(
+        repo,
+        journal=RejectingJournal(),
+        git_runner=lambda *args: git_calls.append(args) or _completed(0),
+    )
+    with pytest.raises(RuntimeError, match="not committed and pushed"):
+        driver.revoke_unit("unit-a", "composition failure")
+    assert _state_path(repo).read_bytes() == state_preimage
+    assert registry_path.read_bytes() == registry_preimage
+    assert sentinel.read_bytes() == b"bad-but-auditable"
+    assert git_calls == []
+    events_path = repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    events = events_path.read_text() if events_path.is_file() else ""
+    assert '"verdict_revoked"' not in events
+
+
+def test_revoke_unit_refuses_while_driver_lock_is_held(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {"unit-a": {"status": "green", "attempts": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    holder = _driver(repo, journal=FakeJournal())
+    contender = _driver(repo, journal=FakeJournal())
+    assert holder.lock.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="race its state writes"):
+            contender.revoke_unit("unit-a", "must wait for boundary")
+    finally:
+        holder.lock.release()
+    assert _state(repo)["units"]["unit-a"]["status"] == "green"
+
+
+def test_revoke_unit_cli_subcommand(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    from src.port_wasm_units import main
+
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(
+        json.dumps(
+            {
+                "state_schema": 1,
+                "created_at": "2026-08-20T00:00:00Z",
+                "units": {"unit-a": {"status": "green", "attempts": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    remote, baseline = _init_bare_origin(repo, tmp_path)
+    rc = main(
+        [
+            "revoke-unit",
+            "--unit", "unit-a",
+            "--reason", "cli revoke test",
+            "--repo-root", str(repo),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unit"] == "unit-a"
+    assert payload["already_requeued"] is False
+    assert _state(repo)["units"]["unit-a"]["status"] == "pending"
+    remote_events = _remote_progress_events(remote)
+    revoked = [
+        event for event in remote_events
+        if event.get("extra", {}).get("revoked_via") == "revoke-unit"
+    ]
+    assert len(revoked) == 1
+    assert revoked[0]["unit"] == "unit-a"
+    assert _git(repo, "ls-remote", "origin", "refs/heads/main").stdout.split()[0] == baseline
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging", check=False
+    ).stdout == ""
+
+
+def test_interrupted_porting_unit_is_journaled_refunded_and_requeued(
+    tmp_path, monkeypatch
+):
+    """Run-start recovery settles no verdict and spends no phantom attempt."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    state = {
+        "state_schema": 1,
+        "created_at": "2026-08-20T00:00:00Z",
+        "units": {
+            "unit-a": {
+                "status": "porting",
+                "attempts": 1,
+                "last_stage": "compile-fix",
+            }
+        },
+    }
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    journal = FakeJournal()
+    driver = _driver(repo, journal=journal)
+
+    assert driver._reconcile_interrupted(state) is True
+
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "pending"
+    assert record["attempts"] == 0
+    assert record["interruptions"] == 1
+    assert "interrupted before a verdict" in record["error"]
+    assert len(journal.checkpoints) == 1
+    transition = journal.checkpoints[0]["transition"]
+    assert transition.unit == "unit-a"
+    assert transition.result == "deferred"
+    assert transition.stage == "compile-fix"
+    assert transition.attempt == 0
+    assert "requeued" in transition.detail
+
+
+def test_interrupted_reconcile_journal_failure_preserves_porting_preimage(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    state = {
+        "state_schema": 1,
+        "created_at": "2026-08-20T00:00:00Z",
+        "units": {
+            "unit-a": {
+                "status": "porting",
+                "attempts": 3,
+                "interruptions": 2,
+                "last_stage": "compile-fix",
+            }
+        },
+    }
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    preimage = _state_path(repo).read_bytes()
+
+    class RejectingJournal(FakeJournal):
+        def checkpoint(self, **kwargs):
+            self.checkpoints.append(kwargs)
+            return {"recorded": False, "detail": "injected journal failure"}
+
+    journal = RejectingJournal()
+    driver = _driver(repo, journal=journal)
+
+    assert driver._reconcile_interrupted(state) is False
+    assert _state_path(repo).read_bytes() == preimage
+    assert state["units"]["unit-a"] == {
+        "status": "porting",
+        "attempts": 3,
+        "interruptions": 2,
+        "last_stage": "compile-fix",
+    }
+    assert len(journal.checkpoints) == 1
+    events = (driver.run_root / "events.jsonl").read_text(encoding="utf-8")
+    assert '"interrupted_reconcile_blocked"' in events
+
+
+def test_interrupted_reconcile_real_journal_crash_rerun_applies_once(
+    tmp_path, monkeypatch
+):
+    """The journal-first/state-second crash window is exactly replayable."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    state = {
+        "state_schema": 1,
+        "created_at": "2026-08-20T00:00:00Z",
+        "units": {
+            "unit-a": {
+                "status": "porting",
+                "attempts": 1,
+                "last_stage": "compile-fix",
+                "promotion_transaction": {"phase": "prepared", "id": "tx-1"},
+            }
+        },
+    }
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    remote, baseline = _init_bare_origin(repo, tmp_path)
+    journal = ProgressJournal(
+        repo,
+        worktree=tmp_path / "progress-worktree",
+        run_id="interrupted-lifecycle-1",
+    )
+    first = _driver(repo, journal=journal)
+
+    def crash_after_journal(_projected):
+        raise OSError("injected crash before canonical state save")
+
+    first._save_state = crash_after_journal
+    with pytest.raises(OSError, match="before canonical state save"):
+        first._reconcile_interrupted(state)
+
+    assert _state(repo)["units"]["unit-a"]["status"] == "porting"
+    first_events = _remote_progress_events(remote)
+    reconcile_events = [
+        event for event in first_events
+        if str(event.get("extra", {}).get("transition_id", "")).startswith(
+            "interrupted-reconcile-"
+        )
+    ]
+    assert len(reconcile_events) == 1
+    transition_id = reconcile_events[0]["extra"]["transition_id"]
+
+    restarted_state = json.loads(_state_path(repo).read_text(encoding="utf-8"))
+    restarted_journal = ProgressJournal(
+        repo,
+        worktree=tmp_path / "progress-worktree",
+        run_id="interrupted-lifecycle-2",
+    )
+    restarted = _driver(repo, journal=restarted_journal)
+    assert restarted._reconcile_interrupted(restarted_state) is True
+
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "pending"
+    assert record["attempts"] == 0
+    assert record["interruptions"] == 1
+    assert record["interrupted_reconcile_transition_id"] == transition_id
+    final_events = _remote_progress_events(remote)
+    assert sum(
+        event.get("extra", {}).get("transition_id") == transition_id
+        for event in final_events
+    ) == 1
+    assert _git(repo, "ls-remote", "origin", "refs/heads/main").stdout.split()[0] == baseline
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging", check=False
+    ).stdout == ""
 
 
 # ------------------------------------------ T2a: product_priority ordering, 2.14

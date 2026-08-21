@@ -291,7 +291,8 @@ def test_readme_leads_with_the_state_banner_and_recent_transitions(journal):
     assert readme.startswith("# Port workflow: RUNNING")
     for expected in (
         "Current unit", "Current stage", "Queue progress", "Retries outstanding",
-        "Last transition", "Last green", "Last product commit", "Current model",
+        "Last transition", "Last green", "Last product commit", "Active model",
+        "Configured model",
     ):
         assert expected in readme
     assert "auto-c0000-001" in readme
@@ -310,6 +311,33 @@ def test_readme_banner_reflects_machine_state(journal, state, banner):
     journal.checkpoint(transition=None, units=UNITS, machine=state)
     readme = (journal.worktree / "workflow-progress" / "README.md").read_text(encoding="utf-8")
     assert readme.startswith(f"# Port workflow: {banner}")
+
+
+def test_stopped_snapshot_never_presents_configured_model_as_active(journal):
+    journal.checkpoint(
+        transition=None,
+        units=UNITS,
+        machine=MachineState(
+            workflow_state="maintenance",
+            configured_model="configured/model",
+            active_model=None,
+            context_length=None,
+        ),
+        driver_running=False,
+    )
+    current = json.loads(
+        (journal.worktree / "workflow-progress" / "current.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert current["driver_running"] is False
+    assert current["active_model"] is None
+    assert current["context_length"] is None
+    readme = (journal.worktree / "workflow-progress" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "| **Active model** | `-` @ - ctx |" in readme
+    assert "| **Configured model** | `configured/model` |" in readme
 
 
 def test_health_classifications(journal):

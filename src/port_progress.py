@@ -672,9 +672,10 @@ class ProgressJournal:
             f"| **Last green** | {counts.get('last_green_at') or 'never'} "
             f"(`{counts.get('last_green_unit') or '-'}`) |",
             f"| **Last product commit** | `{counts.get('last_product_commit') or '-'}` |",
-            f"| **Current model** | "
-            f"`{current.get('active_model') or current.get('configured_model') or '-'}` "
-            f"@ {current.get('context_length') or '?'} ctx |",
+            f"| **Active model** | `{current.get('active_model') or '-'}` "
+            f"@ {current.get('context_length') or '-'} ctx |",
+            f"| **Configured model** | "
+            f"`{current.get('configured_model') or '-'}` |",
             f"| **Driver** | {current.get('driver_status') or '-'} |",
         ]
         if current.get("block_reason"):
@@ -733,13 +734,23 @@ class ProgressJournal:
         if transition_id:
             receipt = self.transition_receipt(transition_id)
             if receipt["branch"]:
-                return {
+                outcome = {
                     "recorded": True,
                     "committed": True,
                     "pushed": False,
                     "idempotent": True,
                     **({"commit": receipt["commit"]} if receipt.get("commit") else {}),
                 }
+                # A branch receipt proves the transition was committed, not
+                # that the allowed remote journal ref received it. Maintenance
+                # callers may require an actual port-progress push before they
+                # change canonical verdict state, so an exact rerun must retry
+                # that push instead of returning early with pushed=False.
+                if self.enable_push:
+                    outcome.update(self.flush_pending_push())
+                else:
+                    outcome["detail"] = "push disabled"
+                return outcome
         timestamp = stable_timestamp or utc_now()
         record = (
             transition.to_record(timestamp, stable_run_id or self.run_id)
