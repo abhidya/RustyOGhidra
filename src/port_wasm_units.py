@@ -53,6 +53,8 @@ from src.port_assembly_gate import (
     ASSEMBLY_WASM,
     SMOKE_JS,
     assembly_window_size,
+    gate_ledger_material,
+    read_gate_ledger,
     record_gate_result,
     run_assembly_gate,
     select_recent_green_units,
@@ -1838,6 +1840,9 @@ class WasmUnitDriver:
         records in the tracked ledger. Any internal fault degrades to an
         event, never to a lost unit."""
         try:
+            material_before = gate_ledger_material(
+                read_gate_ledger(self.assembly_ledger_path)
+            )
             result = self.run_assembly_gate_now(assembly_window_size())
             if result.get("passed") is None:
                 return  # fewer than 2 units: composition is not yet a claim
@@ -1867,24 +1872,36 @@ class WasmUnitDriver:
                 )
             # Best-effort ledger commit: the conflict records are the
             # cross-unit reconciliation report (section 3) and belong in
-            # history next to the unit that surfaced them. Never fatal, and
-            # an unchanged ledger simply fails the commit quietly.
-            rel = "research/decomp/data/assembly-gate.json"
-            added = self._git_runner("add", rel)
-            if added.returncode == 0:
-                self._git_runner(
-                    "commit",
-                    "-m",
-                    (
-                        f"port-assembly: gate N={result.get('n')} "
-                        f"{'pass' if result.get('passed') else 'FAIL'} "
-                        f"({len(result.get('conflicts') or [])} conflict(s)) "
-                        f"after {unit_name}"
-                    ),
-                    "--",
-                    rel,
-                )
-                self._git_runner("push")
+            # history next to the unit that surfaced them. Never fatal.
+            # MATERIAL changes only (new/changed conflict identity or a new
+            # largest_n_passed): record_gate_result stamps last_run/updated_at
+            # on every call, so committing the raw file would mint one churn
+            # commit per green. Immaterial runs leave the file updated on disk
+            # but uncommitted -- safe, because every other driver commit here
+            # is pathspec'd (git add <paths> + git commit -- <paths>), never a
+            # tree-wide sweep. NO push: the commit rides this branch and
+            # reaches the remote with the next sanctioned product push
+            # (_commit_unit/_commit_paths); a bare push here was landing one
+            # "port-assembly:" commit on origin/main per green.
+            material_after = gate_ledger_material(
+                read_gate_ledger(self.assembly_ledger_path)
+            )
+            if material_after != material_before:
+                rel = "research/decomp/data/assembly-gate.json"
+                added = self._git_runner("add", "--", rel)
+                if added.returncode == 0:
+                    self._git_runner(
+                        "commit",
+                        "-m",
+                        (
+                            f"port-assembly: gate N={result.get('n')} "
+                            f"{'pass' if result.get('passed') else 'FAIL'} "
+                            f"({len(result.get('conflicts') or [])} conflict(s)) "
+                            f"after {unit_name}"
+                        ),
+                        "--",
+                        rel,
+                    )
         except Exception as error:  # noqa: BLE001 - the gate never fails a unit
             self.events.emit(
                 "assembly_gate_error", unit=unit_name, error=str(error)[:400]
@@ -1948,7 +1965,7 @@ class WasmUnitDriver:
             else f"research/decomp/port-units/{name}"
         )
         paths = [rel, *(extra_paths or [])]
-        added = self._git_runner("add", *paths)
+        added = self._git_runner("add", "--", *paths)
         if added.returncode != 0:
             return None, False, (added.stdout + added.stderr)[-400:]
         message = (
@@ -1963,12 +1980,24 @@ class WasmUnitDriver:
         rev = self._git_runner("rev-parse", "HEAD")
         if rev.returncode == 0:
             sha = rev.stdout.strip()
-        pushed = self._git_runner("push")
-        if pushed.returncode != 0:
-            pushed = self._git_runner("push", "-u", "origin", "HEAD")
+        pushed = self._push_product()
         return sha or None, pushed.returncode == 0, (
             "" if pushed.returncode == 0 else (pushed.stdout + pushed.stderr)[-400:]
         )
+
+    def _push_product(self) -> subprocess.CompletedProcess[str]:
+        """The ONE sanctioned product push: current branch to its same-named
+        branch on origin, explicit refspec (a bare `git push` depends on
+        ambient upstream config -- the gate-ledger bug rode exactly that).
+        This lands greens on GotYaForce main per the runbook invariant
+        ("main should receive a push whenever a unit goes green"); the
+        port-progress branch is journal-owned (port_progress.py pushes it
+        with its own explicit refspec from its own worktree) and product
+        history must never be pushed there. One retry for transient faults."""
+        pushed = self._git_runner("push", "origin", "HEAD")
+        if pushed.returncode != 0:
+            pushed = self._git_runner("push", "origin", "HEAD")
+        return pushed
 
     # -------------------------------------------------------------------- unit
 
@@ -3255,9 +3284,7 @@ class WasmUnitDriver:
         rev = self._git_runner("rev-parse", "HEAD")
         if rev.returncode == 0:
             sha = rev.stdout.strip()
-        pushed = self._git_runner("push")
-        if pushed.returncode != 0:
-            pushed = self._git_runner("push", "-u", "origin", "HEAD")
+        pushed = self._push_product()
         return sha or None, pushed.returncode == 0, (
             "" if pushed.returncode == 0 else (pushed.stdout + pushed.stderr)[-400:]
         )

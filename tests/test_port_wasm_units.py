@@ -314,7 +314,7 @@ def test_compile_only_unit_commits_to_staging_unverified(tmp_path, monkeypatch):
     prov = json.loads(staged.read_text())
     assert prov["verified"] is False and prov["tier"] == "compile_only"
     add_call = next(c for c in git_calls if c[0] == "add")
-    assert "port-units-staging" in add_call[1]
+    assert any("port-units-staging" in str(arg) for arg in add_call)
     commit_call = next(c for c in git_calls if c[0] == "commit")
     assert "port-staging:" in commit_call[2] and "unoracled" in commit_call[2]
 
@@ -1248,3 +1248,190 @@ def test_single_green_unit_skips_the_gate_quietly(tmp_path, monkeypatch):
         repo / "research/decomp/generated/finish-game-port/events.jsonl"
     ).read_text()
     assert '"assembly_gate"' not in events
+
+
+def test_assembly_gate_never_pushes(tmp_path, monkeypatch):
+    """Regression: the gate's ledger commit must NOT carry its own push --
+    a bare `git push` here landed one port-assembly commit on origin/main
+    per green. The only push in a green run is the unit's own product push;
+    every git call after the ledger enters the picture is push-free."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        git_runner=fake_git,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    assert driver.run() == EXIT_NO_WORK
+    pushes = [args for args in git_calls if args[0] == "push"]
+    assert len(pushes) == 1, "exactly the unit's product push, nothing more"
+    ledger_indices = [
+        i for i, args in enumerate(git_calls)
+        if any("assembly-gate.json" in str(a) for a in args)
+    ]
+    assert ledger_indices, "the material first gate run must commit the ledger"
+    after_ledger = git_calls[ledger_indices[0]:]
+    assert all(args[0] != "push" for args in after_ledger)
+    # The ledger commit itself is pathspec'd (never a tree-wide sweep).
+    ledger_commits = [
+        args for args in after_ledger
+        if args[0] == "commit" and "assembly-gate.json" in " ".join(map(str, args))
+    ]
+    assert len(ledger_commits) == 1
+    assert "--" in ledger_commits[0]
+
+
+def _gate_driver_with_two_greens(repo, git_calls, *, link_ok=True, conflicts=None):
+    """Driver wired for direct _maybe_run_assembly_gate calls over two
+    pre-seeded green artifacts."""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        if link_ok:
+            (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+            return True, ""
+        return False, conflicts or "wasm-ld: error: duplicate symbol: zz_prior_"
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
+
+    return _driver(
+        repo,
+        git_runner=fake_git,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+
+
+def test_assembly_gate_unchanged_material_mints_no_commit(tmp_path, monkeypatch):
+    """Regression: record_gate_result stamps last_run/updated_at on EVERY
+    run, so an outcome-identical rerun rewrites the file -- but only material
+    change (conflict identity, largest_n_passed) deserves a commit. A
+    materially-unchanged rerun must produce zero git calls."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    _seed_green_artifact(repo, "other-unit", "2026-08-02T00:00:00Z")
+    git_calls = []
+    driver = _gate_driver_with_two_greens(repo, git_calls)
+
+    driver._maybe_run_assembly_gate("other-unit")
+    first_run_commits = [args for args in git_calls if args[0] == "commit"]
+    assert len(first_run_commits) == 1  # largest_n_passed 0 -> 2 is material
+    assert not [args for args in git_calls if args[0] == "push"]
+
+    ledger_path = repo / "research/decomp/data/assembly-gate.json"
+    before = json.loads(ledger_path.read_text())
+    git_calls.clear()
+    driver._maybe_run_assembly_gate("other-unit")
+    after = json.loads(ledger_path.read_text())
+    # The file DID churn (this is exactly why the raw diff is no commit signal)
+    assert after["runs_total"] == before["runs_total"] + 1
+    assert after["last_run"]["checked_at"] != before["last_run"]["checked_at"] or (
+        after["updated_at"] != before["updated_at"]
+    )
+    assert git_calls == [], "immaterial ledger churn must not touch git"
+
+
+def test_assembly_gate_repeat_conflict_is_immaterial(tmp_path, monkeypatch):
+    """A failing gate files its conflict once; re-seeing the SAME conflict
+    only bumps times_seen/last_seen, which is churn, not news -- no second
+    commit, and never any push."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    _seed_green_artifact(repo, "other-unit", "2026-08-02T00:00:00Z")
+    git_calls = []
+    driver = _gate_driver_with_two_greens(repo, git_calls, link_ok=False)
+
+    driver._maybe_run_assembly_gate("other-unit")
+    assert len([args for args in git_calls if args[0] == "commit"]) == 1
+    git_calls.clear()
+    driver._maybe_run_assembly_gate("other-unit")
+    assert git_calls == []
+    ledger = json.loads(
+        (repo / "research/decomp/data/assembly-gate.json").read_text()
+    )
+    only = next(iter(ledger["conflicts"].values()))
+    assert only["times_seen"] == 2  # the recurrence is still recorded on disk
+    assert not [args for args in git_calls if args[0] == "push"]
+
+
+# ---------------------------------------------------------------------------
+# Git side-effect audit invariants: every push carries an explicit refspec
+# (bare `git push` rides ambient upstream config -- the gate-ledger bug),
+# every add/commit is pathspec'd (never sweeps unrelated dirty files).
+
+
+def test_product_push_uses_an_explicit_refspec(tmp_path, monkeypatch):
+    """The green unit's product push must be `push origin HEAD` (current
+    branch to its same-named origin branch), never a bare `git push`."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(repo, git_runner=fake_git, build_runner=fake_build)
+    assert driver.run() == EXIT_NO_WORK
+    pushes = [args for args in git_calls if args[0] == "push"]
+    assert pushes == [("push", "origin", "HEAD")]
+    # And every add/commit in the run is pathspec'd.
+    for args in git_calls:
+        if args[0] in ("add", "commit"):
+            assert "--" in args, f"unpathspec'd git call: {args}"
+
+
+def test_commit_paths_is_pathspecd_and_pushes_explicitly(tmp_path, monkeypatch):
+    """The reverify/T3 promote path (_commit_paths) shares the audit
+    invariants: pathspec'd add + commit, explicit-refspec push."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
+
+    driver = _driver(repo, git_runner=fake_git)
+    sha, pushed, detail = driver._commit_paths(
+        "port: audit-invariant probe", ["research/decomp/data/probe.json"]
+    )
+    assert sha == "deadbeef" and pushed and detail == ""
+    assert [args for args in git_calls if args[0] == "push"] == [
+        ("push", "origin", "HEAD")
+    ]
+    for args in git_calls:
+        if args[0] in ("add", "commit"):
+            assert "--" in args, f"unpathspec'd git call: {args}"

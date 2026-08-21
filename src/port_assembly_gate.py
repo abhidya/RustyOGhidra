@@ -908,15 +908,51 @@ def _conflict_key(conflict: dict[str, Any]) -> str:
     )
 
 
-def record_gate_result(ledger_path: Path, result: dict[str, Any]) -> dict[str, Any]:
-    """Fold one gate result into the tracked assembly ledger. Returns the
-    updated ledger payload."""
+def read_gate_ledger(ledger_path: Path) -> dict[str, Any] | None:
+    """Best-effort read of the tracked assembly ledger. Returns None for a
+    missing, corrupt, or wrong-schema file (record_gate_result then rebuilds)."""
     try:
         ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
         if ledger.get("schema") != GATE_LEDGER_SCHEMA:
-            ledger = None
+            return None
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        ledger = None
+        return None
+    return ledger if isinstance(ledger, dict) else None
+
+
+_CONFLICT_CHURN_FIELDS = ("first_seen", "last_seen", "times_seen")
+
+
+def gate_ledger_material(ledger: dict[str, Any] | None) -> dict[str, Any]:
+    """The subset of the ledger whose change is worth a commit: conflict
+    identity and the largest-N-passed G1 metric. Excludes the fields every
+    run churns regardless of outcome (last_run, updated_at, runs_total) and
+    the per-conflict recurrence bookkeeping (times_seen, first/last_seen) --
+    a recurring already-filed conflict is not new information."""
+    if not isinstance(ledger, dict):
+        return {}
+    conflicts: dict[str, Any] = {}
+    for key, entry in (ledger.get("conflicts") or {}).items():
+        if isinstance(entry, dict):
+            conflicts[key] = {
+                field: value
+                for field, value in entry.items()
+                if field not in _CONFLICT_CHURN_FIELDS
+            }
+        else:
+            conflicts[key] = entry
+    return {
+        "largest_n_passed": int(ledger.get("largest_n_passed", 0)),
+        "conflicts": conflicts,
+    }
+
+
+def record_gate_result(ledger_path: Path, result: dict[str, Any]) -> dict[str, Any]:
+    """Fold one gate result into the tracked assembly ledger. Returns the
+    updated ledger payload. NOTE: last_run/updated_at/runs_total change on
+    EVERY call -- callers deciding whether the update deserves a commit must
+    compare gate_ledger_material() views, not the raw payload."""
+    ledger = read_gate_ledger(ledger_path)
     if not isinstance(ledger, dict):
         ledger = {
             "schema": GATE_LEDGER_SCHEMA,
