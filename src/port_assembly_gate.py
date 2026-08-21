@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -670,6 +671,10 @@ def conflicts_from_link_error(error_text: str, units: list[str]) -> list[dict[st
 # Unit artifact selection
 
 REQUIRED_ARTIFACTS = ("unit.c", "gnt4_shim.h", "provenance.json")
+BACKFILL_REQUIRED_COMMITTED_FILES = frozenset(
+    (*REQUIRED_ARTIFACTS, "unit.wasm")
+)
+BACKFILL_ALLOWED_IGNORED_EVIDENCE = frozenset({"oracle.log"})
 
 
 @dataclass
@@ -681,6 +686,147 @@ class UnitArtifact:
     exports: list[str]
     allowed_extra_imports: list[str]
     tier: str
+    canonical: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class CanonicalStateSnapshot:
+    """One stable, digest-bound view of canonical unit eligibility."""
+
+    path: Path
+    sha256: str
+    units: dict[str, dict[str, Any]]
+
+
+ELIGIBLE_CANONICAL_TIERS = frozenset({"compile_only", "oracle_green"})
+LegacyArtifactVerifier = Callable[
+    [UnitArtifact, dict[str, Any]],
+    tuple[dict[str, Any] | None, str | None],
+]
+
+
+def load_canonical_state_snapshot(
+    state_path: Path, *, attempts: int = 3
+) -> CanonicalStateSnapshot:
+    """Read one stable schema-1 canonical state snapshot or fail closed."""
+    last_error = "canonical state changed during read"
+    for _ in range(max(1, attempts)):
+        try:
+            before = state_path.stat()
+            payload = state_path.read_bytes()
+            after = state_path.stat()
+        except OSError as error:
+            raise ValueError(f"canonical state unavailable: {error}") from error
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            time.sleep(0)
+            continue
+        try:
+            state = json.loads(payload.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("canonical state is malformed") from error
+        units = state.get("units") if isinstance(state, dict) else None
+        if (
+            not isinstance(state, dict)
+            or state.get("state_schema") != 1
+            or not isinstance(units, dict)
+        ):
+            raise ValueError("canonical state schema/units are invalid")
+        if any(not isinstance(name, str) or not isinstance(record, dict)
+               for name, record in units.items()):
+            raise ValueError("canonical state contains an invalid unit record")
+        return CanonicalStateSnapshot(
+            path=state_path,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            units=units,
+        )
+    raise ValueError(last_error)
+
+
+def verify_canonical_state_snapshot(snapshot: CanonicalStateSnapshot) -> bool:
+    """True only when a fresh stable read is byte-identical to ``snapshot``."""
+    try:
+        current = load_canonical_state_snapshot(snapshot.path)
+    except ValueError:
+        return False
+    return current.sha256 == snapshot.sha256
+
+
+def canonical_artifact_evidence(
+    artifact: UnitArtifact,
+    record: dict[str, Any] | None,
+    *,
+    required_tier: str | None,
+    state_sha256: str,
+    legacy_verifier: LegacyArtifactVerifier | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return bound eligibility evidence, or one fail-closed exclusion reason."""
+    if not isinstance(record, dict):
+        return None, "missing-canonical-record"
+    status = record.get("status")
+    tier = record.get("tier")
+    if status != "green":
+        return None, f"canonical-status:{status or 'missing'}"
+    if tier not in ELIGIBLE_CANONICAL_TIERS:
+        return None, f"canonical-tier:{tier or 'missing'}"
+    if required_tier is not None and tier != required_tier:
+        return None, f"root-tier-mismatch:{tier}"
+    if artifact.tier != tier:
+        return None, f"artifact-tier-mismatch:{artifact.tier}"
+    commit = record.get("commit")
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{7,40}", commit, re.I) is None:
+        return None, "canonical-commit-missing"
+    if record.get("pushed") is not True:
+        return None, "canonical-push-unconfirmed"
+    bound_digest = record.get("candidate_sha256")
+    if bound_digest is None:
+        if legacy_verifier is None:
+            return None, "canonical-artifact-digest-missing"
+        binding, reason = legacy_verifier(artifact, record)
+        if binding is None:
+            return None, reason or "legacy-commit-tree-proof-failed"
+        if (
+            binding.get("binding") != "legacy-git-tree"
+            or binding.get("artifact_sha256") != artifact.sha256
+            or binding.get("commit") != commit
+        ):
+            return None, "legacy-commit-tree-proof-invalid"
+        try:
+            digest_after_proof = unit_artifact_sha256(artifact.directory)
+        except OSError:
+            return None, "legacy-artifact-raced"
+        if digest_after_proof != artifact.sha256:
+            return None, "legacy-artifact-raced"
+    else:
+        if (
+            not isinstance(bound_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", bound_digest, re.I) is None
+        ):
+            return None, "canonical-artifact-digest-invalid"
+        if bound_digest != artifact.sha256:
+            return None, "canonical-artifact-digest-mismatch"
+        binding = {
+            "binding": "canonical-digest",
+            "artifact_sha256": bound_digest,
+            "commit": commit,
+        }
+    revoked = record.get("revoked")
+    if revoked is not None and not isinstance(revoked, dict):
+        return None, "canonical-revocation-malformed"
+    if isinstance(revoked, dict) and revoked.get("previous_commit") == commit:
+        return None, "current-lifecycle-revocation-contradiction"
+    return {
+        "name": artifact.name,
+        "artifact_sha256": artifact.sha256,
+        "status": status,
+        "tier": tier,
+        "commit": commit,
+        "pushed": True,
+        "promotion_transaction_id": record.get("promotion_transaction_id"),
+        "promotion_transition_id": record.get("promotion_transition_id"),
+        "state_sha256": state_sha256,
+        "stale_revocation_ignored": isinstance(revoked, dict),
+        "artifact_binding": binding,
+    }, None
 
 
 def unit_artifact_sha256(directory: Path) -> str:
@@ -709,6 +855,184 @@ def unit_artifact_sha256(directory: Path) -> str:
     return digest.hexdigest()
 
 
+def prove_legacy_artifact_commit_tree(
+    artifact: UnitArtifact,
+    record: dict[str, Any],
+    *,
+    repo_root: Path,
+    git_runner: Callable[..., Any],
+    publication_ref: str = "refs/remotes/origin/port-staging",
+    publication_sha: str | None = None,
+    required_committed_files: frozenset[str] | None = None,
+    allowed_ignored_extras: frozenset[str] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Prove a digest-less legacy artifact against its recorded product commit.
+
+    The mutable worktree is never treated as authority. By default every file
+    and directory must correspond exactly to ``commit:path``. The explicit
+    digest-backfill maintenance path may provide a narrow ignored-evidence
+    allowlist only to inventory and journal known historical evidence before
+    sanctioning the complete raw directory digest.
+    """
+    commit = record.get("commit")
+    if (
+        not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-f]{7,40}", commit, re.I) is None
+    ):
+        return None, "legacy-commit-invalid"
+    try:
+        repo = repo_root.resolve(strict=True)
+        directory = artifact.directory.resolve(strict=True)
+        relative = directory.relative_to(repo)
+    except (OSError, ValueError):
+        return None, "legacy-artifact-path-outside-repo"
+    if artifact.directory.is_symlink() or not relative.parts:
+        return None, "legacy-artifact-path-outside-repo"
+    relative_text = relative.as_posix()
+    reachability_target = publication_sha or publication_ref
+    if publication_sha is not None and re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", publication_sha, re.I
+    ) is None:
+        return None, "legacy-publication-sha-invalid"
+    reachable = git_runner(
+        "merge-base", "--is-ancestor", commit, reachability_target
+    )
+    if reachable.returncode != 0:
+        return None, "legacy-commit-unreachable-from-publication-ref"
+    tree = git_runner(
+        "ls-tree", "-r", "-z", "--full-tree", commit, "--", relative_text
+    )
+    if tree.returncode != 0:
+        return None, "legacy-commit-tree-unavailable"
+    prefix = relative_text.rstrip("/") + "/"
+    expected_files: dict[str, tuple[str, str]] = {}
+    for entry in tree.stdout.split("\0"):
+        if not entry:
+            continue
+        try:
+            metadata, path = entry.split("\t", 1)
+            mode, object_type, object_id = metadata.split(" ", 2)
+        except ValueError:
+            return None, "legacy-commit-tree-malformed"
+        if (
+            object_type != "blob"
+            or mode not in {"100644", "100755"}
+            or not path.startswith(prefix)
+        ):
+            return None, "legacy-commit-tree-unsupported-entry"
+        local_name = path[len(prefix):]
+        if not local_name or local_name in expected_files:
+            return None, "legacy-commit-tree-malformed"
+        expected_files[local_name] = (mode, object_id)
+    if not expected_files:
+        return None, "legacy-commit-path-missing"
+    required = required_committed_files or frozenset()
+    missing_required = sorted(required - set(expected_files))
+    if missing_required:
+        return None, "legacy-required-file-not-committed:" + missing_required[0]
+    object_lengths = {len(object_id) for _mode, object_id in expected_files.values()}
+    if object_lengths not in ({40}, {64}):
+        return None, "legacy-commit-object-format-unsupported"
+    expected_directories = {
+        parent.as_posix()
+        for name in expected_files
+        for parent in Path(name).parents
+        if parent != Path(".")
+    }
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    file_inventory: list[dict[str, Any]] = []
+    try:
+        for path in artifact.directory.rglob("*"):
+            if path.is_symlink():
+                return None, "legacy-artifact-tree-unsupported-entry"
+            name = path.relative_to(artifact.directory).as_posix()
+            if path.is_dir():
+                actual_directories.add(name)
+                continue
+            if not path.is_file():
+                return None, "legacy-artifact-tree-unsupported-entry"
+            actual_files.add(name)
+            payload = path.read_bytes()
+            file_inventory.append({
+                "path": name,
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+    except OSError:
+        return None, "legacy-artifact-unreadable"
+    extra_files = actual_files - set(expected_files)
+    extra_directories = actual_directories - expected_directories
+    if not set(expected_files).issubset(actual_files):
+        return None, "legacy-artifact-commit-mismatch"
+    ignore_evidence: list[dict[str, str]] = []
+    if extra_directories:
+        return None, "legacy-extra-directory-not-allowed:" + sorted(extra_directories)[0]
+    if extra_files and allowed_ignored_extras is None:
+        return None, "legacy-artifact-commit-mismatch"
+    for name in sorted(extra_files):
+        repo_path = f"{relative_text}/{name}"
+        ignored = git_runner("check-ignore", "-v", "--", repo_path)
+        is_ignored = ignored.returncode == 0 and bool(ignored.stdout.strip())
+        if ignored.returncode not in {0, 1}:
+            return None, "legacy-ignore-proof-unavailable:" + name
+        if not is_ignored:
+            return None, "legacy-extra-not-ignored:" + name
+        if name not in (allowed_ignored_extras or frozenset()):
+            return None, "legacy-ignored-extra-not-allowlisted:" + name
+        ignore_evidence.append({
+            "path": name,
+            "repo_path": repo_path,
+            "classification": "allowed-ignored-evidence",
+            "allowlist_entry": name,
+            "git_check_ignore": ignored.stdout.strip(),
+        })
+    try:
+        digest_before = unit_artifact_sha256(artifact.directory)
+    except OSError:
+        return None, "legacy-artifact-unreadable"
+    if digest_before != artifact.sha256:
+        return None, "legacy-artifact-raced"
+    # Git's clean filters are part of the repository's committed-byte model
+    # (notably core.autocrlf on this Windows host). ``git diff`` proves the
+    # worktree material maps exactly to the recorded tree without mistaking a
+    # normal checkout representation for a substitution. The raw directory
+    # digest above/below still binds the exact bytes compiled by the gate.
+    diff = git_runner(
+        "diff", "--no-ext-diff", "--quiet", commit, "--", relative_text
+    )
+    if diff.returncode == 1:
+        return None, "legacy-artifact-commit-mismatch"
+    if diff.returncode != 0:
+        return None, "legacy-commit-tree-unavailable"
+    try:
+        digest_after = unit_artifact_sha256(artifact.directory)
+    except OSError:
+        return None, "legacy-artifact-unreadable"
+    if digest_after != artifact.sha256:
+        return None, "legacy-artifact-raced"
+    tree_digest = hashlib.sha256()
+    for name, (mode, object_id) in sorted(expected_files.items()):
+        tree_digest.update(f"{mode} {object_id}\0{name}\0".encode("utf-8"))
+    return {
+        "binding": "legacy-git-tree",
+        "artifact_sha256": artifact.sha256,
+        "commit": commit,
+        "publication_ref": publication_ref,
+        "publication_sha": publication_sha or reachability_target,
+        "path": relative_text,
+        "tree_entry_count": len(expected_files),
+        "tree_sha256": tree_digest.hexdigest(),
+        "file_inventory": sorted(file_inventory, key=lambda item: item["path"]),
+        "uncommitted_files": sorted(actual_files - set(expected_files)),
+        "uncommitted_directories": sorted(
+            actual_directories - expected_directories
+        ),
+        "ignored_extra_evidence": ignore_evidence,
+        "required_committed_files": sorted(required),
+    }, None
+
+
 def load_unit_artifact(directory: Path) -> UnitArtifact | None:
     for artifact in REQUIRED_ARTIFACTS:
         if not (directory / artifact).is_file():
@@ -733,8 +1057,13 @@ def load_unit_artifact(directory: Path) -> UnitArtifact | None:
 
 
 def select_recent_green_units(
-    roots: list[Path], n: int | None
-) -> list[UnitArtifact]:
+    roots: list[Path],
+    n: int | None,
+    *,
+    canonical_snapshot: CanonicalStateSnapshot,
+    root_tiers: list[str | None] | None = None,
+    legacy_verifier: LegacyArtifactVerifier | None = None,
+) -> tuple[list[UnitArtifact], dict[str, str]]:
     """The last N green/staged unit artifacts across the given roots, oldest
     first (stable link order), recency by provenance generated_at. n=None
     selects everything (the backfill sweep).
@@ -748,9 +1077,12 @@ def select_recent_green_units(
     (review R2) both copies were selected, the gate wrote ``{name}.c`` twice
     (newer silently overwriting older), and the composition compiled one
     unit's code twice while the other's was silently absent."""
+    if root_tiers is not None and len(root_tiers) != len(roots):
+        raise ValueError("root_tiers must match roots")
     artifacts: list[UnitArtifact] = []
+    excluded: dict[str, str] = {}
     seen_names: set[str] = set()
-    for root in roots:
+    for root_index, root in enumerate(roots):
         if not root.is_dir():
             continue
         for directory in sorted(root.iterdir()):
@@ -760,11 +1092,22 @@ def select_recent_green_units(
             if artifact is None or artifact.name in seen_names:
                 continue
             seen_names.add(artifact.name)
+            evidence, reason = canonical_artifact_evidence(
+                artifact,
+                canonical_snapshot.units.get(artifact.name),
+                required_tier=(root_tiers[root_index] if root_tiers else None),
+                state_sha256=canonical_snapshot.sha256,
+                legacy_verifier=legacy_verifier,
+            )
+            if evidence is None:
+                excluded[artifact.name] = reason or "ineligible"
+                continue
+            artifact.canonical = evidence
             artifacts.append(artifact)
     artifacts.sort(key=lambda a: (a.generated_at, a.name))
     if n is not None and n > 0:
         artifacts = artifacts[-n:]
-    return artifacts
+    return artifacts, excluded
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +1149,7 @@ def run_assembly_gate(
     smoke_runner: Callable[[Path], tuple[bool, str]] | None = None,
     *,
     candidate: UnitArtifact | None = None,
+    selection_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one N-unit assembly-gate pass. Pure orchestration: emcc and node
     arrive as injected runners.
@@ -827,6 +1171,7 @@ def run_assembly_gate(
             if candidate is not None
             else None
         ),
+        "selection": selection_evidence,
     }
     if candidate is not None:
         matching = [unit for unit in units if unit.name == candidate.name]
@@ -845,6 +1190,18 @@ def run_assembly_gate(
                 f"assembly selection did not bind exact candidate "
                 f"{candidate.name}@{candidate.sha256}; observed "
                 f"{digest_now} with {len(matching)} matching name(s)"
+            )
+            return result
+    for unit in units:
+        try:
+            digest_now = unit_artifact_sha256(unit.directory)
+        except OSError as error:
+            digest_now = f"unreadable:{error}"
+        if digest_now != unit.sha256:
+            result["stage"] = "artifact-integrity"
+            result["detail"] = (
+                f"selected artifact {unit.name} changed before assembly: "
+                f"expected {unit.sha256}, observed {digest_now}"
             )
             return result
     # Defense in depth behind select_recent_green_units' name dedup: the gate
@@ -944,16 +1301,20 @@ def run_assembly_gate(
             result["detail"] = (log or "").strip()[-1200:]
             return result
 
-    if candidate is not None:
+    for unit in units:
         try:
-            digest_after = unit_artifact_sha256(candidate.directory)
+            digest_after = unit_artifact_sha256(unit.directory)
         except OSError as error:
             digest_after = f"unreadable:{error}"
-        if digest_after != candidate.sha256:
-            result["stage"] = "candidate-integrity"
+        if digest_after != unit.sha256:
+            result["stage"] = (
+                "candidate-integrity"
+                if candidate is not None and unit.name == candidate.name
+                else "artifact-integrity"
+            )
             result["detail"] = (
-                f"candidate {candidate.name} changed during assembly: expected "
-                f"{candidate.sha256}, observed {digest_after}"
+                f"selected artifact {unit.name} changed during assembly: expected "
+                f"{unit.sha256}, observed {digest_after}"
             )
             return result
 

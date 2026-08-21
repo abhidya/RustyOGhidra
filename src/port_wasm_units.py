@@ -52,15 +52,21 @@ from pathlib import Path
 from typing import Any
 
 from src.port_assembly_gate import (
+    BACKFILL_ALLOWED_IGNORED_EVIDENCE,
+    BACKFILL_REQUIRED_COMMITTED_FILES,
+    ELIGIBLE_CANONICAL_TIERS,
     ASSEMBLY_WASM,
     SMOKE_JS,
     UnitArtifact,
     assembly_window_size,
     load_unit_artifact,
+    load_canonical_state_snapshot,
+    prove_legacy_artifact_commit_tree,
     record_gate_result,
     run_assembly_gate,
     select_recent_green_units,
     unit_artifact_sha256,
+    verify_canonical_state_snapshot,
 )
 from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
 from src.port_fp_transform import (
@@ -2356,6 +2362,10 @@ class WasmUnitDriver:
         projected = self._project_record_update(
             state, str(marker.get("unit")), green_update
         )
+        # A successful promotion is a new canonical lifecycle. Revocation
+        # metadata describes the superseded verdict and must not survive to
+        # contradict this green record (or poison assembly eligibility).
+        projected["units"][str(marker.get("unit"))].pop("revoked", None)
         self._update_promotion_marker(
             attempt_dir, phase="checkpointing", green_record=green_update
         )
@@ -2534,26 +2544,75 @@ class WasmUnitDriver:
     ) -> dict[str, Any]:
         """One assembly-gate pass over the last n green/staged units (n=None
         sweeps everything -- the backfill form). Emits NO events and takes no
-        lock: safe from the maintenance CLI while a driver is alive (it reads
-        only committed artifacts and writes only its own workdir + ledger)."""
+        lock. Selection is bound to one stable canonical-state snapshot and
+        fails closed if that state changes while the gate is running; callers
+        must reconcile interrupted records before invoking this maintenance
+        path."""
+        try:
+            snapshot = load_canonical_state_snapshot(self.state_path)
+        except ValueError as error:
+            return {
+                "passed": False, "n": 0, "units": [],
+                "stage": "canonical-state", "conflicts": [],
+                "detail": str(error)[:1200], "candidate": (
+                    {"name": candidate.name, "sha256": candidate.sha256}
+                    if candidate is not None else None
+                ),
+                "selection": None,
+            }
+        interrupted = sorted(
+            name for name, record in snapshot.units.items()
+            if record.get("status") == "porting"
+            and (candidate is None or name != candidate.name)
+        )
+        if interrupted:
+            return {
+                "passed": False, "n": 0, "units": [],
+                "stage": "canonical-state", "conflicts": [],
+                "detail": "interrupted canonical records require reconciliation "
+                "before assembly selection: " + ", ".join(interrupted[:20]),
+                "candidate": (
+                    {"name": candidate.name, "sha256": candidate.sha256}
+                    if candidate is not None else None
+                ),
+                "selection": {"canonical_state_sha256": snapshot.sha256},
+            }
+        prior, excluded = select_recent_green_units(
+            [self.artifact_root, self.staging_root],
+            None,
+            canonical_snapshot=snapshot,
+            root_tiers=["oracle_green", "compile_only"],
+        )
+        selection_evidence = {
+            "canonical_state_sha256": snapshot.sha256,
+            "eligible": [unit.canonical for unit in prior],
+            "excluded": excluded,
+        }
         if candidate is None:
-            units = select_recent_green_units(
-                [self.artifact_root, self.staging_root], n
-            )
+            units = prior[-n:] if n is not None and n > 0 else prior
+            selected_names = {unit.name for unit in units}
+            selection_evidence["eligible"] = [
+                unit.canonical for unit in prior if unit.name in selected_names
+            ]
         else:
             # The candidate is explicit authority, never discovered through
             # timestamp/root selection. Exclude every same-name root artifact,
             # select at most N-1 prior units, then append the exact candidate.
             prior = [
                 unit
-                for unit in select_recent_green_units(
-                    [self.artifact_root, self.staging_root], None
-                )
+                for unit in prior
                 if unit.name != candidate.name
             ]
             if n is not None and n > 0:
                 prior = prior[-max(0, n - 1):] if n > 1 else []
             units = [*prior, candidate]
+            selection_evidence["eligible"] = [unit.canonical for unit in prior]
+            selection_evidence["candidate"] = {
+                "name": candidate.name,
+                "artifact_sha256": candidate.sha256,
+                "tier": candidate.tier,
+                "authority": "private-explicit-candidate",
+            }
         if len(units) < 2:
             try:
                 digest_now = (
@@ -2575,6 +2634,21 @@ class WasmUnitDriver:
                         "name": candidate.name,
                         "sha256": candidate.sha256,
                     },
+                    "selection": selection_evidence,
+                }
+            if not verify_canonical_state_snapshot(snapshot):
+                return {
+                    "passed": False,
+                    "n": len(units),
+                    "units": [unit.name for unit in units],
+                    "stage": "canonical-state-integrity",
+                    "conflicts": [],
+                    "detail": "canonical state changed during assembly selection",
+                    "candidate": (
+                        {"name": candidate.name, "sha256": candidate.sha256}
+                        if candidate is not None else None
+                    ),
+                    "selection": selection_evidence,
                 }
             return {
                 "passed": None,
@@ -2588,6 +2662,7 @@ class WasmUnitDriver:
                     if candidate is not None
                     else None
                 ),
+                "selection": selection_evidence,
             }
         result = run_assembly_gate(
             units,
@@ -2595,7 +2670,12 @@ class WasmUnitDriver:
             link_runner=self._assembly_link_runner,
             smoke_runner=self._assembly_smoke_runner,
             candidate=candidate,
+            selection_evidence=selection_evidence,
         )
+        if not verify_canonical_state_snapshot(snapshot):
+            result["passed"] = False
+            result["stage"] = "canonical-state-integrity"
+            result["detail"] = "canonical state changed during assembly gate"
         record_gate_result(self.assembly_ledger_path, result)
         return result
 
@@ -2761,13 +2841,26 @@ class WasmUnitDriver:
         )
         return sha, ""
 
-    def _remote_port_staging_sha(self) -> str | None:
+    def _remote_port_staging_sha(self, *, strict: bool = False) -> str | None:
         result = self._git_runner(
             "ls-remote", "origin", "refs/heads/port-staging"
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        return result.stdout.split()[0]
+        if not strict:
+            return result.stdout.split()[0]
+        matches = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "refs/heads/port-staging":
+                matches.append(fields[0])
+        if len(matches) != 1:
+            return None
+        if re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", matches[0], re.I
+        ) is None:
+            return None
+        return matches[0]
 
     def _push_product_sha(self, sha: str) -> subprocess.CompletedProcess[str]:
         """The ONE sanctioned product push, explicit refspec (a bare
@@ -4052,6 +4145,186 @@ class WasmUnitDriver:
         finally:
             self.lock.release()
 
+    def backfill_artifact_digest(
+        self, unit_name: str, reason: str
+    ) -> dict[str, Any]:
+        """Journal-first, one-unit migration for digest-less green history.
+
+        Historical artifacts can contain ignored evidence (notably
+        ``oracle.log``), so Git alone cannot authenticate the complete raw
+        directory. This explicit maintenance operation proves every committed
+        file against the recorded publication commit, inventories every extra
+        file, journals that inventory + raw directory digest durably, and only
+        then adds ``candidate_sha256`` to canonical state. It never edits an
+        artifact or product ref.
+        """
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("artifact digest backfill requires a non-empty reason")
+        if Path(unit_name).name != unit_name:
+            raise ValueError("artifact digest backfill requires one plain unit name")
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; digest "
+                "backfill would race its state writes"
+            )
+        try:
+            snapshot = load_canonical_state_snapshot(self.state_path)
+            payload = self.state_path.read_bytes()
+            if hashlib.sha256(payload).hexdigest() != snapshot.sha256:
+                raise RuntimeError("canonical state changed during digest backfill")
+            state = json.loads(payload.decode("utf-8-sig"))
+            record = state.get("units", {}).get(unit_name)
+            if not isinstance(record, dict):
+                raise ValueError(f"unknown canonical unit {unit_name!r}")
+            tier = record.get("tier")
+            if record.get("status") != "green" or tier not in ELIGIBLE_CANONICAL_TIERS:
+                raise ValueError(
+                    f"unit {unit_name!r} is not a green eligible lifecycle "
+                    f"(status={record.get('status')!r}, tier={tier!r})"
+                )
+            revoked = record.get("revoked")
+            if (
+                isinstance(revoked, dict)
+                and revoked.get("previous_commit") == record.get("commit")
+            ):
+                raise ValueError(
+                    f"unit {unit_name!r} has a current-lifecycle revocation"
+                )
+            root = self.artifact_root if tier == "oracle_green" else self.staging_root
+            try:
+                artifact = load_unit_artifact(root / unit_name)
+            except OSError as error:
+                raise ValueError(
+                    f"unit {unit_name!r} artifact tree is unsafe: {error}"
+                ) from error
+            if artifact is None or artifact.name != unit_name or artifact.tier != tier:
+                raise ValueError(
+                    f"unit {unit_name!r} has no matching {tier!r} artifact"
+                )
+            existing_digest = record.get("candidate_sha256")
+            if existing_digest is not None:
+                if existing_digest != artifact.sha256:
+                    raise RuntimeError(
+                        f"canonical digest for {unit_name!r} does not match artifact"
+                    )
+                return {
+                    "unit": unit_name,
+                    "candidate_sha256": artifact.sha256,
+                    "already_bound": True,
+                    "backup": None,
+                    "state_file": str(self.state_path),
+                }
+            remote_sha = self._remote_port_staging_sha(strict=True)
+            if remote_sha is None:
+                raise RuntimeError(
+                    "authoritative origin/port-staging publication ref is unavailable"
+                )
+            binding, proof_error = prove_legacy_artifact_commit_tree(
+                artifact,
+                record,
+                repo_root=self.repo_root,
+                git_runner=self._git_runner,
+                publication_ref="refs/heads/port-staging",
+                publication_sha=remote_sha,
+                required_committed_files=BACKFILL_REQUIRED_COMMITTED_FILES,
+                allowed_ignored_extras=BACKFILL_ALLOWED_IGNORED_EVIDENCE,
+            )
+            if binding is None:
+                raise RuntimeError(
+                    f"legacy artifact commit proof failed: {proof_error}"
+                )
+            transition_preimage = {
+                "schema": 1,
+                "unit": unit_name,
+                "reason": reason,
+                "canonical_state_sha256": snapshot.sha256,
+                "binding": binding,
+            }
+            transition_id = "artifact-digest-backfill-" + hashlib.sha256(
+                json.dumps(
+                    transition_preimage, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            evidence = {
+                **binding,
+                "via": "backfill-artifact-digest",
+                "reason": reason,
+                "canonical_state_sha256": snapshot.sha256,
+                "transition_id": transition_id,
+            }
+            projected = self._project_record_update(
+                state,
+                unit_name,
+                {
+                    "candidate_sha256": artifact.sha256,
+                    "artifact_digest_backfill": evidence,
+                },
+            )
+            backup = self._backup_state()
+            transition = UnitTransition(
+                unit=unit_name,
+                result=RESULT_STAGED if tier == "compile_only" else RESULT_GREEN,
+                stage="artifact-digest-backfill",
+                attempt=record.get("attempts", 0),
+                detail=f"legacy artifact digest sanctioned: {reason}",
+                product_commit=str(record.get("commit") or "") or None,
+                product_pushed=True,
+                oracle_summary=record.get("oracle_summary"),
+                model=self._model_config.model,
+                tier=tier,
+                extra={**evidence, "transition_id": transition_id},
+            )
+            if not self._checkpoint(
+                projected,
+                transition,
+                workflow_state="maintenance",
+                driver_running=False,
+                require_progress_push=True,
+            ):
+                raise RuntimeError(
+                    "artifact digest backfill was not committed and pushed to "
+                    "port-progress; canonical state remains unchanged"
+                )
+            if not verify_canonical_state_snapshot(snapshot):
+                raise RuntimeError(
+                    "canonical state changed after digest backfill checkpoint"
+                )
+            try:
+                digest_after = unit_artifact_sha256(artifact.directory)
+            except OSError as error:
+                raise RuntimeError(
+                    f"artifact became unreadable after digest checkpoint: {error}"
+                ) from error
+            if digest_after != artifact.sha256:
+                raise RuntimeError(
+                    "artifact changed after digest checkpoint; canonical state "
+                    "remains unchanged"
+                )
+            self._save_state(projected)
+            self.events.emit(
+                "artifact_digest_backfilled",
+                unit=unit_name,
+                candidate_sha256=artifact.sha256,
+                commit=record.get("commit"),
+                publication_ref=binding.get("publication_ref"),
+                transition_id=transition_id,
+                uncommitted_files=binding.get("uncommitted_files"),
+                reason=reason[:600],
+                via="backfill-artifact-digest",
+            )
+            return {
+                "unit": unit_name,
+                "candidate_sha256": artifact.sha256,
+                "transition_id": transition_id,
+                "already_bound": False,
+                "backup": backup,
+                "state_file": str(self.state_path),
+                "binding": binding,
+            }
+        finally:
+            self.lock.release()
+
     # ------------------------------------------- D5 migration (design D5-6)
 
     def _backup_state(self) -> str | None:
@@ -5312,6 +5585,20 @@ def main(argv: list[str] | None = None) -> int:
         help="why this verdict is invalid (journaled verbatim)",
     )
     revoke.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    backfill = sub.add_parser(
+        "backfill-artifact-digest",
+        help="sanction one digest-less historical green through an exact "
+        "publication-tree audit plus a durable port-progress journal receipt; "
+        "takes the driver lock, never edits artifacts or product refs",
+    )
+    backfill.add_argument("--unit", required=True, help="one green unit name")
+    backfill.add_argument(
+        "--reason", required=True,
+        help="operator reason for sanctioning the inventoried legacy bytes",
+    )
+    backfill.add_argument(
+        "--repo-root", default=None, help="GotYaForce checkout root"
+    )
     gate = sub.add_parser(
         "assembly-gate",
         help="run the continuous assembly gate (section 2.13) over the last N "
@@ -5372,6 +5659,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "revoke-unit":
         driver = WasmUnitDriver(repo_root=args.repo_root)
         print(json.dumps(driver.revoke_unit(args.unit, args.reason), indent=2))
+        return 0
+    if args.command == "backfill-artifact-digest":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        print(json.dumps(
+            driver.backfill_artifact_digest(args.unit, args.reason), indent=2
+        ))
         return 0
     if args.command == "assembly-gate":
         driver = WasmUnitDriver(repo_root=args.repo_root)

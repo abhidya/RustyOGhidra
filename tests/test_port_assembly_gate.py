@@ -4,7 +4,10 @@ design section 2.13 [V4-11], tranche T2b)."""
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from src.port_assembly_gate import (
     CLASS_COLLISION_STUB,
@@ -14,11 +17,13 @@ from src.port_assembly_gate import (
     CLASS_UNDEFINED8_FORK,
     ASSEMBLY_WASM,
     HeaderChunk,
+    load_canonical_state_snapshot,
     conflicts_from_link_error,
     duplicate_definition_conflicts,
     load_unit_artifact,
     merge_headers,
     parse_header_chunks,
+    prove_legacy_artifact_commit_tree,
     record_gate_result,
     run_assembly_gate,
     scan_function_definitions,
@@ -203,6 +208,7 @@ def _write_artifact(
     root: Path, name: str, generated_at: str, header: str = DOUBLE_HEADER,
     unit_c: str = "int zz_x_(int a)\n{\n  return a;\n}\n",
     exports: list | None = None,
+    tier: str = "compile_only",
 ) -> Path:
     directory = root / name
     directory.mkdir(parents=True)
@@ -215,12 +221,83 @@ def _write_artifact(
                 "generated_at": generated_at,
                 "exported_functions": exports or ["zz_x_"],
                 "allowed_extra_imports": ["zz_ext_"],
-                "tier": "compile_only",
+                "tier": tier,
             }
         ),
         encoding="utf-8",
     )
     return directory
+
+
+def _canonical_snapshot(tmp_path: Path, records: dict[str, dict] | list[str]):
+    if isinstance(records, list):
+        records = {
+            name: {
+                "status": "green", "tier": "compile_only",
+                "commit": f"deadbee{index:x}", "pushed": True,
+            }
+            for index, name in enumerate(records)
+        }
+    for name, record in records.items():
+        if "candidate_sha256" in record:
+            continue
+        directories = sorted(
+            path.parent
+            for path in tmp_path.rglob("provenance.json")
+            if path.parent.name == name
+        )
+        if directories:
+            artifact = load_unit_artifact(directories[0])
+            assert artifact is not None
+            record["candidate_sha256"] = artifact.sha256
+    path = tmp_path / "wasm-units-state.json"
+    path.write_text(json.dumps({"state_schema": 1, "units": records}))
+    return load_canonical_state_snapshot(path)
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=False
+    )
+
+
+def _legacy_commit_fixture(
+    tmp_path: Path,
+    *,
+    name: str = "legacy",
+    root_name: str = "research/decomp/port-units-staging",
+    tier: str = "compile_only",
+) -> tuple[Path, Path, dict, object]:
+    repo = tmp_path / "repo"
+    root = repo / root_name
+    _write_artifact(root, name, "2026-08-01T00:00:00Z", tier=tier)
+    assert _git(repo, "init").returncode == 0
+    assert _git(repo, "config", "user.email", "port-test@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "Port Test").returncode == 0
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-m", "legacy artifact").returncode == 0
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert _git(
+        repo, "update-ref", "refs/remotes/origin/port-staging", commit
+    ).returncode == 0
+    record = {
+        "status": "green",
+        "tier": tier,
+        "commit": commit,
+        "pushed": True,
+    }
+    state_path = repo / "state.json"
+    state_path.write_text(json.dumps({
+        "state_schema": 1, "units": {name: record}
+    }), encoding="utf-8")
+    snapshot = load_canonical_state_snapshot(state_path)
+    return repo, root, record, snapshot
+
+
+def _legacy_verifier(repo: Path):
+    return lambda artifact, record: prove_legacy_artifact_commit_tree(
+        artifact, record, repo_root=repo, git_runner=lambda *args: _git(repo, *args)
+    )
 
 
 def test_select_recent_green_units_orders_by_recency_and_caps_n(tmp_path):
@@ -229,10 +306,273 @@ def test_select_recent_green_units_orders_by_recency_and_caps_n(tmp_path):
     _write_artifact(root, "mid", "2026-08-10T00:00:00Z")
     _write_artifact(root, "new", "2026-08-20T00:00:00Z")
     (root / "broken").mkdir()  # no artifacts: skipped, never fatal
-    picked = select_recent_green_units([root, tmp_path / "missing-root"], 2)
+    snapshot = _canonical_snapshot(tmp_path, ["old", "mid", "new"])
+    picked, excluded = select_recent_green_units(
+        [root, tmp_path / "missing-root"], 2, canonical_snapshot=snapshot
+    )
     assert [u.name for u in picked] == ["mid", "new"]
-    everything = select_recent_green_units([root], None)
+    assert excluded == {}
+    everything, _ = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot
+    )
     assert [u.name for u in everything] == ["old", "mid", "new"]
+
+
+def test_legacy_missing_digest_passes_only_with_exact_commit_tree(tmp_path):
+    repo, root, _record, snapshot = _legacy_commit_fixture(tmp_path)
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+
+    assert [unit.name for unit in picked] == ["legacy"]
+    binding = picked[0].canonical["artifact_binding"]
+    assert binding["binding"] == "legacy-git-tree"
+    assert binding["artifact_sha256"] == picked[0].sha256
+    assert binding["commit"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert binding["path"] == "research/decomp/port-units-staging/legacy"
+    assert binding["tree_entry_count"] == 3
+    assert excluded == {}
+
+
+def test_legacy_missing_digest_rejects_substituted_worktree_bytes(tmp_path):
+    repo, root, _record, snapshot = _legacy_commit_fixture(tmp_path)
+    (root / "legacy/unit.c").write_text("int substituted;\n", encoding="utf-8")
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+
+    assert picked == []
+    assert excluded == {"legacy": "legacy-artifact-commit-mismatch"}
+
+
+def test_legacy_missing_digest_rejects_unreachable_commit_and_missing_path(tmp_path):
+    repo, root, record, _snapshot = _legacy_commit_fixture(tmp_path)
+    state_path = repo / "state.json"
+    record["commit"] = "f" * 40
+    state_path.write_text(json.dumps({
+        "state_schema": 1, "units": {"legacy": record}
+    }), encoding="utf-8")
+    unreachable = load_canonical_state_snapshot(state_path)
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=unreachable,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+    assert picked == []
+    assert excluded == {
+        "legacy": "legacy-commit-unreachable-from-publication-ref"
+    }
+
+    missing_root = repo / "research/decomp/port-units-missing"
+    _write_artifact(missing_root, "not-in-commit", "2026-08-02T00:00:00Z")
+    record = {
+        "status": "green", "tier": "compile_only",
+        "commit": _git(repo, "rev-parse", "HEAD").stdout.strip(), "pushed": True,
+    }
+    state_path.write_text(json.dumps({
+        "state_schema": 1, "units": {"not-in-commit": record}
+    }), encoding="utf-8")
+    missing_path = load_canonical_state_snapshot(state_path)
+    picked, excluded = select_recent_green_units(
+        [missing_root], None, canonical_snapshot=missing_path,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+    assert picked == []
+    assert excluded == {"not-in-commit": "legacy-commit-path-missing"}
+
+
+def test_legacy_proof_uses_publication_ref_when_head_diverged(tmp_path):
+    repo, root, _record, snapshot = _legacy_commit_fixture(tmp_path)
+    published = _git(
+        repo, "rev-parse", "refs/remotes/origin/port-staging"
+    ).stdout.strip()
+    assert _git(repo, "checkout", "--orphan", "diverged").returncode == 0
+    assert _git(repo, "commit", "--allow-empty", "-m", "diverged head").returncode == 0
+    assert _git(repo, "merge-base", "--is-ancestor", published, "HEAD").returncode == 1
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+
+    assert [unit.name for unit in picked] == ["legacy"]
+    assert picked[0].canonical["artifact_binding"]["publication_ref"] == (
+        "refs/remotes/origin/port-staging"
+    )
+    assert excluded == {}
+
+
+def test_legacy_proof_fails_if_local_publication_ref_is_missing(tmp_path):
+    repo, root, _record, snapshot = _legacy_commit_fixture(tmp_path)
+    assert _git(
+        repo, "update-ref", "-d", "refs/remotes/origin/port-staging"
+    ).returncode == 0
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+
+    assert picked == []
+    assert excluded == {
+        "legacy": "legacy-commit-unreachable-from-publication-ref"
+    }
+
+
+def test_legacy_commit_proof_detects_artifact_race(tmp_path):
+    repo, root, _record, snapshot = _legacy_commit_fixture(tmp_path)
+    raced = {"done": False}
+
+    def racing_git(*args):
+        result = _git(repo, *args)
+        if args[0] == "diff" and not raced["done"]:
+            raced["done"] = True
+            (root / "legacy/unit.c").write_text("int raced;\n", encoding="utf-8")
+        return result
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot,
+        legacy_verifier=lambda artifact, record: prove_legacy_artifact_commit_tree(
+            artifact, record, repo_root=repo, git_runner=racing_git
+        ),
+    )
+
+    assert picked == []
+    assert excluded == {"legacy": "legacy-artifact-raced"}
+
+
+def test_legacy_commit_proof_preserves_verified_root_precedence(tmp_path):
+    repo, verified, record, _snapshot = _legacy_commit_fixture(
+        tmp_path,
+        name="auto-x",
+        root_name="research/decomp/port-units",
+        tier="oracle_green",
+    )
+    staging = repo / "research/decomp/port-units-staging"
+    _write_artifact(
+        staging, "auto-x", "2999-08-20T00:00:00Z",
+        unit_c="int staged_substitute;\n", tier="oracle_green",
+    )
+    snapshot = load_canonical_state_snapshot(repo / "state.json")
+
+    picked, excluded = select_recent_green_units(
+        [verified, staging], None, canonical_snapshot=snapshot,
+        root_tiers=["oracle_green", "compile_only"],
+        legacy_verifier=_legacy_verifier(repo),
+    )
+
+    assert [unit.name for unit in picked] == ["auto-x"]
+    assert picked[0].directory == verified / "auto-x"
+    assert excluded == {}
+
+
+def test_selection_uses_canonical_lifecycle_not_artifact_mtime(tmp_path):
+    verified = tmp_path / "port-units"
+    staging = tmp_path / "port-units-staging"
+    _write_artifact(
+        verified, "verified", "2026-08-01T00:00:00Z", tier="oracle_green"
+    )
+    _write_artifact(staging, "staged", "2026-08-02T00:00:00Z")
+    statuses = {
+        "pending": "pending",
+        "retryable": "red_retryable",
+        "failed": "failed",
+        "structural": "structural_ineligible",
+        "revoked": "green",
+    }
+    for index, name in enumerate(statuses, start=10):
+        _write_artifact(staging, name, f"2999-08-{index:02d}T00:00:00Z")
+    records = {
+        "verified": {
+            "status": "green", "tier": "oracle_green",
+            "commit": "abc1234", "pushed": True,
+        },
+        "staged": {
+            "status": "green", "tier": "compile_only",
+            "commit": "abc1235", "pushed": True,
+        },
+    }
+    for index, (name, status) in enumerate(statuses.items(), start=6):
+        records[name] = {
+            "status": status,
+            "tier": "compile_only",
+            "commit": f"abc123{index:x}",
+            "pushed": True,
+        }
+    records["revoked"]["revoked"] = {
+        "previous_commit": records["revoked"]["commit"],
+        "reason": "current lifecycle revoked",
+    }
+    snapshot = _canonical_snapshot(tmp_path, records)
+
+    picked, excluded = select_recent_green_units(
+        [verified, staging], None, canonical_snapshot=snapshot,
+        root_tiers=["oracle_green", "compile_only"],
+    )
+
+    assert [unit.name for unit in picked] == ["verified", "staged"]
+    assert excluded == {
+        "failed": "canonical-status:failed",
+        "pending": "canonical-status:pending",
+        "retryable": "canonical-status:red_retryable",
+        "revoked": "current-lifecycle-revocation-contradiction",
+        "structural": "canonical-status:structural_ineligible",
+    }
+
+
+def test_verified_root_shadow_is_fail_closed_before_name_dedup(tmp_path):
+    verified = tmp_path / "port-units"
+    staging = tmp_path / "port-units-staging"
+    _write_artifact(verified, "auto-x", "2026-08-01T00:00:00Z")
+    _write_artifact(staging, "auto-x", "2026-08-20T00:00:00Z")
+    snapshot = _canonical_snapshot(tmp_path, {
+        "auto-x": {
+            "status": "green", "tier": "compile_only",
+            "commit": "abc1234", "pushed": True,
+        }
+    })
+
+    picked, excluded = select_recent_green_units(
+        [verified, staging], None, canonical_snapshot=snapshot,
+        root_tiers=["oracle_green", "compile_only"],
+    )
+
+    assert picked == []
+    assert excluded == {"auto-x": "root-tier-mismatch:compile_only"}
+
+
+def test_stale_revocation_from_prior_lifecycle_does_not_poison_green(tmp_path):
+    root = tmp_path / "port-units-staging"
+    directory = _write_artifact(root, "rebuilt", "2026-08-20T00:00:00Z")
+    artifact = load_unit_artifact(directory)
+    assert artifact is not None
+    snapshot = _canonical_snapshot(tmp_path, {
+        "rebuilt": {
+            "status": "green", "tier": "compile_only",
+            "commit": "bbb2222", "pushed": True,
+            "candidate_sha256": artifact.sha256,
+            "revoked": {"previous_commit": "aaa1111", "reason": "old verdict"},
+        }
+    })
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot
+    )
+
+    assert [unit.name for unit in picked] == ["rebuilt"]
+    assert picked[0].canonical["stale_revocation_ignored"] is True
+    assert excluded == {}
+
+
+def test_canonical_snapshot_rejects_non_object_state(tmp_path):
+    path = tmp_path / "wasm-units-state.json"
+    path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema/units"):
+        load_canonical_state_snapshot(path)
 
 
 def test_load_unit_artifact_requires_all_files(tmp_path):
@@ -253,7 +593,12 @@ def _units(tmp_path, headers_and_sources):
             root, name, f"2026-08-{10 + index:02d}T00:00:00Z",
             header=header, unit_c=source, exports=[f"fn_{index}"],
         )
-    return select_recent_green_units([root], None)
+    snapshot = _canonical_snapshot(
+        tmp_path, [name for name, _header, _source in headers_and_sources]
+    )
+    return select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot
+    )[0]
 
 
 def test_gate_pass_links_merged_workdir_and_smokes(tmp_path):
@@ -321,6 +666,29 @@ def test_gate_fails_if_explicit_candidate_digest_changes_during_link(tmp_path):
     assert result["stage"] == "candidate-integrity"
     assert result["candidate"] == expected
     assert expected["sha256"] in result["detail"]
+
+
+def test_gate_fails_if_prior_artifact_digest_changes_during_link(tmp_path):
+    units = _units(
+        tmp_path,
+        [
+            ("unit-a", DOUBLE_HEADER, "int fn_0(void)\n{\n  return 0;\n}\n"),
+            ("unit-b", DOUBLE_HEADER, "int fn_1(void)\n{\n  return 1;\n}\n"),
+        ],
+    )
+
+    def mutating_link(workdir, c_files, exports, allowed_extra):
+        (workdir / ASSEMBLY_WASM).write_bytes(b"\x00asm")
+        (units[0].directory / "unit.c").write_text("int changed;\n")
+        return True, ""
+
+    result = run_assembly_gate(
+        units, tmp_path / "work", mutating_link, lambda _path: (True, "ok")
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "artifact-integrity"
+    assert "unit-a changed during assembly" in result["detail"]
 
 
 def test_gate_merge_conflict_fails_before_any_link(tmp_path):
@@ -625,7 +993,10 @@ def test_same_unit_name_in_both_roots_dedups_and_verified_root_wins(tmp_path):
         staging, "auto-x", "2026-08-15T00:00:00Z",
         unit_c="int fn_s(void)\n{\n  return 2;\n}\n",
     )
-    picked = select_recent_green_units([verified, staging], None)
+    snapshot = _canonical_snapshot(tmp_path, ["auto-x"])
+    picked, _ = select_recent_green_units(
+        [verified, staging], None, canonical_snapshot=snapshot
+    )
     assert [u.name for u in picked] == ["auto-x"]
     # Authority rule: the earlier root in the list (the caller passes the
     # verified root first) wins over its staging copy -- even a NEWER one.
@@ -647,7 +1018,10 @@ def test_cross_root_duplicate_never_reaches_the_gate_twice(tmp_path):
         staging, "auto-y", "2026-08-16T00:00:00Z",
         unit_c="int fn_y(void)\n{\n  return 3;\n}\n", exports=["fn_y"],
     )
-    units = select_recent_green_units([verified, staging], None)
+    snapshot = _canonical_snapshot(tmp_path, ["auto-x", "auto-y"])
+    units, _ = select_recent_green_units(
+        [verified, staging], None, canonical_snapshot=snapshot
+    )
     linked = {}
 
     def fake_link(workdir, c_files, exports, allowed_extra):
@@ -671,10 +1045,8 @@ def test_gate_refuses_duplicate_unit_names_loudly(tmp_path):
     root_b = tmp_path / "b"
     _write_artifact(root_a, "auto-x", "2026-08-01T00:00:00Z")
     _write_artifact(root_b, "auto-x", "2026-08-15T00:00:00Z")
-    units = (
-        select_recent_green_units([root_a], None)
-        + select_recent_green_units([root_b], None)
-    )
+    units = [load_unit_artifact(root_a / "auto-x"), load_unit_artifact(root_b / "auto-x")]
+    assert all(unit is not None for unit in units)
     assert len(units) == 2  # deliberately bypassing selection-time dedup
     linked = []
     result = run_assembly_gate(
