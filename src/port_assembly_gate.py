@@ -508,7 +508,10 @@ def duplicate_definition_conflicts(
 # header says `extern int zz_0006fb4_();` while auto-c0000-006's prelude says
 # `void zz_0006fb4_(undefined8, ...)`.
 
-VERBATIM_MARKER = "/* ==== VERBATIM:"
+# Prefix WITHOUT the colon: D5-transformed blocks carry the renamed
+# "/* ==== VERBATIM+D5:" marker (docs/d5-idiom-fix-design.md D5-3a), and the
+# prelude split must recognize both spellings.
+VERBATIM_MARKER = "/* ==== VERBATIM"
 
 
 def prelude_region(unit_c_text: str) -> str:

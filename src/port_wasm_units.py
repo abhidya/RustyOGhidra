@@ -58,6 +58,10 @@ from src.port_assembly_gate import (
     select_recent_green_units,
 )
 from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
+from src.port_fp_transform import (
+    ensure_bitcast_helper,
+    transform_record,
+)
 from src.port_knowledge_registry import (
     REGISTRY_RELPATH,
     TIER_COMPILE_ONLY,
@@ -174,6 +178,11 @@ return floating point, even when the surrounding code converts to double:
 standard PowerPC int->double idiom. The xor and the cast belong to the CALLER;
 do NOT fold them into CONCAT44. A CONCAT that returns double makes the xor
 illegal ('invalid operands to binary expression') and the unit cannot compile.
+
+The pipeline pre-rewrites that idiom's reinterpretation cast to
+`__gnt4_bitcast_f64(...)` before you ever see the .c file (D5 transform).
+`__gnt4_bitcast_f64` is seed-provided; never redefine, wrap, or remove it.
+A `(double)` cast you see in unit.c is a genuine value conversion.
 
 Ghidra names raw data symbols `DAT_<addr>` / `PTR_DAT_<addr>` after WHERE the
 value was found, not after any recovered type. The `PTR_` prefix is NOT a
@@ -300,6 +309,68 @@ def extract_verbatim(repo_root: Path, extractions: list[dict[str, Any]]) -> tupl
         )
         blocks.append(f"/* ==== VERBATIM: {spec['file']} {start}-{end} ==== */\n{raw}")
     return "\n".join(blocks), records
+
+
+class MaterializedUnit:
+    """Output of :func:`materialize_unit_c` -- the ONE seam through which
+    unit.c text reaches a build, a diagnosis prompt, or an F4 replay."""
+
+    __slots__ = (
+        "unit_c", "verbatim", "extraction_records", "extracted_sha256",
+        "transform",
+    )
+
+    def __init__(
+        self,
+        unit_c: str,
+        verbatim: str,
+        extraction_records: list[dict[str, Any]],
+        extracted_sha256: str,
+        transform: dict[str, Any],
+    ) -> None:
+        self.unit_c = unit_c
+        self.verbatim = verbatim
+        self.extraction_records = extraction_records
+        self.extracted_sha256 = extracted_sha256
+        self.transform = transform
+
+
+def materialize_unit_c(repo_root: Path, unit: dict[str, Any]) -> MaterializedUnit:
+    """Materialize a unit's C text: byte-faithful extraction, then the D5
+    fp-reinterpret transform (docs/d5-idiom-fix-design.md D5-3a).
+
+    ``extract_verbatim`` stays byte-faithful and is called ONLY here, so the
+    built unit, the diagnosis prompt's read-only display, and the F4 offline
+    replay can never diverge on whether the transform ran (F-D5-6). The
+    per-block sha256s and ``extracted_sha256`` are recorded PRE-transform
+    (the export-chain answer); the ``transform`` block carries the
+    post-transform hash (the artifact answer) -- D5-4: both questions,
+    conflated never. For site-free text the transform is identity and
+    ``transform["transformed_sha256"] == extracted_sha256``.
+    """
+    pre_blocks: list[str] = []
+    records: list[dict[str, Any]] = []
+    for spec in unit["extractions"]:
+        block, block_records = extract_verbatim(repo_root, [spec])
+        pre_blocks.append(block)
+        records.extend(block_records)
+    pre_combined = "\n".join(pre_blocks)
+    extracted_sha256 = hashlib.sha256(pre_combined.encode("utf-8")).hexdigest()
+    post_blocks, transform = transform_record(pre_blocks)
+    verbatim = "\n".join(post_blocks)
+    prelude = "\n".join(unit.get("prelude", []))
+    unit_c = (
+        "#include \"gnt4_shim.h\"\n\n"
+        + (prelude + "\n\n" if prelude else "")
+        + verbatim
+    )
+    return MaterializedUnit(
+        unit_c=unit_c,
+        verbatim=verbatim,
+        extraction_records=records,
+        extracted_sha256=extracted_sha256,
+        transform=transform,
+    )
 
 
 def scan_disallowed_imports(wasm_path: Path) -> list[str]:
@@ -529,7 +600,10 @@ def is_stuck(
 # becomes schedulable again, so bump deliberately, never casually.
 # v2 (T2c): SYSTEM_PROMPT gained the registry authoritative/advisory block
 # rules -- a semantic change by the bump rule.
-PROMPT_VERSION = 2
+# v3 (D5): the __gnt4_bitcast_f64 seed-helper rule (never redefine, wrap, or
+# remove; a bare (double) cast in unit.c is a genuine value conversion) --
+# the D5-5 world-delta that rides the transform landing.
+PROMPT_VERSION = 3
 
 
 def registry_version_component(repo_root: Path) -> int:
@@ -1036,6 +1110,87 @@ def build_environment() -> dict:
     # pushed the actual linker diagnosis out of the record entirely.
     environment["EMSDK_QUIET"] = "1"
     return environment
+
+
+def emcc_build_unit(
+    repo_root: Path,
+    workdir: Path,
+    exports: list[str],
+    allowed_extra: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Build one unit.c to unit.wasm and run the import-whitelist gate.
+
+    Module-level so the D5 gate-3 probe (src/port_d5_probe.py) rebuilds
+    through the IDENTICAL emcc invocation the driver uses -- the probe must
+    exercise the production build path, not a lookalike."""
+    bash = resolve_bash()
+    emsdk = repo_root / "research/tools/emsdk"
+    # A demangled C++ export (`cCameraManager::HasCamera(cBaseCamera*)`) took
+    # auto-c0000-011's whole build down with a bash syntax error on 2026-08-20:
+    # '(' opened a subshell, and the ',' split one symbol into two invalid ones.
+    # emcc can only export C identifiers, so anything else is dropped -- loudly,
+    # since a silently missing export becomes a confusing link failure later.
+    valid, dropped = [], []
+    for name in exports:
+        (valid if EXPORT_NAME.fullmatch(name) else dropped).append(name)
+    if dropped:
+        print(f"  skipping {len(dropped)} non-identifier export(s): "
+              f"{', '.join(dropped[:3])}{' ...' if len(dropped) > 3 else ''}")
+    exports_flag = ",".join("_" + name for name in valid)
+    # Paths converted in Python (no cygpath dependency), and the emsdk
+    # source is NOT silenced: a toolchain that failed to load must name
+    # itself rather than surface as a bare "emcc: command not found"
+    # charged to the unit as a wasm-link gate failure.
+    script = (
+        f"source \"{to_posix_path(emsdk)}/emsdk_env.sh\" >/dev/null || "
+        "{ echo 'emsdk_env.sh failed to load' >&2; exit 127; }; "
+        "command -v emcc >/dev/null || "
+        "{ echo 'emcc not on PATH after sourcing emsdk_env.sh' >&2; exit 127; }; "
+        f"cd \"{to_posix_path(workdir)}\" && "
+        "emcc unit.c -O1 -fno-strict-aliasing --no-entry "
+        "-Wno-implicit-function-declaration -Wno-int-conversion "
+        "-Wno-deprecated-non-prototype "
+        # Ghidra lowers `undefined` to `unsigned char`, so decompiled C passes
+        # `undefined **` where `char **` is declared. clang 16+ makes that an
+        # ERROR by default, which is the whole auto-c0000-* wasm-link failure
+        # family. Same class of concession as the three flags above; the oracle
+        # gate still enforces actual behaviour.
+        "-Wno-incompatible-pointer-types -Wno-pointer-sign "
+        # Section 2.2: clang stops after 19 errors by default, so two
+        # DIFFERENT error sets could share a truncated prefix and
+        # fingerprint identically. The stuck-abort fingerprint needs the
+        # full set; the prompt still receives the deduplicated
+        # summarise_build_error() summary, never this firehose.
+        "-ferror-limit=0 "
+        "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
+        "-sALLOW_MEMORY_GROWTH=0 "
+        f"-sEXPORTED_FUNCTIONS={shlex.quote(exports_flag)} "
+        "-o unit.wasm"
+    )
+    completed = subprocess.run(
+        [bash, "-lc", script],
+        capture_output=True,
+        text=True,
+        timeout=BUILD_TIMEOUT_SECONDS,
+        env=build_environment(),
+     creationflags=NO_WINDOW)
+    if completed.returncode != 0:
+        return False, (completed.stderr + completed.stdout)[-6000:]
+    bad = scan_disallowed_imports(workdir / "unit.wasm")
+    # Auto-generated units may declare external callees (functions outside the
+    # unit's extraction set). Those stay wasm imports by design — the JS side
+    # stubs+logs them (auto-stub rule) — so they are whitelisted per unit.
+    if allowed_extra:
+        bad = [name for name in bad if name not in allowed_extra]
+    if bad:
+        return False, (
+            "link gate: these symbols are UNDEFINED and became wasm imports, but "
+            "they are not gnt4_* SDK functions, so they must be DEFINED in "
+            f"gnt4_shim.h with correct PowerPC semantics: {', '.join(bad)}\n"
+            "(Ghidra decompiler helper idioms like CONCAT44 must behave exactly "
+            "as the original PPC code did.)"
+        )
+    return True, ""
 
 
 class WasmUnitDriver:
@@ -1564,74 +1719,7 @@ class WasmUnitDriver:
         exports: list[str],
         allowed_extra: list[str] | None = None,
     ) -> tuple[bool, str]:
-        bash = resolve_bash()
-        emsdk = self.repo_root / "research/tools/emsdk"
-        # A demangled C++ export (`cCameraManager::HasCamera(cBaseCamera*)`) took
-        # auto-c0000-011's whole build down with a bash syntax error on 2026-08-20:
-        # '(' opened a subshell, and the ',' split one symbol into two invalid ones.
-        # emcc can only export C identifiers, so anything else is dropped -- loudly,
-        # since a silently missing export becomes a confusing link failure later.
-        valid, dropped = [], []
-        for name in exports:
-            (valid if EXPORT_NAME.fullmatch(name) else dropped).append(name)
-        if dropped:
-            print(f"  skipping {len(dropped)} non-identifier export(s): "
-                  f"{', '.join(dropped[:3])}{' ...' if len(dropped) > 3 else ''}")
-        exports_flag = ",".join("_" + name for name in valid)
-        # Paths converted in Python (no cygpath dependency), and the emsdk
-        # source is NOT silenced: a toolchain that failed to load must name
-        # itself rather than surface as a bare "emcc: command not found"
-        # charged to the unit as a wasm-link gate failure.
-        script = (
-            f"source \"{to_posix_path(emsdk)}/emsdk_env.sh\" >/dev/null || "
-            "{ echo 'emsdk_env.sh failed to load' >&2; exit 127; }; "
-            "command -v emcc >/dev/null || "
-            "{ echo 'emcc not on PATH after sourcing emsdk_env.sh' >&2; exit 127; }; "
-            f"cd \"{to_posix_path(workdir)}\" && "
-            "emcc unit.c -O1 -fno-strict-aliasing --no-entry "
-            "-Wno-implicit-function-declaration -Wno-int-conversion "
-            "-Wno-deprecated-non-prototype "
-            # Ghidra lowers `undefined` to `unsigned char`, so decompiled C passes
-            # `undefined **` where `char **` is declared. clang 16+ makes that an
-            # ERROR by default, which is the whole auto-c0000-* wasm-link failure
-            # family. Same class of concession as the three flags above; the oracle
-            # gate still enforces actual behaviour.
-            "-Wno-incompatible-pointer-types -Wno-pointer-sign "
-            # Section 2.2: clang stops after 19 errors by default, so two
-            # DIFFERENT error sets could share a truncated prefix and
-            # fingerprint identically. The stuck-abort fingerprint needs the
-            # full set; the prompt still receives the deduplicated
-            # summarise_build_error() summary, never this firehose.
-            "-ferror-limit=0 "
-            "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
-            "-sALLOW_MEMORY_GROWTH=0 "
-            f"-sEXPORTED_FUNCTIONS={shlex.quote(exports_flag)} "
-            "-o unit.wasm"
-        )
-        completed = subprocess.run(
-            [bash, "-lc", script],
-            capture_output=True,
-            text=True,
-            timeout=BUILD_TIMEOUT_SECONDS,
-            env=build_environment(),
-         creationflags=NO_WINDOW)
-        if completed.returncode != 0:
-            return False, (completed.stderr + completed.stdout)[-6000:]
-        bad = scan_disallowed_imports(workdir / "unit.wasm")
-        # Auto-generated units may declare external callees (functions outside the
-        # unit's extraction set). Those stay wasm imports by design — the JS side
-        # stubs+logs them (auto-stub rule) — so they are whitelisted per unit.
-        if allowed_extra:
-            bad = [name for name in bad if name not in allowed_extra]
-        if bad:
-            return False, (
-                "link gate: these symbols are UNDEFINED and became wasm imports, but "
-                "they are not gnt4_* SDK functions, so they must be DEFINED in "
-                f"gnt4_shim.h with correct PowerPC semantics: {', '.join(bad)}\n"
-                "(Ghidra decompiler helper idioms like CONCAT44 must behave exactly "
-                "as the original PPC code did.)"
-            )
-        return True, ""
+        return emcc_build_unit(self.repo_root, workdir, exports, allowed_extra)
 
     # ---------------------------------------------------------- assembly gate
 
@@ -1893,9 +1981,10 @@ class WasmUnitDriver:
         workdir = self.work_root / name
         workdir.mkdir(parents=True, exist_ok=True)
 
-        # 1. verbatim extraction (sha256-recorded)
+        # 1. materialization: byte-faithful extraction (sha256-recorded
+        # pre-transform), then the D5 fp-reinterpret transform (D5-3a).
         try:
-            verbatim, extraction_records = extract_verbatim(self.repo_root, unit["extractions"])
+            materialized = materialize_unit_c(self.repo_root, unit)
         except (OSError, ValueError, KeyError) as error:
             # The queue entry does not describe extractable code: retrying the
             # identical spec cannot help, so this is structural, not retryable.
@@ -1904,13 +1993,32 @@ class WasmUnitDriver:
                 stage="extract", result=RESULT_STRUCTURAL_INELIGIBLE,
             )
         prelude = "\n".join(unit.get("prelude", []))
-        unit_c = (
-            "#include \"gnt4_shim.h\"\n\n"
-            + (prelude + "\n\n" if prelude else "")
-            + verbatim
-        )
+        unit_c = materialized.unit_c
+        extraction_records = materialized.extraction_records
         (workdir / "unit.c").write_text(unit_c, encoding="utf-8", newline="\n")
-        combined_sha = hashlib.sha256(verbatim.encode("utf-8")).hexdigest()
+        combined_sha = materialized.extracted_sha256
+
+        # F-D5-2 guard: a dataflow-separated reinterpretation (u = CONCAT44
+        # (...); ... (double)u) is lexically invisible to grammar G. Measured
+        # zero across the whole export; a hit must page, never silently build
+        # (F-D5-B: the unit blocks until G grows a dataflow rule or the unit
+        # is manually dispositioned -- gate_failed keeps it schedulable only
+        # on a world change, i.e. a transform/driver revision).
+        if materialized.transform.get("d5_residual_risk"):
+            self.events.emit(
+                "d5_residual_risk",
+                unit=name,
+                count=materialized.transform["d5_residual_risk"],
+            )
+            return self._fail(
+                state, record, name,
+                "D5 residual-risk guard (F-D5-2): "
+                f"{materialized.transform['d5_residual_risk']} dataflow-"
+                "separated CONCAT44->(double) site(s) that grammar G cannot "
+                "rewrite; blocked pending a dataflow rule or manual "
+                "disposition",
+                stage="extract", result=RESULT_GATE_FAILED,
+            )
 
         # A .c that both declares a function `void` and assigns its result cannot
         # be satisfied by ANY header, so spending 8 model iterations discovering
@@ -1941,6 +2049,12 @@ class WasmUnitDriver:
                 state, record, name, f"header seed: {error}",
                 stage="header-seed", result=RESULT_RETRYABLE,
             )
+        # D5: generated per-unit headers are seed SNAPSHOTS taken before the
+        # helper landed in gnt4_shim_seed.h, so a transformed unit's header
+        # must gain the seed-tier helper deterministically here (same trust
+        # class as the transform; never a model decision).
+        if materialized.transform["sites"]:
+            header = ensure_bitcast_helper(header)
 
         # 2b. knowledge-registry augmentation (section 2.11, T2c [V4-1/V4-5]).
         # The unit's symbol set is recorded regardless (the section-2.8
@@ -2009,6 +2123,8 @@ class WasmUnitDriver:
                     "registry_augment_error", unit=name, error=str(error)[:400]
                 )
                 header = header_seed.read_text(encoding="utf-8")
+                if materialized.transform["sites"]:
+                    header = ensure_bitcast_helper(header)
                 authoritative_injected = []
         self._save_state(state)
         # The (augmented) seed is what the harvest diffs the winning header
@@ -2379,6 +2495,11 @@ class WasmUnitDriver:
             "generated_at": utc_now(),
             "extractions": extraction_records,
             "extracted_sha256": combined_sha,
+            # D5-4: "is this artifact the output of transform vN?" -- the
+            # pre-transform hashes above stay the export-chain answer; for
+            # site-free units transformed_sha256 == extracted_sha256 (the
+            # identity case the migration census re-stamps in place).
+            "transform": materialized.transform,
             "exported_functions": exports,
             "compile_iterations": iterations,
             "model": model_used,
@@ -2780,7 +2901,10 @@ class WasmUnitDriver:
         if record.get("diagnosis"):
             return record["diagnosis"]
         try:
-            verbatim, _records = extract_verbatim(self.repo_root, unit["extractions"])
+            # Same materialization seam as the build (F-D5-6): the diagnosis
+            # prompt shows TRANSFORMED text, which is correct -- the question
+            # is "why can no header fix *what compiles*".
+            verbatim = materialize_unit_c(self.repo_root, unit).verbatim
             rounds = record.get("rounds") or []
             diagnostics = "\n".join(
                 (rounds[-1].get("diagnostics") or []) if rounds else []
@@ -3324,15 +3448,13 @@ class WasmUnitDriver:
         name = unit["name"]
         workdir = self.work_root / "_f4" / name
         workdir.mkdir(parents=True, exist_ok=True)
-        verbatim, _records = extract_verbatim(self.repo_root, unit["extractions"])
+        materialized = materialize_unit_c(self.repo_root, unit)  # F-D5-6: shared seam
         prelude = "\n".join(unit.get("prelude", []))
-        unit_c = (
-            "#include \"gnt4_shim.h\"\n\n"
-            + (prelude + "\n\n" if prelude else "")
-            + verbatim
-        )
+        unit_c = materialized.unit_c
         (workdir / "unit.c").write_text(unit_c, encoding="utf-8", newline="\n")
         header = (self.repo_root / unit["header_seed"]).read_text(encoding="utf-8")
+        if materialized.transform["sites"]:
+            header = ensure_bitcast_helper(header)
         exports = unit["exported_functions"]
         try:
             registry = json.loads(json.dumps(self._registry()))  # replay-local copy
