@@ -68,9 +68,11 @@ from src.port_knowledge_registry import (
     is_holdout,
     load_registry,
     prelude_prototypes,
+    promote_unit_entries,
     record_surviving_deviations,
     registry_version,
     relevant_delta,
+    revoke_unit_entries,
     save_registry,
     unit_symbol_set,
 )
@@ -653,6 +655,356 @@ def void_result_contradictions(unit_source: str) -> list[str]:
     return contradictions
 
 
+# ---------------------------------------------------------------------------
+# Concrete-type structural classifier (design section 2.7, T3). Only the case
+# actually observed is provable: a local declared in unit.c with a CONCRETE
+# built-in type, cast to/from an incompatible concrete built-in type, where
+# neither type involves any header-defined typedef or macro. Everything else
+# stays retryable. F4's monthly recheck (f4-recheck CLI) is the falsifier: any
+# settled unit that links on replay freezes this classifier back to the
+# void-result detector.
+
+# Tokens a provably header-independent type may consist of. Anything else
+# (undefined4, byte, uint, a struct tag, ...) can be a header typedef, so the
+# contradiction would not be provable from the verbatim .c alone.
+CONCRETE_TYPE_TOKENS = frozenset(
+    {"void", "char", "short", "int", "long", "float", "double",
+     "signed", "unsigned", "const", "volatile"}
+)
+_C_KEYWORDS = frozenset(
+    {"if", "else", "for", "while", "do", "return", "sizeof", "switch", "case",
+     "break", "continue", "goto", "static", "extern", "register", "struct",
+     "union", "enum", "typedef", "default"}
+) | CONCRETE_TYPE_TOKENS
+
+_UNIT_C_ERROR = re.compile(r"(?:^|[/\\])unit\.c:(\d+):\d+:\s*error:\s*(.*)$")
+_QUOTED_TYPE = re.compile(r"'([^']+)'")
+
+
+def _is_concrete_builtin_type(type_text: str) -> bool:
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", type_text)
+    return bool(tokens) and all(token in CONCRETE_TYPE_TOKENS for token in tokens)
+
+
+def _declared_concrete_local(identifier: str, unit_c_text: str) -> bool:
+    """Is ``identifier`` declared somewhere in the verbatim .c with a type made
+    only of concrete built-in tokens? Covers both local declarations
+    (``char *local_68;``) and parameters (``int param_1``)."""
+    pattern = re.compile(
+        r"\b(?:(?:unsigned|signed|const|volatile)\s+)*"
+        r"(?:char|short|int|long|float|double)(?:\s+(?:long|int))?"
+        r"\s*\**\s*" + re.escape(identifier) + r"\b"
+    )
+    return bool(pattern.search(unit_c_text))
+
+
+def concrete_type_contradictions(
+    unit_c_text: str, rounds: list[dict[str, Any]]
+) -> list[str]:
+    """Section 2.7's concrete-type case, proven from the attempt's own rounds.
+
+    A diagnostic qualifies only when ALL of these hold:
+    - it survived EVERY round of the attempt (up to 4 different headers were
+      applied and none removed it -- 'never cleared', the section 2.3 set
+      intersection), so it is header-independent empirically;
+    - it is a cast error located in unit.c whose quoted types are all
+      concrete built-ins (no header typedef can be involved);
+    - every identifier on the named source line is a C keyword/builtin or an
+      identifier declared IN the verbatim .c with a concrete built-in type
+      (no DAT_ symbol, no undefinedN local, no callee -- nothing a header
+      could redeclare).
+    Conservative on purpose: the caller settles the unit permanently.
+    """
+    if not rounds:
+        return []
+    common: set[str] | None = None
+    for round_record in rounds:
+        diagnostics = set(round_record.get("diagnostics") or [])
+        common = diagnostics if common is None else (common & diagnostics)
+    if not common:
+        return []
+    source_lines = unit_c_text.splitlines()
+    proofs: list[str] = []
+    for diagnostic in sorted(common):
+        match = _UNIT_C_ERROR.search(diagnostic)
+        if not match:
+            continue
+        line_number, message = int(match.group(1)), match.group(2)
+        if "cast" not in message:
+            continue
+        quoted = _QUOTED_TYPE.findall(message)
+        if not quoted or not all(_is_concrete_builtin_type(q) for q in quoted):
+            continue
+        if not (1 <= line_number <= len(source_lines)):
+            continue
+        source_line = source_lines[line_number - 1]
+        identifiers = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source_line))
+        if not identifiers:
+            continue
+        provable = True
+        for identifier in identifiers:
+            if identifier in _C_KEYWORDS:
+                continue
+            if not _declared_concrete_local(identifier, unit_c_text):
+                provable = False
+                break
+        if provable:
+            proofs.append(
+                f"unit.c:{line_number}: {message} (line: {source_line.strip()[:120]})"
+            )
+    return proofs
+
+
+# ---------------------------------------------------------------------------
+# Question escalation (design section 2.12, T3): mechanically-extracted inputs
+# for the targeted-symbol question (a) and the diagnosis question (b), plus
+# the post-mortem assembly both carry (section 2.3 -- string assembly from
+# state, no LLM writes it).
+
+TARGETED_MAX_SYMBOLS = 5
+# Section 2.12(b): an LLM STRUCTURAL verdict never settles -- it deprioritises
+# (a large attempts-equivalent penalty in the selector, so the unit sinks
+# behind all other schedulable work but still runs when it is the only work)
+# and nominates the unit for the F4 replay sample.
+STRUCTURAL_DEPRIORITY = 100
+
+_SYMBOL_DIAG_PATTERNS = [
+    re.compile(r"use of undeclared identifier '([A-Za-z_]\w*)'"),
+    re.compile(r"call to undeclared function '([A-Za-z_]\w*)'"),
+    re.compile(r"unknown type name '([A-Za-z_]\w*)'"),
+    re.compile(r"undefined symbol:?\s+([A-Za-z_]\w*)"),
+]
+_IMPORT_GATE_LIST = re.compile(r"semantics:\s*(.+)$")
+
+
+def _line_is_error_shaped(line: str) -> bool:
+    lowered = line.lower()
+    return (
+        "error:" in lowered
+        or "undefined symbol" in lowered
+        or line.lstrip().startswith(IMPORT_GATE_PREFIX)
+    )
+
+
+def targeted_question_symbols(diagnostics: list[str]) -> list[str]:
+    """The symbols the failed attempt's final diagnostics implicate -- or []
+    when the attempt does not qualify for the targeted-symbol question.
+
+    Qualifies only when every error-shaped diagnostic line yields at least one
+    symbol (the failure is FULLY about missing/undeclared symbols; a partial
+    match would leave part of the failure unaddressed by the narrow question)
+    and the distinct symbols number 1..TARGETED_MAX_SYMBOLS.
+    """
+    symbols: set[str] = set()
+    for line in diagnostics or []:
+        if not _line_is_error_shaped(line):
+            continue  # boilerplate/context lines carry no requirement
+        found: set[str] = set()
+        for pattern in _SYMBOL_DIAG_PATTERNS:
+            found.update(pattern.findall(line))
+        gate_list = _IMPORT_GATE_LIST.search(line)
+        if gate_list:
+            found.update(re.findall(r"[A-Za-z_]\w*", gate_list.group(1)))
+        if not found:
+            return []
+        symbols.update(found)
+    if not (1 <= len(symbols) <= TARGETED_MAX_SYMBOLS):
+        return []
+    return sorted(symbols)
+
+
+def referencing_lines(unit_c_text: str, symbols: list[str], cap: int = 60) -> str:
+    """The verbatim .c lines referencing any of ``symbols``, with line numbers
+    -- the call-site evidence the targeted question shows instead of the whole
+    unit. Mechanical extraction, no LLM."""
+    patterns = [re.compile(rf"\b{re.escape(symbol)}\b") for symbol in symbols]
+    picked: list[str] = []
+    for number, line in enumerate(unit_c_text.splitlines(), start=1):
+        if any(pattern.search(line) for pattern in patterns):
+            picked.append(f"{number}: {line.rstrip()}")
+            if len(picked) >= cap:
+                break
+    return "\n".join(picked)
+
+
+def assemble_post_mortem(record: dict[str, Any]) -> str:
+    """Section 2.3's post-mortem: 5-10 lines, mechanically extracted from the
+    per-round records the loop already keeps. Prompt CONTENT for retries and
+    escalation questions -- never a scheduling license ([V4-4])."""
+    rounds = record.get("rounds") or []
+    if not rounds:
+        return ""
+    stages = ", ".join(str(r.get("stage", "?")) for r in rounds)
+    best = min(rounds, key=lambda r: r.get("error_count", 1 << 30))
+    never_cleared: set[str] | None = None
+    for round_record in rounds:
+        diagnostics = set(round_record.get("diagnostics") or [])
+        never_cleared = (
+            diagnostics if never_cleared is None else (never_cleared & diagnostics)
+        )
+    world = record.get("world_version") or {}
+    lines = [
+        f"POST-MORTEM of attempt {record.get('attempts', '?')} (failed):",
+        f"rounds: {len(rounds)}; stages: {stages}",
+        f"best round: {best.get('iteration')} ({best.get('error_count')} errors)",
+    ]
+    for diagnostic in sorted(never_cleared or set())[:4]:
+        lines.append(f"never cleared: {diagnostic[:200]}")
+    lines.append(
+        f"ending: {record.get('last_stage', '?')} -- "
+        f"{(record.get('error') or '')[:200]}"
+    )
+    diagnosis = record.get("diagnosis") or {}
+    if diagnosis.get("verdict") == "FIXABLE" and diagnosis.get("reason"):
+        lines.append(f"diagnosis: FIXABLE -- {diagnosis['reason'][:200]}")
+    lines.append(
+        "world at failure: registry v"
+        f"{world.get('registry_version', '?')}, prompt v"
+        f"{world.get('prompt_version', '?')}"
+    )
+    return "\n".join(lines)
+
+
+def merge_targeted_declarations(
+    header_text: str, reply_block: str, symbols: list[str]
+) -> str:
+    """Merge a targeted-symbol reply into the (augmented) seed header: any
+    existing logical line that #defines or declares one of the symbols is
+    replaced (never duplicated -- the section 2.11 [V4-5] merge rule), and the
+    reply block is appended in a marked section."""
+    logical: list[str] = []
+    buffer: list[str] = []
+    for line in header_text.splitlines():
+        buffer.append(line)
+        if not line.rstrip().endswith("\\"):
+            logical.append("\n".join(buffer))
+            buffer = []
+    if buffer:
+        logical.append("\n".join(buffer))
+    kept: list[str] = []
+    for chunk in logical:
+        first = chunk.lstrip()
+        if any(
+            re.match(rf"#\s*define\s+{re.escape(symbol)}\b", first)
+            for symbol in symbols
+        ):
+            continue
+        if (
+            not first.startswith("#")
+            and chunk.strip().endswith(";")
+            and any(
+                re.search(rf"\b{re.escape(symbol)}\s*[\(;,\[=]", chunk)
+                for symbol in symbols
+            )
+        ):
+            continue
+        kept.append(chunk)
+    return (
+        "\n".join(kept).rstrip("\n")
+        + "\n\n/* ==== TARGETED (design 2.12a): model-declared symbols: "
+        + ", ".join(symbols)
+        + " ==== */\n"
+        + reply_block.strip()
+        + "\n"
+    )
+
+
+DIAGNOSIS_SYSTEM_PROMPT = """You are the diagnosis stage of a Ghidra-C -> wasm port pipeline. A verbatim
+Ghidra-decompiled C file has repeatedly failed to compile; only the support
+header gnt4_shim.h may ever be edited, never the .c file.
+
+Answer ONE question: why can no header fix this? Reply with exactly one line:
+STRUCTURAL: <one-sentence reason> -- if the .c file itself is self-contradictory
+and NO header content could make it compile, or
+FIXABLE: <one-sentence reason> -- if some header content could fix it (say what
+kind). No other text."""
+
+_DIAGNOSIS_VERDICT = re.compile(r"\b(STRUCTURAL|FIXABLE)\b")
+
+
+# ---------------------------------------------------------------------------
+# Oracle-spec sidecar (oracle-workstream-plan.md section 3.4 [CF-2.14], T3
+# verification queue): per-unit oracle commands live in a tracked sidecar,
+# bound to an export set by exports_sha256 -- the queue unit's export set for
+# the pending-unit overlay, the STAGED artifact's provenance for reverify.
+
+ORACLE_SIDECAR_RELPATH = "research/decomp/data/oracle-commands.json"
+ORACLE_SIDECAR_SCHEMA = 1
+
+# S3/[R1] pattern discipline: the first pattern must be the anchored total
+# line with the (?m) inline flag -- _run_oracle calls re.search with no flags
+# on a multi-line log, so a bare-anchored pattern can never match.
+SIDECAR_TOTAL_LINE = re.compile(
+    r"^\(\?m\)\^ORACLE TOTAL functions=\d+/\d+ cases=\d+ "
+    r"UNEXPLAINED: 0 VERDICT: PASS\$$"
+)
+
+
+def exports_sha256(exported_functions: list[str]) -> str:
+    """sha256 of the sorted export set, the sidecar binding key (I-9)."""
+    return hashlib.sha256(
+        "\n".join(sorted(exported_functions)).encode("utf-8")
+    ).hexdigest()
+
+
+def oracle_entry_sha(entry: dict[str, Any]) -> str:
+    """Content hash of one sidecar entry: a failed reverify is not repeated
+    until the spec (or the wasm) changes -- the section 0.1 rule applied to
+    oracle re-runs."""
+    return hashlib.sha256(
+        json.dumps(entry, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_oracle_entry(
+    name: str, entry: dict[str, Any], exports: list[str] | None = None
+) -> list[str]:
+    """The S3/I-5 sidecar discipline as code. Returns problem strings; an
+    empty list means the entry is usable. ``exports`` (when known) enforces
+    one per-function pattern per exported function."""
+    problems: list[str] = []
+    if not isinstance(entry, dict):
+        return [f"{name}: entry is not an object"]
+    sha = entry.get("exports_sha256")
+    if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+        problems.append(f"{name}: exports_sha256 missing or not a sha256 hex")
+    oracle = entry.get("oracle")
+    if not isinstance(oracle, dict):
+        return problems + [f"{name}: oracle missing"]
+    command = oracle.get("command")
+    if not (
+        isinstance(command, list)
+        and command
+        and all(isinstance(part, str) for part in command)
+    ):
+        problems.append(f"{name}: oracle.command must be a non-empty string list")
+    if not isinstance(oracle.get("cwd"), str) or not oracle.get("cwd"):
+        problems.append(f"{name}: oracle.cwd missing")
+    patterns = oracle.get("success_patterns")
+    if not (isinstance(patterns, list) and patterns):
+        return problems + [f"{name}: success_patterns required (I-5)"]
+    if not SIDECAR_TOTAL_LINE.match(patterns[0]):
+        problems.append(
+            f"{name}: first pattern must be the (?m)-anchored total line (S3/[R1])"
+        )
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            problems.append(f"{name}: invalid regex {pattern!r}: {error}")
+            continue
+        if ("^" in pattern or "$" in pattern) and not pattern.startswith("(?m)"):
+            problems.append(
+                f"{name}: anchored pattern without (?m) inline flag: {pattern!r}"
+            )
+    if exports:
+        joined = "\n".join(patterns)
+        for function in exports:
+            if re.escape(function) not in joined and function not in joined:
+                problems.append(f"{name}: no per-function pattern for {function}")
+    return problems
+
+
 def build_environment() -> dict:
     """PATH the emsdk toolchain actually needs, independent of the parent's.
 
@@ -754,6 +1106,14 @@ class WasmUnitDriver:
         )
         self._assembly_link_runner = assembly_link_runner or self._emcc_link_many
         self._assembly_smoke_runner = assembly_smoke_runner or self._node_smoke
+        # Oracle-spec sidecar (T3 verification queue; oracle plan section 3.4):
+        # tracked in the data dir like the priority sidecar. Absent file =>
+        # bit-identical current behaviour (every unit keeps its queue spec).
+        self.oracle_sidecar_path = self.repo_root / ORACLE_SIDECAR_RELPATH
+        self._oracle_sidecar_cache: tuple[float, dict[str, Any]] | None = None
+        # (unit, kind) pairs already reported this run -- one oracle_spec_*
+        # event per unit per run, not one per attempt.
+        self._sidecar_reported: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------- state
 
@@ -852,6 +1212,70 @@ class WasmUnitDriver:
                 self._unit_priorities = {}
         return self._unit_priorities.get(name, 0)
 
+    # ---------------------------------------------------- oracle-spec sidecar
+
+    def _oracle_sidecar(self) -> dict[str, Any]:
+        """The oracle-commands sidecar's units map, mtime-cached. A malformed
+        file degrades to {} with one event -- the sidecar must never take the
+        selector down (same posture as the priority sidecar)."""
+        try:
+            mtime = self.oracle_sidecar_path.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+        if self._oracle_sidecar_cache is None or self._oracle_sidecar_cache[0] != mtime:
+            units: dict[str, Any] = {}
+            if mtime >= 0:
+                try:
+                    payload = json.loads(
+                        self.oracle_sidecar_path.read_text(encoding="utf-8-sig")
+                    )
+                    if payload.get("spec_schema") != ORACLE_SIDECAR_SCHEMA:
+                        raise ValueError(
+                            f"spec_schema != {ORACLE_SIDECAR_SCHEMA}"
+                        )
+                    units = payload.get("units") or {}
+                    if not isinstance(units, dict):
+                        raise ValueError("units is not an object")
+                except (json.JSONDecodeError, OSError, ValueError) as error:
+                    units = {}
+                    self.events.emit(
+                        "oracle_sidecar_unreadable", error=str(error)[:400]
+                    )
+            self._oracle_sidecar_cache = (mtime, units)
+        return self._oracle_sidecar_cache[1]
+
+    def _sidecar_report_once(self, unit_name: str, kind: str, **payload: Any) -> None:
+        if (unit_name, kind) in self._sidecar_reported:
+            return
+        self._sidecar_reported.add((unit_name, kind))
+        self.events.emit(kind, unit=unit_name, **payload)
+
+    def _effective_oracle(self, unit: dict[str, Any]) -> dict[str, Any] | None:
+        """The oracle spec this attempt runs under: the sidecar entry overlays
+        the queue spec IFF its exports_sha256 matches the queue unit's current
+        export set (I-9). Absent file, absent entry, invalid entry, or hash
+        mismatch => the unit keeps its queue spec -- bit-identical current
+        behaviour; a mismatch additionally journals oracle_spec_stale so
+        drift is visible, not silent."""
+        name = unit["name"]
+        entry = self._oracle_sidecar().get(name)
+        if not entry:
+            return unit.get("oracle")
+        exports = unit.get("exported_functions") or []
+        problems = validate_oracle_entry(name, entry, exports=exports)
+        if problems:
+            self._sidecar_report_once(
+                name, "oracle_spec_invalid", problems=problems[:5]
+            )
+            return unit.get("oracle")
+        if entry.get("exports_sha256") != exports_sha256(exports):
+            self._sidecar_report_once(
+                name, "oracle_spec_stale", binding="queue_exports"
+            )
+            return unit.get("oracle")
+        self._sidecar_report_once(name, "oracle_spec_overlaid")
+        return json.loads(json.dumps(entry["oracle"]))
+
     # ----------------------------------------------------------------- control
 
     def _control_command(self) -> str:
@@ -899,6 +1323,14 @@ class WasmUnitDriver:
     ) -> None:
         units = state.get("units", {})
         greens = sum(1 for record in units.values() if record.get("status") == "green")
+        # Section 3 metric split: verified_green vs staged. Progress toward G1
+        # is the verified count; staged compile-only greens are inventory.
+        verified = sum(
+            1
+            for record in units.values()
+            if record.get("status") == "green"
+            and record.get("tier") == "oracle_green"
+        )
         total = max(len(units), 1)
         payload = {
             "run_schema": 3,
@@ -919,6 +1351,8 @@ class WasmUnitDriver:
             },
             "counters": {
                 "units_integrated": greens,
+                "units_verified": verified,
+                "units_staged": greens - verified,
                 "units_known": len(units),
                 "model_requests_total": sum(
                     record.get("model_requests", 0) for record in units.values()
@@ -942,6 +1376,45 @@ class WasmUnitDriver:
             payload["unit"] = unit
         atomic_write_json(self.run_root / "run-state.json", payload)
         self.events.emit("progress", **payload["counters"])
+
+    def _flag_unverified_inventory(self, state: dict[str, Any]) -> None:
+        """Section 4 T3 invariant row: page when the verified fraction falls
+        while staged grows -- unverifiable-inventory build-up. The previous
+        mark rides the state file so the comparison survives runs."""
+        units = state.get("units", {})
+        verified = sum(
+            1
+            for record in units.values()
+            if record.get("status") == "green"
+            and record.get("tier") == "oracle_green"
+        )
+        staged = sum(
+            1
+            for record in units.values()
+            if record.get("status") == "green"
+            and record.get("tier") != "oracle_green"
+        )
+        fraction = verified / max(verified + staged, 1)
+        previous = state.get("verified_fraction_mark") or {}
+        if (
+            previous  # first mark is a baseline, not a comparison
+            and staged > int(previous.get("staged", 0))
+            and fraction < float(previous.get("fraction", 1.0))
+        ):
+            self.events.emit(
+                "unverified_inventory_buildup",
+                verified=verified,
+                staged=staged,
+                fraction=round(fraction, 4),
+                previous_fraction=previous.get("fraction"),
+            )
+        state["verified_fraction_mark"] = {
+            "verified": verified,
+            "staged": staged,
+            "fraction": round(fraction, 4),
+            "at": utc_now(),
+        }
+        self._save_state(state)
 
     # ---------------------------------------------------------------- progress
 
@@ -1539,6 +2012,95 @@ class WasmUnitDriver:
         augmented_seed_text = header
         (workdir / "gnt4_shim.h").write_text(header, encoding="utf-8", newline="\n")
 
+        # 2c. targeted-symbol question (section 2.12(a), T3). On a RETRY whose
+        # previous attempt's final diagnostics implicate <=5 symbols, open
+        # with "declare exactly these N symbols given these call sites"
+        # instead of another full-header round. The reply is merged into the
+        # augmented seed and the normal loop resumes; the call REPLACES the
+        # retry's first full-header round (max_iters shrinks by one), so the
+        # attempt's call count does not grow. It is a different question AND
+        # carries the post-mortem -- section 0.1 satisfied twice over.
+        targeted_spent = False
+        targeted_header_path: str | None = None
+        previous_rounds = record.get("rounds") or []
+        if (
+            record.get("attempts", 0) >= 2
+            and MAX_COMPILE_ITERS >= 2
+            and previous_rounds
+        ):
+            symbols = targeted_question_symbols(
+                previous_rounds[-1].get("diagnostics") or []
+            )
+            if symbols:
+                self._heartbeat(f"wasm_units:{name}:targeted_question")
+                post_mortem = assemble_post_mortem(record)
+                diagnostics_text = "\n".join(
+                    previous_rounds[-1].get("diagnostics") or []
+                )
+                prompt = (
+                    (post_mortem + "\n\n" if post_mortem else "")
+                    + "The previous attempt's final diagnostics implicate exactly "
+                    + f"these symbols: {', '.join(symbols)}\n\n"
+                    + f"Diagnostics:\n```\n{diagnostics_text}\n```\n\n"
+                    + "The verbatim .c lines referencing them (line: text):\n"
+                    + f"```c\n{referencing_lines(unit_c, symbols)}\n```\n\n"
+                    + f"Declare exactly these {len(symbols)} symbol(s) for "
+                    + "gnt4_shim.h given these call sites, following the typing "
+                    + "rules above. Reply with ONLY the declarations/#defines "
+                    + "for these symbols in a single ```c block."
+                )
+                try:
+                    reply = self._llm_client().generate(
+                        prompt=prompt,
+                        system_prompt=SYSTEM_PROMPT
+                        + (" /no_think" if DISABLE_THINKING else ""),
+                        max_tokens=COMPILE_FIX_MAX_TOKENS,
+                        phase=f"wasm_targeted_symbols:{name}",
+                        stream_callback=lambda _event_type, _event: None,
+                        **SAMPLING,
+                        **(
+                            {"chat_template_kwargs": {"enable_thinking": False}}
+                            if DISABLE_THINKING
+                            else {}
+                        ),
+                    )
+                except Exception as error:  # noqa: BLE001 - same taxonomy as compile-fix
+                    if self._is_context_budget_fault(error):
+                        return self._fail(
+                            state, record, name, f"context budget: {error}",
+                            stage="context-budget", result=RESULT_GATE_FAILED,
+                        )
+                    if self._is_provider_fault(error):
+                        return self._provider_pause(state, record, name, str(error))
+                    return self._fail(
+                        state, record, name, f"targeted-symbol LLM: {error}",
+                        stage="targeted-question",
+                    )
+                targeted_spent = True
+                record["model_requests"] = record.get("model_requests", 0) + 1
+                self._save_state(state)
+                blocks = CODE_BLOCK.findall(reply or "")
+                merged = False
+                if blocks:
+                    header = merge_targeted_declarations(
+                        header, max(blocks, key=len), symbols
+                    )
+                    (workdir / "gnt4_shim.h").write_text(
+                        header, encoding="utf-8", newline="\n"
+                    )
+                    snapshot = (
+                        workdir / f"header-attempt{record['attempts']}-iter0.h"
+                    )
+                    snapshot.write_text(header, encoding="utf-8", newline="\n")
+                    targeted_header_path = str(snapshot)
+                    merged = True
+                self.events.emit(
+                    "targeted_symbol_question",
+                    unit=name,
+                    symbols=symbols,
+                    merged=merged,
+                )
+
         # 3. build + LLM compile-fix loop (header-only edits; depth capped by
         #    OGHIDRA_PORT_MAX_ITERS per section 2.1, stage-aware stuck-abort
         #    per section 2.2, round-level malformed replies per section 2.5)
@@ -1563,14 +2125,18 @@ class WasmUnitDriver:
         # Symbols already paged as registry deviations (one event per symbol
         # per attempt; the model re-emits the whole header every round).
         reported_deviations: set[str] = set()
-        current_header_path = str(header_seed)
+        current_header_path = targeted_header_path or str(header_seed)
+        # Section 2.12(a): a spent targeted call replaces the retry's first
+        # full-header round -- the depth budget shrinks by one so the
+        # attempt's total model-call count does not grow.
+        max_iters = MAX_COMPILE_ITERS - (1 if targeted_spent else 0)
         # Per-round memory (section 2.3 [V4-4]): stage, error count, header
         # path, plus the NORMALIZED DIAGNOSTIC SET and its fingerprint --
         # "never cleared" is then a set intersection and cross-attempt
         # oscillation detection a fingerprint comparison. Persisted into the
         # unit state record on _fail for the post-mortem carry.
         rounds: list[dict[str, Any]] = []
-        for iteration in range(1, MAX_COMPILE_ITERS + 1):
+        for iteration in range(1, max_iters + 1):
             iterations = iteration
             if iteration == 1 or header_applied:
                 self._heartbeat(f"wasm_units:{name}:build:{iteration}")
@@ -1615,7 +2181,7 @@ class WasmUnitDriver:
             # header, so the previous build's result is already in hand;
             # rebuilding the identical input would yield the identical output,
             # and the fingerprint comparison is skipped for that round.
-            if iteration == MAX_COMPILE_ITERS:
+            if iteration == max_iters:
                 break
             self._heartbeat(f"wasm_units:{name}:compile_fix:{iteration}")
             header_text = (workdir / "gnt4_shim.h").read_text(encoding="utf-8")
@@ -1731,6 +2297,25 @@ class WasmUnitDriver:
             current_header_path = str(snapshot)
             header_applied = True
         if not linked:
+            # Concrete-type structural classifier (section 2.7, T3): a cast
+            # contradiction between concrete built-in types on unit-declared
+            # locals, never cleared across every applied header of this
+            # attempt, is provably header-independent -- settle it instead of
+            # retrying forever. Everything else stays retryable.
+            final_stage = (
+                rounds[-1]["stage"] if rounds else classify_build_stage(build_error)
+            )
+            if rounds and final_stage == STAGE_COMPILE:
+                proofs = concrete_type_contradictions(unit_c, rounds)
+                if proofs:
+                    return self._fail(
+                        state, record, name,
+                        "concrete-type contradiction, header-independent "
+                        "(section 2.7): " + "; ".join(proofs[:3]),
+                        stage="compile-fix",
+                        result=RESULT_STRUCTURAL_INELIGIBLE,
+                        extra={"rounds": rounds},
+                    )
             detail = f"not linked: {summarise_build_error(build_error)}"
             if no_new_header_rounds:
                 detail += (
@@ -1748,7 +2333,11 @@ class WasmUnitDriver:
         # oracle yet: it passes build+import gates only, lands in the STAGING
         # artifact tree with verified:false provenance, and is never wired into
         # the app. Design stage 4 (oracle before trust) still governs promotion.
-        oracle_spec = unit.get("oracle") or {}
+        # Sidecar overlay (oracle plan section 3.4): a validated sidecar entry
+        # whose exports_sha256 matches this unit's export set replaces the
+        # queue spec -- a compile_only unit gains a behavioral oracle the
+        # moment its spec lands, no queue regeneration involved.
+        oracle_spec = self._effective_oracle(unit) or {}
         compile_only = oracle_spec.get("type") == "compile_only"
         if compile_only:
             passed, summary, oracle_log = True, "compile-only (UNVERIFIED)", (
@@ -1758,7 +2347,9 @@ class WasmUnitDriver:
         else:
             self._heartbeat(f"wasm_units:{name}:oracle")
             try:
-                passed, summary, oracle_log = self._oracle_runner(unit, workdir / "unit.wasm")
+                passed, summary, oracle_log = self._oracle_runner(
+                    {**unit, "oracle": oracle_spec}, workdir / "unit.wasm"
+                )
             except (OSError, subprocess.SubprocessError, FileNotFoundError) as error:
                 return self._fail(
                     state, record, name, f"oracle runner: {error}", stage="oracle",
@@ -1942,6 +2533,9 @@ class WasmUnitDriver:
             pushed=pushed,
             push_detail=push_detail,
         )
+        # Section 4 T3 row: verified fraction falling while staged grows pages
+        # (unverifiable-inventory build-up).
+        self._flag_unverified_inventory(state)
         # Continuous assembly gate (section 2.13 [V4-11]): every green feeds
         # the rolling N-unit link. Runs after the unit's own commit so a gate
         # fault can never cost a green; failures page + file conflicts.
@@ -2164,6 +2758,526 @@ class WasmUnitDriver:
         finally:
             self.lock.release()
 
+    # ------------------------------------------------- diagnosis (section 2.12b)
+
+    def _diagnose_unit(
+        self, unit: dict[str, Any], record: dict[str, Any], state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """One section-2.12(b) diagnosis call, at most once per unit lifetime:
+        "why can no header fix this? STRUCTURAL or FIXABLE with one reason."
+
+        Consumption is conservative by construction (section 2.7): STRUCTURAL
+        never settles -- it deprioritises the unit (selector penalty) and
+        nominates it for the F4 replay sample, where a provable outcome
+        decides; FIXABLE appends its reason to the post-mortem the next
+        scheduled attempt carries. Any fault degrades to an event and leaves
+        the question unconsumed."""
+        name = unit["name"]
+        if record.get("diagnosis"):
+            return record["diagnosis"]
+        try:
+            verbatim, _records = extract_verbatim(self.repo_root, unit["extractions"])
+            rounds = record.get("rounds") or []
+            diagnostics = "\n".join(
+                (rounds[-1].get("diagnostics") or []) if rounds else []
+            )
+            post_mortem = assemble_post_mortem(record)
+            prompt = (
+                (post_mortem + "\n\n" if post_mortem else "")
+                + f"Final diagnostics:\n```\n{diagnostics or record.get('error', '')}\n```\n\n"
+                + f"Verbatim decompiled C (read-only):\n```c\n{verbatim}\n```\n\n"
+                + "Why can no header fix this? Answer STRUCTURAL or FIXABLE "
+                + "with one reason."
+            )
+            self._heartbeat(f"wasm_units:{name}:diagnosis")
+            reply = self._llm_client().generate(
+                prompt=prompt,
+                system_prompt=DIAGNOSIS_SYSTEM_PROMPT
+                + (" /no_think" if DISABLE_THINKING else ""),
+                max_tokens=512,
+                phase=f"wasm_diagnosis:{name}",
+                stream_callback=lambda _event_type, _event: None,
+                **SAMPLING,
+                **(
+                    {"chat_template_kwargs": {"enable_thinking": False}}
+                    if DISABLE_THINKING
+                    else {}
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - diagnosis is best-effort
+            self.events.emit("diagnosis_error", unit=name, error=str(error)[:400])
+            return None
+        match = _DIAGNOSIS_VERDICT.search(reply or "")
+        if not match:
+            self.events.emit(
+                "diagnosis_error", unit=name,
+                error=f"no STRUCTURAL/FIXABLE verdict in reply: {(reply or '')[:200]!r}",
+            )
+            return None
+        verdict = match.group(1)
+        reason = (reply or "")[match.end():].lstrip(" :-—").strip()[:400]
+        diagnosis = {
+            "verdict": verdict,
+            "reason": reason,
+            "attempts_at": record.get("attempts", 0),
+            "at": utc_now(),
+        }
+        record["diagnosis"] = diagnosis
+        record["model_requests"] = record.get("model_requests", 0) + 1
+        if verdict == "STRUCTURAL":
+            # Never settles: deprioritise + nominate for the F4 replay sample.
+            record["f4_nominated"] = True
+        self._save_state(state)
+        self.events.emit(
+            "diagnosis_question", unit=name, verdict=verdict, reason=reason[:200]
+        )
+        return diagnosis
+
+    # -------------------------------------- verification queue (section 3, T3)
+
+    def _staged_provenance(self, name: str) -> dict[str, Any] | None:
+        try:
+            return json.loads(
+                (self.staging_root / name / "provenance.json").read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+
+    def _verification_candidates(self, state: dict[str, Any]) -> list[str]:
+        """Staged compile-only greens whose sidecar oracle spec binds to the
+        STAGED artifact's provenance export set (oracle plan section 3.4: the
+        wasm being verified is the one the provenance describes, never the
+        current queue's export set). A candidate that already failed under
+        the SAME spec is not re-run -- an oracle re-run with identical inputs
+        is the section 0.1 forbidden retry."""
+        sidecar = self._oracle_sidecar()
+        if not sidecar:
+            return []
+        candidates: list[str] = []
+        for name, record in state.get("units", {}).items():
+            if record.get("status") != "green" or record.get("tier") != "compile_only":
+                continue
+            entry = sidecar.get(name)
+            if not entry:
+                continue
+            if not (self.staging_root / name / "unit.wasm").is_file():
+                continue
+            provenance = self._staged_provenance(name)
+            if not provenance:
+                continue
+            exports = provenance.get("exported_functions") or []
+            if validate_oracle_entry(name, entry, exports=exports):
+                self._sidecar_report_once(
+                    name, "oracle_spec_invalid",
+                    problems=validate_oracle_entry(name, entry, exports=exports)[:5],
+                )
+                continue
+            if entry.get("exports_sha256") != exports_sha256(exports):
+                self._sidecar_report_once(
+                    name, "oracle_spec_stale", binding="staged_provenance"
+                )
+                continue
+            previous = record.get("verify") or {}
+            if previous and previous.get("spec_sha256") == oracle_entry_sha(entry):
+                continue  # same spec already ran; nothing new to learn
+            candidates.append(name)
+        return sorted(candidates)
+
+    def _commit_paths(
+        self, message: str, paths: list[str]
+    ) -> tuple[str | None, bool, str]:
+        """git add (pathspec, deletions included) + commit + push."""
+        added = self._git_runner("add", "--", *paths)
+        if added.returncode != 0:
+            return None, False, (added.stdout + added.stderr)[-400:]
+        committed = self._git_runner("commit", "-m", message, "--", *paths)
+        if committed.returncode != 0:
+            return None, False, (committed.stdout + committed.stderr)[-400:]
+        sha = ""
+        rev = self._git_runner("rev-parse", "HEAD")
+        if rev.returncode == 0:
+            sha = rev.stdout.strip()
+        pushed = self._git_runner("push")
+        if pushed.returncode != 0:
+            pushed = self._git_runner("push", "-u", "origin", "HEAD")
+        return sha or None, pushed.returncode == 0, (
+            "" if pushed.returncode == 0 else (pushed.stdout + pushed.stderr)[-400:]
+        )
+
+    def _reverify_unit_inner(self, name: str, state: dict[str, Any]) -> dict[str, Any]:
+        """Oracle-only verification stage for one staged unit (section 3's
+        verification queue; oracle plan section 3.4's reverify semantics).
+
+        Rebuilds nothing: runs the sidecar oracle against the COMMITTED staged
+        artifact's unit.wasm. On pass: provenance rewrite, artifact move
+        staging -> port-units, registry promotion ([V4-7], with conflict
+        recompute), commit, journal checkpoint + verdict_promoted event. On
+        fail: the unit STAYS staged (no verdict change), the failure is
+        recorded (same spec never re-runs), and [V4-7] demotion revokes/
+        demotes registry entries sourced from the unit."""
+        record = self._unit_state(state, name)
+        staged_dir = self.staging_root / name
+        provenance = self._staged_provenance(name)
+        if provenance is None:
+            raise ValueError(f"{name}: no readable staged provenance.json")
+        exports = provenance.get("exported_functions") or []
+        entry = self._oracle_sidecar().get(name)
+        if not entry:
+            raise ValueError(f"{name}: no oracle-commands.json sidecar entry")
+        problems = validate_oracle_entry(name, entry, exports=exports)
+        if problems:
+            raise ValueError(f"{name}: invalid sidecar entry: {problems[:3]}")
+        if entry.get("exports_sha256") != exports_sha256(exports):
+            self._sidecar_report_once(
+                name, "oracle_spec_stale", binding="staged_provenance"
+            )
+            raise ValueError(
+                f"{name}: exports_sha256 does not match the staged artifact's "
+                "provenance export set (section 3.4 binding rule)"
+            )
+        spec_sha = oracle_entry_sha(entry)
+        wasm_path = staged_dir / "unit.wasm"
+        self._heartbeat(f"wasm_units:{name}:reverify")
+        self.events.emit("wasm_unit_reverify_started", unit=name)
+        oracle = json.loads(json.dumps(entry["oracle"]))
+        passed, summary, oracle_log = self._oracle_runner(
+            {"name": name, "oracle": oracle}, wasm_path
+        )
+        if not passed:
+            record["verify"] = {
+                "status": "oracle_red",
+                "summary": summary,
+                "spec_sha256": spec_sha,
+                "at": utc_now(),
+            }
+            self._save_state(state)
+            # [V4-7] demotion: a failed oracle re-run on a staged unit
+            # downgrades or removes every registry entry sourced from it.
+            registry_rel: str | None = None
+            try:
+                registry = self._registry()
+                retier = revoke_unit_entries(registry, name)
+                if retier.changed:
+                    self._save_registry(registry)
+                    registry_rel = REGISTRY_RELPATH
+                    self.events.emit(
+                        "registry_revoked",
+                        unit=name,
+                        demoted=retier.demoted[:20],
+                        revoked=retier.revoked[:20],
+                        registry_version=retier.version,
+                    )
+            except Exception as error:  # noqa: BLE001 - registry never blocks
+                self.events.emit(
+                    "registry_revoke_error", unit=name, error=str(error)[:400]
+                )
+            if registry_rel:
+                self._commit_paths(
+                    f"port-registry: revoke {name} entries (staged oracle re-run failed)",
+                    [registry_rel],
+                )
+            self.events.emit(
+                "wasm_unit_reverify_red", unit=name, summary=summary
+            )
+            self._checkpoint(
+                state,
+                UnitTransition(
+                    unit=name,
+                    result=RESULT_GATE_FAILED,
+                    stage="reverify",
+                    attempt=record.get("attempts", 0),
+                    detail=f"oracle red on staged artifact: {summary}",
+                    model=self._model_config.model,
+                    tier="compile_only",
+                    extra={"verify": record["verify"]},
+                ),
+            )
+            return {"unit": name, "promoted": False, "summary": summary}
+        # PASS: provenance rewrite + artifact move + registry promotion + commit.
+        promoted_dir = self.artifact_root / name
+        promoted_dir.mkdir(parents=True, exist_ok=True)
+        for file_path in staged_dir.iterdir():
+            if file_path.is_file():
+                shutil.copyfile(file_path, promoted_dir / file_path.name)
+        (promoted_dir / "oracle.log").write_text(
+            oracle_log, encoding="utf-8", newline="\n"
+        )
+        provenance.update(
+            verified=True,
+            tier="oracle_green",
+            previous_tier="compile_only",
+            reverified_at=utc_now(),
+            reverify={
+                "run_id": self.run_id,
+                "spec_sha256": spec_sha,
+                "exports_sha256": entry["exports_sha256"],
+            },
+            oracle={
+                "command": oracle["command"],
+                "cwd": oracle["cwd"],
+                "summary": summary,
+            },
+        )
+        atomic_write_json(promoted_dir / "provenance.json", provenance)
+        shutil.rmtree(staged_dir)
+        registry_rel = None
+        retier = None
+        try:
+            registry = self._registry()
+            retier = promote_unit_entries(registry, name)
+            if retier.changed:
+                self._save_registry(registry)
+                registry_rel = REGISTRY_RELPATH
+                self.events.emit(
+                    "registry_promoted",
+                    unit=name,
+                    promoted=retier.promoted[:20],
+                    reopened=retier.reopened[:20],
+                    green_green=retier.green_green[:20],
+                    registry_version=retier.version,
+                )
+                for key in retier.green_green:
+                    # Section 2.11 conflict policy: green-green disagreement
+                    # pages the owner.
+                    self.events.emit(
+                        "registry_green_green_conflict", unit=name, key=key
+                    )
+        except Exception as error:  # noqa: BLE001 - promotion never costs the pass
+            self.events.emit(
+                "registry_promote_error", unit=name, error=str(error)[:400]
+            )
+        sha, pushed, push_detail = self._commit_paths(
+            f"port: {name} wasm unit promoted (oracle {summary})",
+            [
+                f"research/decomp/port-units/{name}",
+                f"research/decomp/port-units-staging/{name}",
+                *([registry_rel] if registry_rel else []),
+            ],
+        )
+        if sha is None:
+            record["verify"] = {
+                "status": "commit_failed",
+                "summary": summary,
+                "spec_sha256": spec_sha,
+                "detail": push_detail,
+                "at": utc_now(),
+            }
+            self._save_state(state)
+            self.events.emit(
+                "reverify_commit_failed", unit=name, detail=push_detail
+            )
+            return {
+                "unit": name,
+                "promoted": False,
+                "summary": summary,
+                "error": f"commit failed: {push_detail}",
+            }
+        # Promotion is a verdict-class operation: journal FIRST (settle-unit
+        # ordering), then the local record.
+        self._checkpoint(
+            state,
+            UnitTransition(
+                unit=name,
+                result=RESULT_GREEN,
+                stage="reverify",
+                attempt=record.get("attempts", 0),
+                detail=f"staged unit promoted, oracle green: {summary}",
+                product_commit=sha,
+                product_pushed=pushed,
+                oracle_summary=summary,
+                model=self._model_config.model,
+                tier="oracle_green",
+            ),
+        )
+        record.update(
+            status="green",
+            tier="oracle_green",
+            oracle_summary=summary,
+            commit=sha,
+            pushed=pushed,
+            error=None,
+            last_stage="reverify",
+            verify={
+                "status": "pass",
+                "summary": summary,
+                "spec_sha256": spec_sha,
+                "at": utc_now(),
+            },
+        )
+        self._save_state(state)
+        self.events.emit(
+            "verdict_promoted",
+            unit=name,
+            oracle_summary=summary,
+            commit=sha,
+            pushed=pushed,
+            previous_tier="compile_only",
+        )
+        self._flag_unverified_inventory(state)
+        return {
+            "unit": name,
+            "promoted": True,
+            "summary": summary,
+            "commit": sha,
+            "pushed": pushed,
+        }
+
+    def reverify_unit(self, unit_name: str) -> dict[str, Any]:
+        """CLI entry (oracle plan section 3.4): promote one staged unit by
+        re-running its sidecar oracle against the committed staged artifact.
+        Takes the driver lock (a reverify under a running driver would race
+        its state writes) and goes through the journal, like settle-unit."""
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "reverifying under a running driver would race its state writes"
+            )
+        try:
+            state = self._load_state()
+            if unit_name not in state.get("units", {}):
+                raise ValueError(f"unknown unit {unit_name!r}: not in the state file")
+            record = state["units"][unit_name]
+            if record.get("status") != "green" or record.get("tier") != "compile_only":
+                raise ValueError(
+                    f"{unit_name} is not a staged compile-only green "
+                    f"(status={record.get('status')!r}, tier={record.get('tier')!r})"
+                )
+            return self._reverify_unit_inner(unit_name, state)
+        finally:
+            self.lock.release()
+
+    # ------------------------------------------------- F4 recheck (section 2.7)
+
+    def f4_recheck(self, sample_size: int = 5) -> dict[str, Any]:
+        """The monthly bounded F4 recheck: replay up to ``sample_size`` units
+        offline with the current loop -- diagnosis-nominated reds first
+        (section 2.12(b) feeds the sample), then settled structural_ineligible
+        units. Replay writes NO state, NO journal, NO commits; any SETTLED
+        unit that links is the classifier-freeze signal (freeze to the
+        void-result detector and reopen the class -- an owner decision, which
+        is why this reports instead of acting)."""
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "the F4 replay shares the model slot and the workdir tree"
+            )
+        try:
+            state = self._load_state()
+            queue = {unit["name"]: unit for unit in self._load_queue()}
+            units = state.get("units", {})
+            nominated = [
+                name
+                for name, record in units.items()
+                if record.get("f4_nominated")
+                and record.get("status") == "red_retryable"
+                and name in queue
+            ]
+            settled = [
+                name
+                for name, record in units.items()
+                if record.get("status") == "structural_ineligible" and name in queue
+            ]
+            sample = (
+                nominated + [name for name in settled if name not in nominated]
+            )[: max(1, sample_size)]
+            results: list[dict[str, Any]] = []
+            for name in sample:
+                linked, detail = self._replay_unit_offline(queue[name])
+                results.append(
+                    {
+                        "unit": name,
+                        "status": units[name].get("status"),
+                        "nominated": name in nominated,
+                        "linked": linked,
+                        "detail": (detail or "")[:400],
+                    }
+                )
+            freeze_signal = any(
+                result["linked"] and result["status"] == "structural_ineligible"
+                for result in results
+            )
+            self.events.emit(
+                "f4_recheck",
+                sample=[result["unit"] for result in results],
+                linked=[result["unit"] for result in results if result["linked"]],
+                classifier_freeze_signal=freeze_signal,
+            )
+            return {"sample": results, "classifier_freeze_signal": freeze_signal}
+        finally:
+            self.lock.release()
+
+    def _replay_unit_offline(self, unit: dict[str, Any]) -> tuple[bool, str]:
+        """One offline replay of the compile-fix loop: extraction, (deep-copied)
+        registry augmentation, build + LLM rounds with the stage-aware stuck
+        rule. Touches only its own workdir -- no state, no journal, no
+        registry writes, no verdicts."""
+        name = unit["name"]
+        workdir = self.work_root / "_f4" / name
+        workdir.mkdir(parents=True, exist_ok=True)
+        verbatim, _records = extract_verbatim(self.repo_root, unit["extractions"])
+        prelude = "\n".join(unit.get("prelude", []))
+        unit_c = (
+            "#include \"gnt4_shim.h\"\n\n"
+            + (prelude + "\n\n" if prelude else "")
+            + verbatim
+        )
+        (workdir / "unit.c").write_text(unit_c, encoding="utf-8", newline="\n")
+        header = (self.repo_root / unit["header_seed"]).read_text(encoding="utf-8")
+        exports = unit["exported_functions"]
+        try:
+            registry = json.loads(json.dumps(self._registry()))  # replay-local copy
+            if registry.get("entries") and not is_holdout(name):
+                augmented = augment_seed(
+                    registry,
+                    unit_name=name,
+                    seed_text=header,
+                    symbols=unit_symbol_set(unit_c, exports),
+                    prelude_declarations=prelude_prototypes(prelude),
+                )
+                header = augmented.header_text
+        except Exception:  # noqa: BLE001 - warmth is optional in replay too
+            pass
+        (workdir / "gnt4_shim.h").write_text(header, encoding="utf-8", newline="\n")
+        previous_stage: str | None = None
+        previous_fingerprint: str | None = None
+        header_applied = False
+        build_error = ""
+        for iteration in range(1, MAX_COMPILE_ITERS + 1):
+            if iteration == 1 or header_applied:
+                linked, build_error = self._build_runner(
+                    workdir, exports, unit.get("allowed_extra_imports") or None
+                )
+                if linked:
+                    return True, f"linked at replay iteration {iteration}"
+                stage = classify_build_stage(build_error)
+                fingerprint = diagnostic_fingerprint(build_error)
+                if is_stuck(
+                    previous_stage, previous_fingerprint,
+                    stage, fingerprint, header_applied,
+                ):
+                    return False, "stuck: identical diagnostics after applied fix"
+                previous_stage, previous_fingerprint = stage, fingerprint
+            if iteration == MAX_COMPILE_ITERS:
+                break
+            header_text = (workdir / "gnt4_shim.h").read_text(encoding="utf-8")
+            fixed = None
+            for format_reminder in (False, True):
+                fixed = self._compile_fix(
+                    unit_c, header_text,
+                    summarise_build_error(build_error, budget=2000),
+                    unit_name=f"f4-replay:{name}",
+                    format_reminder=format_reminder,
+                )
+                if fixed is not None:
+                    break
+            if fixed is None:
+                return False, "no new header in replay round"
+            (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
+            header_applied = True
+        return False, f"not linked: {summarise_build_error(build_error)[:300]}"
+
     def _reconcile_interrupted(self, state: dict[str, Any]) -> None:
         """A unit left `porting` by a killed run never got a transition record.
 
@@ -2271,6 +3385,11 @@ class WasmUnitDriver:
             # unit its place in line, so neither a failing unit nor a
             # driver-killing one can monopolise the selector.
             cost = int(record.get("attempts", 0)) + int(record.get("interruptions", 0))
+            # Section 2.12(b): an LLM STRUCTURAL diagnosis never settles --
+            # it deprioritises: the unit sinks behind all other schedulable
+            # work, but still runs when it is the only work left.
+            if (record.get("diagnosis") or {}).get("verdict") == "STRUCTURAL":
+                cost += STRUCTURAL_DEPRIORITY
             # Section 2.14 [V4-2]: product_priority leads the key (higher
             # serves first, hence negated); chunk/queue order stays the tail
             # tie-break. An absent sidecar makes every priority 0 and the
@@ -2327,6 +3446,49 @@ class WasmUnitDriver:
                         driver_running=False,
                     )
                     return EXIT_STOPPED
+                # Verification lane (section 3, T3): staged compile-only
+                # greens whose sidecar oracle spec has appeared are served
+                # FIRST -- an oracle-only stage that converts inventory into
+                # verified progress (G1) with zero model calls.
+                verify_candidates = [
+                    candidate
+                    for candidate in self._verification_candidates(state)
+                    if candidate not in processed
+                ]
+                if verify_candidates:
+                    verify_name = verify_candidates[0]
+                    self.events.emit(
+                        "selection", action="wasm_unit_reverify", unit=verify_name
+                    )
+                    self._write_progress(state, "verifying", unit=verify_name)
+                    try:
+                        self._reverify_unit_inner(verify_name, state)
+                    except Exception as error:  # noqa: BLE001 - never takes the run down
+                        self.events.emit(
+                            "reverify_error",
+                            unit=verify_name,
+                            error=str(error)[:400],
+                        )
+                        # Mark the spec as attempted so a raising candidate
+                        # cannot spin the pass.
+                        verify_record = self._unit_state(state, verify_name)
+                        entry = self._oracle_sidecar().get(verify_name)
+                        verify_record["verify"] = {
+                            "status": "error",
+                            "error": str(error)[:400],
+                            "spec_sha256": oracle_entry_sha(entry) if entry else None,
+                            "at": utc_now(),
+                        }
+                        self._save_state(state)
+                    processed.add(verify_name)
+                    steps_done += 1
+                    self._write_progress(state, "running")
+                    if not self.until_blocked and steps_done >= self.units_budget:
+                        self.events.emit(
+                            "driver_stopped", reason="units_budget_reached"
+                        )
+                        return EXIT_PROGRESSED
+                    continue
                 unit = self._next_unit(queue, state, processed)
                 if unit is None:
                     work_left = self._work_remains(state)
@@ -2346,6 +3508,32 @@ class WasmUnitDriver:
                             for unit_name, rec in state.get("units", {}).items()
                             if rec.get("status") == "red_retryable"
                         )
+                        # Terminal protocol (section 2.8 [V4-3] / 2.12(b)):
+                        # each zero-delta red receives exactly one diagnosis
+                        # call (once per unit lifetime, so re-entering this
+                        # state later re-spends nothing), and the page carries
+                        # the diagnoses -- a work order, not a stall report.
+                        queue_by_name = {queued["name"]: queued for queued in queue}
+                        diagnoses: list[dict[str, Any]] = []
+                        for waiting_name in waiting:
+                            waiting_record = self._unit_state(state, waiting_name)
+                            if (
+                                not waiting_record.get("diagnosis")
+                                and waiting_name in queue_by_name
+                            ):
+                                self._diagnose_unit(
+                                    queue_by_name[waiting_name],
+                                    waiting_record,
+                                    state,
+                                )
+                            diagnosis = waiting_record.get("diagnosis") or {}
+                            diagnoses.append(
+                                {
+                                    "unit": waiting_name,
+                                    "verdict": diagnosis.get("verdict"),
+                                    "reason": (diagnosis.get("reason") or "")[:200],
+                                }
+                            )
                         self._write_progress(
                             state, "waiting_world_change",
                             run_state="waiting_world_change",
@@ -2354,6 +3542,7 @@ class WasmUnitDriver:
                             "waiting_world_change",
                             reds=len(waiting),
                             units=waiting[:20],
+                            diagnoses=diagnoses[:20],
                             world_version=self._world_version(),
                         )
                         self.events.emit(
@@ -2403,6 +3592,17 @@ class WasmUnitDriver:
                         detail=(self._provider_paused_detail or "")[:300],
                     )
                     return EXIT_PROVIDER_PAUSED
+                # Section 2.12(b) general lane (T3): after the SECOND failed
+                # attempt, one diagnosis call per unit lifetime. STRUCTURAL
+                # deprioritises + nominates for F4; FIXABLE feeds the
+                # post-mortem. Never settles.
+                if outcome == "red_retryable":
+                    failed_record = self._unit_state(state, unit["name"])
+                    if (
+                        failed_record.get("attempts", 0) >= 2
+                        and not failed_record.get("diagnosis")
+                    ):
+                        self._diagnose_unit(unit, failed_record, state)
                 processed.add(unit["name"])
                 steps_done += 1
                 self._write_progress(state, "running")
@@ -2461,6 +3661,24 @@ def main(argv: list[str] | None = None) -> int:
         help="assemble every green/staged unit instead of the last N",
     )
     gate.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    reverify = sub.add_parser(
+        "reverify-unit",
+        help="promote one staged compile-only green by re-running its "
+        "oracle-commands.json sidecar oracle against the committed staged "
+        "artifact (oracle plan section 3.4). Journal-emitting; takes the "
+        "driver lock and refuses while a driver is alive.",
+    )
+    reverify.add_argument("--unit", required=True, help="staged unit name")
+    reverify.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    f4 = sub.add_parser(
+        "f4-recheck",
+        help="F4 bounded recheck (design section 2.7): replay up to N "
+        "structural_ineligible / diagnosis-nominated units offline with the "
+        "current loop. Reports; never settles or unsettles. A settled unit "
+        "that links is the classifier-freeze signal (exit 1).",
+    )
+    f4.add_argument("--sample", type=int, default=5, help="max units to replay")
+    f4.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
     args = parser.parse_args(argv)
     if args.command == "settle-unit":
         driver = WasmUnitDriver(repo_root=args.repo_root)
@@ -2472,6 +3690,16 @@ def main(argv: list[str] | None = None) -> int:
         result = driver.run_assembly_gate_now(window, workdir_name="_assembly-manual")
         print(json.dumps(result, indent=2))
         return 0 if result.get("passed") in (True, None) else 1
+    if args.command == "reverify-unit":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        result = driver.reverify_unit(args.unit)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("promoted") else 1
+    if args.command == "f4-recheck":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        result = driver.f4_recheck(args.sample)
+        print(json.dumps(result, indent=2))
+        return 1 if result.get("classifier_freeze_signal") else 0
     return 2
 
 
