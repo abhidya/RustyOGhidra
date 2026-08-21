@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,9 @@ def test_damage_core_entry_binds_to_provenance_exports() -> None:
 def _dry_run_driver(extra_env: dict[str, str] | None = None) -> tuple[bool, str, str]:
     entry = _load()["units"]["damage-core"]
     oracle = json.loads(json.dumps(entry["oracle"]))  # deep copy
+    # Review F3: dry-runs must never clobber the tracked passing artifact under
+    # research/decomp/data/oracle-results/ — route the result JSON to a scratch dir.
+    oracle.setdefault("env", {})["ORACLE_RESULTS_DIR"] = tempfile.mkdtemp(prefix="oracle-dryrun-")
     if extra_env:
         oracle.setdefault("env", {}).update(extra_env)
     driver = WasmUnitDriver.__new__(WasmUnitDriver)  # no __init__: no lock, no state
