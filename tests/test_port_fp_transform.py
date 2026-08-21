@@ -684,6 +684,162 @@ def test_dataflow_residual_risk_blocks_the_unit(tmp_path, monkeypatch):
     assert "residual-risk" in record.get("error", "")
 
 
+# ------------------------------------------------- D5-6 migration sweep
+
+
+def _migration_repo(tmp_path: Path):
+    repo = _write_repo(tmp_path, IDIOM_BODY)
+    (repo / "research/decomp/generated/finish-game-port").mkdir(parents=True)
+    staging = repo / "research/decomp/port-units-staging"
+
+    def entry(name: str, start: int, end: int) -> dict:
+        return {
+            "name": name,
+            "extractions": [
+                {
+                    "file": "research/decomp/ghidra-export/chunk_7777.c",
+                    "start": start,
+                    "end": end,
+                }
+            ],
+            "prelude": [],
+            "exported_functions": ["zz_fp_"],
+            "header_seed": "research/decomp/poc/seed.h",
+            "oracle": {"type": "compile_only"},
+        }
+
+    queue = {
+        "queue_schema": 1,
+        "units": [
+            entry("unit-wrong", 2, 6),    # idiom site, pre-D5 green -> revoke
+            entry("unit-clean", 8, 11),   # site-free, pre-D5 green -> stands
+            entry("unit-current", 2, 6),  # already transform-stamped -> current
+            entry("island-core", 8, 11),  # green, no staged dir -> skipped
+            entry("unit-pending", 2, 6),  # never green -> untouched
+        ],
+    }
+    (repo / "research/decomp/generated/finish-game-port/wasm-units.json").write_text(
+        json.dumps(queue), encoding="utf-8"
+    )
+
+    def stage(name: str, provenance: dict) -> None:
+        unit_dir = staging / name
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "provenance.json").write_text(
+            json.dumps(provenance), encoding="utf-8"
+        )
+
+    units = {unit["name"]: unit for unit in queue["units"]}
+    wrong = materialize_unit_c(repo, units["unit-wrong"])
+    clean = materialize_unit_c(repo, units["unit-clean"])
+    current = materialize_unit_c(repo, units["unit-current"])
+    # Pre-D5 provenance shape: extraction hashes only, NO transform block.
+    stage("unit-wrong", {
+        "unit": "unit-wrong",
+        "extractions": wrong.extraction_records,
+        "extracted_sha256": wrong.extracted_sha256,
+        "tier": "compile_only",
+    })
+    stage("unit-clean", {
+        "unit": "unit-clean",
+        "extractions": clean.extraction_records,
+        "extracted_sha256": clean.extracted_sha256,
+        "tier": "compile_only",
+    })
+    stage("unit-current", {
+        "unit": "unit-current",
+        "extractions": current.extraction_records,
+        "extracted_sha256": current.extracted_sha256,
+        "transform": current.transform,
+        "tier": "compile_only",
+    })
+    state = {
+        "state_schema": 1,
+        "units": {
+            "unit-wrong": {"status": "green", "attempts": 1, "tier": "compile_only"},
+            "unit-clean": {"status": "green", "attempts": 1, "tier": "compile_only"},
+            "unit-current": {"status": "green", "attempts": 2, "tier": "compile_only"},
+            "island-core": {"status": "green", "attempts": 1},
+            "unit-pending": {"status": "pending", "attempts": 0},
+        },
+    }
+    (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+    return repo
+
+
+def _migration_driver(repo: Path):
+    from src.port_wasm_units import WasmUnitDriver
+
+    return WasmUnitDriver(
+        repo_root=repo,
+        build_runner=lambda workdir, exports, extra=None: (True, ""),
+        oracle_runner=lambda unit, wasm: (True, "1/1", "PASS"),
+        git_runner=lambda *args: _completed(0, "abc123\n"),
+    )
+
+
+def test_d5_migrate_revokes_exactly_the_predicate_selection(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _migration_repo(tmp_path)
+    report = _migration_driver(repo).d5_migrate()
+    assert [row["unit"] for row in report["revoked"]] == ["unit-wrong"]
+    assert report["revoked"][0]["sites"] == 1
+    assert report["identity_stand"] == ["unit-clean"]
+    assert report["current"] == ["unit-current"]
+    assert [row["unit"] for row in report["skipped"]] == ["island-core"]
+    assert report["backup"]  # state was backed up before the first edit
+    state = json.loads(
+        (
+            repo
+            / "research/decomp/generated/finish-game-port/wasm-units-state.json"
+        ).read_text(encoding="utf-8")
+    )
+    units = state["units"]
+    assert units["unit-wrong"]["status"] == "pending"  # requeued
+    assert units["unit-wrong"]["revoked"]["via"] == "d5-migrate"
+    assert units["unit-wrong"]["revoked"]["previous_tier"] == "compile_only"
+    assert units["unit-clean"]["status"] == "green"    # identity carve-out
+    assert units["unit-current"]["status"] == "green"
+    assert units["island-core"]["status"] == "green"   # step 4: out of scope
+    assert units["unit-pending"]["status"] == "pending"
+    # The journal saw the revocation (events.jsonl carries verdict_revoked).
+    events_path = (
+        repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    )
+    revoked_events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if '"verdict_revoked"' in line
+    ]
+    assert [event.get("unit") for event in revoked_events] == ["unit-wrong"]
+    # Idempotent: a second sweep finds nothing left to revoke.
+    second = _migration_driver(repo).d5_migrate()
+    assert second["revoked"] == []
+    assert second["identity_stand"] == ["unit-clean"]
+
+
+def test_d5_migrate_dry_run_changes_nothing(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _migration_repo(tmp_path)
+    state_path = (
+        repo / "research/decomp/generated/finish-game-port/wasm-units-state.json"
+    )
+    before = state_path.read_text(encoding="utf-8")
+    report = _migration_driver(repo).d5_migrate(dry_run=True)
+    assert [row["unit"] for row in report["revoked"]] == ["unit-wrong"]
+    assert report["backup"] is None
+    assert state_path.read_text(encoding="utf-8") == before
+    events_path = (
+        repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    )
+    assert (
+        not events_path.is_file()
+        or '"verdict_revoked"' not in events_path.read_text(encoding="utf-8")
+    )
+
+
 # ----------------------------------------------------- gate 3 rehearsal
 
 

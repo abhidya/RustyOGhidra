@@ -59,8 +59,11 @@ from src.port_assembly_gate import (
 )
 from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
 from src.port_fp_transform import (
+    CURRENT as D5_CURRENT,
+    RESTAMP as D5_RESTAMP,
     ensure_bitcast_helper,
     transform_record,
+    transform_staleness,
 )
 from src.port_knowledge_registry import (
     REGISTRY_RELPATH,
@@ -2889,6 +2892,188 @@ class WasmUnitDriver:
         finally:
             self.lock.release()
 
+    # ------------------------------------------- D5 migration (design D5-6)
+
+    def _backup_state(self) -> str | None:
+        if not self.state_path.is_file():
+            return None
+        backup_path = self.state_path.with_name(
+            f"{self.state_path.name}.settle-backup-"
+            + utc_now().replace(":", "").replace("-", "")
+        )
+        shutil.copyfile(self.state_path, backup_path)
+        return backup_path.name
+
+    def d5_migrate(self, dry_run: bool = False) -> dict[str, Any]:
+        """D5-6 migration steps 2-3: revoke-and-requeue every settled green
+        the census predicate selects, EVALUATED NOW (never a unit list).
+
+        Predicate per D5-4 [R2]: the staged artifact's provenance is D5-stale
+        (no transform block, or version-stale with differing output) AND the
+        transform on its extractions is non-identity. Site-free artifacts
+        classify RESTAMP -- their verdicts STAND and the identity stamp lands
+        at their next routine touch (D5-6), so this sweep records them but
+        does not rewrite committed artifacts. Units without a staged
+        provenance (the oracle-green PoC island in port-units -- migration
+        step 4, owner decision pending) are skipped and reported.
+
+        Every revocation goes THROUGH the journal (section 2.9 [V4-9]):
+        state backup, journal checkpoint, ``verdict_revoked`` event, atomic
+        state save -- and triggers the [V4-7] registry demote path
+        (tombstoned where sole-sourced; re-harvest on the new green
+        re-supplies them). The staged artifact directory is left in place:
+        the requeued rebuild overwrites and re-commits it, and gate item 2's
+        census stays visibly red until the mix drains (F-D5-8).
+
+        Takes the driver lock; refuses while a driver is alive (same rule as
+        settle_unit -- racing a live driver's state writes is a proven
+        failure mode).
+        """
+        queue = {unit["name"]: unit for unit in self._load_queue()}
+        if not dry_run and not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "migrating under a running driver would race its state writes"
+            )
+        try:
+            state = self._load_state()
+            report: dict[str, Any] = {
+                "dry_run": dry_run,
+                "revoked": [],
+                "identity_stand": [],
+                "current": [],
+                "skipped": [],
+                "backup": None,
+            }
+            registry_dirty = False
+            registry = None
+            for name in sorted(state.get("units", {})):
+                record = state["units"][name]
+                if record.get("status") != "green":
+                    continue
+                provenance = self._staged_provenance(name)
+                if provenance is None:
+                    report["skipped"].append(
+                        {
+                            "unit": name,
+                            "why": "no staged provenance (oracle-green "
+                            "island or promoted artifact; D5-6 step 4 is "
+                            "out of this sweep's scope)",
+                        }
+                    )
+                    continue
+                unit = queue.get(name)
+                if unit is None:
+                    report["skipped"].append(
+                        {"unit": name, "why": "green record not in the queue"}
+                    )
+                    continue
+                try:
+                    materialized = materialize_unit_c(self.repo_root, unit)
+                except (OSError, ValueError, KeyError) as error:
+                    report["skipped"].append(
+                        {"unit": name, "why": f"materialization: {error}"}
+                    )
+                    continue
+                current_sha = materialized.transform["transformed_sha256"]
+                staleness = transform_staleness(provenance, current_sha)
+                if staleness == D5_CURRENT:
+                    report["current"].append(name)
+                    continue
+                if staleness == D5_RESTAMP:
+                    report["identity_stand"].append(name)
+                    continue
+                sites = materialized.transform["sites"]
+                entry = {"unit": name, "sites": sites}
+                report["revoked"].append(entry)
+                if dry_run:
+                    continue
+                if report["backup"] is None:
+                    report["backup"] = self._backup_state()
+                reason = (
+                    "D5-6 migration: artifact predates the d5-fp-reinterpret "
+                    f"transform and its extractions carry {sites} rewritable "
+                    "idiom site(s); verdict revoked and unit requeued for "
+                    "rebuild under the transform"
+                )
+                transition = UnitTransition(
+                    unit=name,
+                    result=RESULT_DEFERRED,
+                    stage="d5-migrate",
+                    attempt=record.get("attempts", 0),
+                    detail=f"verdict revoked: {reason}",
+                    model=self._model_config.model,
+                    extra={
+                        "revoked_via": "d5-migrate",
+                        "previous_status": "green",
+                        "world_version": self._world_version(),
+                        "transform_sites": sites,
+                    },
+                )
+                # Journal FIRST (remote record before the local verdict
+                # changes -- same ordering rule as settle_unit).
+                self._checkpoint(state, transition)
+                previous_tier = record.get("tier")
+                record.pop("tier", None)
+                record.update(
+                    status="pending",
+                    error=None,
+                    last_stage="d5-migrate",
+                    revoked={
+                        "via": "d5-migrate",
+                        "at": utc_now(),
+                        "reason": reason,
+                        "previous_status": "green",
+                        "previous_tier": previous_tier,
+                        "transform_sites": sites,
+                    },
+                )
+                self._save_state(state)
+                self.events.emit(
+                    "verdict_revoked",
+                    unit=name,
+                    previous_status="green",
+                    previous_tier=previous_tier,
+                    reason=reason[:600],
+                    transform_sites=sites,
+                    via="d5-migrate",
+                )
+                # [V4-7] demote path for the unit's harvested entries.
+                try:
+                    if registry is None:
+                        registry = self._registry()
+                    retier = revoke_unit_entries(registry, name)
+                    if retier.changed:
+                        registry_dirty = True
+                        self.events.emit(
+                            "registry_revoked",
+                            unit=name,
+                            demoted=retier.demoted[:20],
+                            revoked=retier.revoked[:20],
+                            registry_version=retier.version,
+                        )
+                except Exception as error:  # noqa: BLE001 - registry never blocks
+                    self.events.emit(
+                        "registry_revoke_error", unit=name, error=str(error)[:400]
+                    )
+            if registry_dirty and registry is not None:
+                self._save_registry(registry)
+                # Local commit only -- this sweep never pushes; the driver's
+                # next sanctioned commit flow carries it outward.
+                self._git_runner("add", "--", REGISTRY_RELPATH)
+                self._git_runner(
+                    "commit",
+                    "-m",
+                    "port-registry: D5-6 migration revocations "
+                    "([V4-7] demote for revoked staged greens)",
+                    "--",
+                    REGISTRY_RELPATH,
+                )
+            return report
+        finally:
+            if not dry_run:
+                self.lock.release()
+
     # ------------------------------------------------- diagnosis (section 2.12b)
 
     def _diagnose_unit(
@@ -3922,6 +4107,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     reverify.add_argument("--unit", required=True, help="staged unit name")
     reverify.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    migrate = sub.add_parser(
+        "d5-migrate",
+        help="D5-6 migration steps 2-3: revoke-and-requeue (through the "
+        "journal, verdict_revoked) every settled green whose staged artifact "
+        "the D5 census predicate selects, evaluated now. Site-free artifacts "
+        "stand (identity carve-out). Takes the driver lock; refuses while a "
+        "driver is alive. Never pushes.",
+    )
+    migrate.add_argument(
+        "--dry-run", action="store_true",
+        help="evaluate and report the predicate only; no lock, no writes",
+    )
+    migrate.add_argument(
+        "--wait-seconds", type=float, default=0.0,
+        help="poll this long for the driver lock instead of refusing "
+        "immediately (the live driver frees it between unit runs)",
+    )
+    migrate.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
     f4 = sub.add_parser(
         "f4-recheck",
         help="F4 bounded recheck (design section 2.7): replay up to N "
@@ -3947,6 +4150,21 @@ def main(argv: list[str] | None = None) -> int:
         result = driver.reverify_unit(args.unit)
         print(json.dumps(result, indent=2))
         return 0 if result.get("promoted") else 1
+    if args.command == "d5-migrate":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        deadline = time.monotonic() + max(0.0, args.wait_seconds)
+        while True:
+            try:
+                result = driver.d5_migrate(dry_run=args.dry_run)
+                break
+            except RuntimeError as error:
+                if "wasm-units.lock" not in str(error) or (
+                    time.monotonic() >= deadline
+                ):
+                    raise
+                time.sleep(2.0)
+        print(json.dumps(result, indent=2))
+        return 0
     if args.command == "f4-recheck":
         driver = WasmUnitDriver(repo_root=args.repo_root)
         result = driver.f4_recheck(args.sample)
