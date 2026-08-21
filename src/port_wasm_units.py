@@ -46,18 +46,20 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from src.port_assembly_gate import (
     ASSEMBLY_WASM,
     SMOKE_JS,
+    UnitArtifact,
     assembly_window_size,
-    gate_ledger_material,
-    read_gate_ledger,
+    load_unit_artifact,
     record_gate_result,
     run_assembly_gate,
     select_recent_green_units,
+    unit_artifact_sha256,
 )
 from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
 from src.port_fp_transform import (
@@ -118,6 +120,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 QUEUE_SCHEMA = 1
 STATE_SCHEMA = 1
+PROMOTION_ATTEMPT_SCHEMA = 1
 # Compile-fix depth cap (design section 2.1): across the n=7 clean repair-greens
 # the link iterations were 2,2,2,2,3,3,5 -- one needed 5, so a hard cap of 3
 # would strand that class while no recovery path exists. Cap 4 for T1; the cap
@@ -1222,6 +1225,8 @@ class WasmUnitDriver:
         self.queue_path = self.run_root / "wasm-units.json"
         self.state_path = self.run_root / "wasm-units-state.json"
         self.work_root = self.run_root / "wasm-units"
+        self.promotion_attempt_root = self.work_root / "_promotion-attempts"
+        self.promotion_quarantine_root = self.work_root / "_promotion-quarantine"
         self.artifact_root = self.repo_root / "research/decomp/port-units"
         self.staging_root = self.repo_root / "research/decomp/port-units-staging"
         self.lock = DriverLock(self.run_root / "wasm-units.lock")
@@ -1261,10 +1266,10 @@ class WasmUnitDriver:
         # every unit priority 0 => ordering unchanged.
         self.priority_path = self.repo_root / "research/decomp/data/unit-priority.json"
         self._unit_priorities: dict[str, int] | None = None
-        # Continuous assembly gate (section 2.13 [V4-11], T2b): after every
-        # green, the last N green/staged units are linked in one invocation
-        # and instantiation-smoked. The ledger (largest-N-passed + conflict
-        # records) lives in the tracked data dir, like the priority sidecar.
+        # Continuous assembly gate (section 2.13 [V4-11], T2b): before a
+        # candidate can become green, it is explicitly bound by name+digest
+        # and linked with up to N-1 green/staged units. The ledger is durable
+        # local evidence and never creates its own product-lineage commit.
         self.assembly_ledger_path = (
             self.repo_root / "research/decomp/data/assembly-gate.json"
         )
@@ -1592,12 +1597,13 @@ class WasmUnitDriver:
         current_attempt: int = 0,
         workflow_state: str = "running",
         driver_running: bool = True,
-    ) -> None:
-        """Emit one remote progress checkpoint. Telemetry: never fails a unit.
+    ) -> bool:
+        """Emit one progress checkpoint and report whether it is durable.
 
         Called at EVERY unit transition, before the selector moves on -- the
         unit-transition invariant. A git/network fault degrades to a recorded
-        pending push, never to a lost unit or a raised exception.
+        pending push. Assembly verdict callers use the boolean to fail closed
+        when even the local transition record could not be written.
         """
         machine = MachineState(
             workflow_state=workflow_state,
@@ -1607,7 +1613,7 @@ class WasmUnitDriver:
             context_length=self._model_config.max_seq_length or None,
         )
         try:
-            self._journal.checkpoint(
+            result = self._journal.checkpoint(
                 transition=transition,
                 units=state.get("units", {}),
                 machine=machine,
@@ -1620,9 +1626,31 @@ class WasmUnitDriver:
             )
         except Exception as error:  # noqa: BLE001 - telemetry is never fatal
             self.events.emit("progress_checkpoint_failed", error=str(error)[:400])
+            return False
+        durable = not isinstance(result, dict) or bool(result.get("recorded", True))
+        if not durable:
+            self.events.emit(
+                "progress_checkpoint_failed",
+                error=str(result.get("detail") or "journal did not record transition")[:400],
+            )
+            return False
         if transition is not None:
             self._previous_unit = transition.unit
             self._previous_result = transition.result
+        return True
+
+    @staticmethod
+    def _project_record_update(
+        state: dict[str, Any], name: str, record_update: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Copy the canonical state with one projected unit record update."""
+        projected = dict(state)
+        units = dict(state.get("units", {}))
+        record = dict(units.get(name, {}))
+        record.update(record_update)
+        units[name] = record
+        projected["units"] = units
+        return projected
 
     # --------------------------------------------------------------------- llm
 
@@ -1800,20 +1828,304 @@ class WasmUnitDriver:
         )
         return completed.returncode == 0 and "ASSEMBLY_SMOKE_OK" in completed.stdout, log
 
+    # ------------------------------------------------------- promotion attempt
+
+    def _promotion_marker(self, attempt_dir: Path) -> dict[str, Any] | None:
+        """Return a validated ownership marker for one private attempt."""
+        try:
+            if attempt_dir.is_symlink() or (
+                hasattr(attempt_dir, "is_junction") and attempt_dir.is_junction()
+            ):
+                return None
+            marker = json.loads(
+                (attempt_dir / ".promotion-attempt.json").read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(marker, dict):
+            return None
+        if marker.get("schema") != PROMOTION_ATTEMPT_SCHEMA:
+            return None
+        if marker.get("attempt_id") != attempt_dir.name:
+            return None
+        try:
+            if attempt_dir.resolve().parent != self.promotion_attempt_root.resolve():
+                return None
+        except OSError:
+            return None
+        return marker
+
+    def _create_promotion_attempt(
+        self,
+        *,
+        name: str,
+        attempt: int,
+        workdir: Path,
+        provenance: dict[str, Any],
+        destination: Path,
+    ) -> tuple[Path, UnitArtifact]:
+        """Copy a publish candidate into a private, ownership-marked attempt.
+
+        Nothing under the authoritative artifact roots exists until T2b binds
+        and passes this exact candidate digest.
+        """
+        self.promotion_attempt_root.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-") or "unit"
+        attempt_id = f"{safe_name}-a{attempt}-{uuid.uuid4().hex}"
+        attempt_dir = self.promotion_attempt_root / attempt_id
+        attempt_dir.mkdir(exist_ok=False)
+        atomic_write_json(
+            attempt_dir / ".promotion-attempt.json",
+            {
+                "schema": PROMOTION_ATTEMPT_SCHEMA,
+                "attempt_id": attempt_id,
+                "unit": name,
+                "attempt": attempt,
+                "run_id": self.run_id,
+                "created_at": utc_now(),
+                "phase": "creating",
+                "destination": destination.relative_to(self.repo_root).as_posix(),
+            },
+        )
+        candidate_dir = attempt_dir / "candidate"
+        candidate_dir.mkdir()
+        for file_name in ("unit.c", "gnt4_shim.h", "unit.wasm", "oracle.log"):
+            shutil.copyfile(workdir / file_name, candidate_dir / file_name)
+        atomic_write_json(candidate_dir / "provenance.json", provenance)
+        candidate = load_unit_artifact(candidate_dir)
+        if candidate is None or candidate.name != name:
+            raise RuntimeError(f"private promotion candidate invalid for {name}")
+        self._update_promotion_marker(
+            attempt_dir,
+            phase="candidate-private",
+            candidate_sha256=candidate.sha256,
+        )
+        return attempt_dir, candidate
+
+    def _update_promotion_marker(self, attempt_dir: Path, **updates: Any) -> None:
+        marker = self._promotion_marker(attempt_dir)
+        if marker is None:
+            raise RuntimeError(f"promotion attempt lost ownership: {attempt_dir}")
+        marker.update(updates)
+        marker["updated_at"] = utc_now()
+        atomic_write_json(attempt_dir / ".promotion-attempt.json", marker)
+
+    def _promotion_destination(self, marker: dict[str, Any]) -> Path | None:
+        raw = marker.get("destination")
+        unit = str(marker.get("unit") or "")
+        if not isinstance(raw, str) or not unit:
+            return None
+        try:
+            destination = (self.repo_root / raw).resolve()
+            allowed = {
+                (self.artifact_root / unit).resolve(),
+                (self.staging_root / unit).resolve(),
+            }
+        except OSError:
+            return None
+        return destination if destination in allowed else None
+
+    def _cleanup_promotion_attempt(self, attempt_dir: Path) -> None:
+        """Delete only an ownership-marked private attempt and verify removal."""
+        marker = self._promotion_marker(attempt_dir)
+        if marker is None:
+            raise RuntimeError(
+                f"refusing to clean unowned promotion path: {attempt_dir}"
+            )
+        try:
+            shutil.rmtree(attempt_dir)
+        except Exception:  # noqa: BLE001 - restore ownership for restart
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(attempt_dir / ".promotion-attempt.json", marker)
+            raise
+        if attempt_dir.exists():
+            atomic_write_json(attempt_dir / ".promotion-attempt.json", marker)
+            raise RuntimeError(f"promotion attempt cleanup incomplete: {attempt_dir}")
+
+    def _reconcile_orphan_promotion_attempts(self) -> bool:
+        """Quarantine owned attempts left by a killed/crashed driver.
+
+        Unmarked directories are never touched. A quarantine move is atomic on
+        this volume and keeps crash evidence available without allowing the
+        orphan to participate in artifact selection.
+        """
+        if not self.promotion_attempt_root.is_dir():
+            return True
+        ok = True
+        for attempt_dir in sorted(self.promotion_attempt_root.iterdir()):
+            if not attempt_dir.is_dir():
+                self.events.emit(
+                    "promotion_attempt_unowned", path=str(attempt_dir)[:400]
+                )
+                continue
+            marker = self._promotion_marker(attempt_dir)
+            if marker is None:
+                self.events.emit(
+                    "promotion_attempt_unowned", path=str(attempt_dir)[:400]
+                )
+                continue
+            candidate_dir = attempt_dir / "candidate"
+            destination_path = self._promotion_destination(marker)
+            if (
+                not candidate_dir.exists()
+                and marker.get("phase") in {"installing", "installed"}
+            ):
+                try:
+                    if destination_path is None:
+                        raise RuntimeError("owned attempt has invalid destination")
+                    installed = load_unit_artifact(destination_path)
+                    if (
+                        installed is None
+                        or installed.name != marker.get("unit")
+                        or installed.sha256 != marker.get("candidate_sha256")
+                    ):
+                        raise RuntimeError(
+                            "installed orphan does not match marker digest"
+                        )
+                    destination_path.rename(candidate_dir)
+                    if destination_path.exists() or not candidate_dir.is_dir():
+                        raise RuntimeError("orphan install rollback incomplete")
+                    self._update_promotion_marker(
+                        attempt_dir, phase="restart-rolled-back"
+                    )
+                    marker = self._promotion_marker(attempt_dir) or marker
+                    self.events.emit(
+                        "promotion_attempt_install_rolled_back",
+                        unit=marker.get("unit"),
+                        attempt_id=marker.get("attempt_id"),
+                    )
+                except (OSError, RuntimeError) as error:
+                    ok = False
+                    self.events.emit(
+                        "promotion_attempt_reconcile_failed",
+                        unit=marker.get("unit"),
+                        attempt_id=marker.get("attempt_id"),
+                        error=str(error)[:400],
+                    )
+                    continue
+            self.promotion_quarantine_root.mkdir(parents=True, exist_ok=True)
+            destination = self.promotion_quarantine_root / (
+                f"{attempt_dir.name}-orphan-{uuid.uuid4().hex}"
+            )
+            try:
+                os.replace(attempt_dir, destination)
+                if attempt_dir.exists() or not destination.is_dir():
+                    raise OSError("quarantine move did not reach a stable state")
+                self.events.emit(
+                    "promotion_attempt_quarantined",
+                    unit=marker.get("unit"),
+                    attempt_id=marker.get("attempt_id"),
+                    quarantine=str(destination)[:400],
+                )
+            except OSError as error:
+                ok = False
+                self.events.emit(
+                    "promotion_attempt_quarantine_failed",
+                    unit=marker.get("unit"),
+                    attempt_id=marker.get("attempt_id"),
+                    error=str(error)[:400],
+                )
+        return ok
+
+    def _install_promotion_candidate(
+        self, candidate: UnitArtifact, destination: Path
+    ) -> str:
+        """Atomically install an absent candidate or accept an exact preimage.
+
+        A same-name destination with any other contents is authoritative and
+        must never be overwritten or recursively deleted.
+        """
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            existing = load_unit_artifact(destination)
+            if (
+                existing is None
+                or existing.name != candidate.name
+                or existing.sha256 != candidate.sha256
+            ):
+                raise RuntimeError(
+                    f"artifact destination already exists with a different "
+                    f"preimage: {destination}"
+                )
+            return "preimage-verified"
+        try:
+            candidate.directory.rename(destination)
+        except OSError:
+            # Resolve an install race only when the winner is byte-identical.
+            if destination.exists():
+                existing = load_unit_artifact(destination)
+                if (
+                    existing is not None
+                    and existing.name == candidate.name
+                    and existing.sha256 == candidate.sha256
+                ):
+                    return "preimage-verified"
+            raise
+        installed = load_unit_artifact(destination)
+        if (
+            installed is None
+            or installed.name != candidate.name
+            or installed.sha256 != candidate.sha256
+        ):
+            raise RuntimeError(
+                f"installed artifact failed digest verification: {destination}"
+            )
+        return "installed"
+
     def run_assembly_gate_now(
         self,
         n: int | None = None,
         *,
         workdir_name: str = "_assembly",
+        candidate: UnitArtifact | None = None,
+        workdir: Path | None = None,
     ) -> dict[str, Any]:
         """One assembly-gate pass over the last n green/staged units (n=None
         sweeps everything -- the backfill form). Emits NO events and takes no
         lock: safe from the maintenance CLI while a driver is alive (it reads
         only committed artifacts and writes only its own workdir + ledger)."""
-        units = select_recent_green_units(
-            [self.artifact_root, self.staging_root], n
-        )
+        if candidate is None:
+            units = select_recent_green_units(
+                [self.artifact_root, self.staging_root], n
+            )
+        else:
+            # The candidate is explicit authority, never discovered through
+            # timestamp/root selection. Exclude every same-name root artifact,
+            # select at most N-1 prior units, then append the exact candidate.
+            prior = [
+                unit
+                for unit in select_recent_green_units(
+                    [self.artifact_root, self.staging_root], None
+                )
+                if unit.name != candidate.name
+            ]
+            if n is not None and n > 0:
+                prior = prior[-max(0, n - 1):] if n > 1 else []
+            units = [*prior, candidate]
         if len(units) < 2:
+            try:
+                digest_now = (
+                    unit_artifact_sha256(candidate.directory)
+                    if candidate is not None
+                    else None
+                )
+            except OSError as error:
+                digest_now = f"unreadable:{error}"
+            if candidate is not None and digest_now != candidate.sha256:
+                return {
+                    "passed": False,
+                    "n": len(units),
+                    "units": [unit.name for unit in units],
+                    "stage": "candidate-integrity",
+                    "conflicts": [],
+                    "detail": f"candidate digest changed before singleton gate: {digest_now}",
+                    "candidate": {
+                        "name": candidate.name,
+                        "sha256": candidate.sha256,
+                    },
+                }
             return {
                 "passed": None,
                 "n": len(units),
@@ -1821,31 +2133,42 @@ class WasmUnitDriver:
                 "stage": "skipped",
                 "conflicts": [],
                 "detail": "fewer than 2 green/staged units; nothing to compose",
+                "candidate": (
+                    {"name": candidate.name, "sha256": candidate.sha256}
+                    if candidate is not None
+                    else None
+                ),
             }
         result = run_assembly_gate(
             units,
-            self.work_root / workdir_name,
+            workdir or (self.work_root / workdir_name),
             link_runner=self._assembly_link_runner,
             smoke_runner=self._assembly_smoke_runner,
+            candidate=candidate,
         )
         record_gate_result(self.assembly_ledger_path, result)
         return result
 
-    def _maybe_run_assembly_gate(self, unit_name: str) -> dict[str, Any]:
+    def _maybe_run_assembly_gate(
+        self,
+        unit_name: str,
+        *,
+        candidate: UnitArtifact | None = None,
+        workdir: Path | None = None,
+    ) -> dict[str, Any]:
         """Run the pre-publication assembly gate for ``unit_name``.
 
         The candidate artifact has been materialized but is not committed,
         settled, or registry-authoritative yet. A failed gate (including an
         internal link/smoke fault) is therefore a blocking result for the
         caller. Fewer than two artifacts is an explicit no-composition-needed
-        result (``passed is None``). Ledger commit bookkeeping remains
-        best-effort and never changes an already-computed gate result.
+        result (``passed is None``). The ledger is durable local evidence only:
+        this hook never creates a product-lineage commit or push.
         """
         try:
-            material_before = gate_ledger_material(
-                read_gate_ledger(self.assembly_ledger_path)
+            result = self.run_assembly_gate_now(
+                assembly_window_size(), candidate=candidate, workdir=workdir
             )
-            result = self.run_assembly_gate_now(assembly_window_size())
             if result.get("passed") is None:
                 return result  # fewer than 2 units: composition is not yet a claim
             self.events.emit(
@@ -1883,45 +2206,12 @@ class WasmUnitDriver:
                 "stage": "internal",
                 "conflicts": [],
                 "detail": str(error)[:1200],
+                "candidate": (
+                    {"name": candidate.name, "sha256": candidate.sha256}
+                    if candidate is not None
+                    else None
+                ),
             }
-
-        try:
-            # Best-effort ledger commit: the conflict records are the
-            # cross-unit reconciliation report (section 3) and belong in
-            # history next to the unit that surfaced them. Never fatal.
-            # MATERIAL changes only (new/changed conflict identity or a new
-            # largest_n_passed): record_gate_result stamps last_run/updated_at
-            # on every call, so committing the raw file would mint one churn
-            # commit per green. Immaterial runs leave the file updated on disk
-            # but uncommitted -- safe, because every other driver commit here
-            # is pathspec'd (git add <paths> + git commit -- <paths>), never a
-            # tree-wide sweep. NO push: the commit rides this branch and
-            # reaches the remote with the next sanctioned product push
-            # (_commit_unit/_commit_paths); a bare push here was landing one
-            # "port-assembly:" commit on origin/main per green.
-            material_after = gate_ledger_material(
-                read_gate_ledger(self.assembly_ledger_path)
-            )
-            if material_after != material_before:
-                rel = "research/decomp/data/assembly-gate.json"
-                added = self._git_runner("add", "--", rel)
-                if added.returncode == 0:
-                    self._git_runner(
-                        "commit",
-                        "-m",
-                        (
-                            f"port-assembly: gate N={result.get('n')} "
-                            f"{'pass' if result.get('passed') else 'FAIL'} "
-                            f"({len(result.get('conflicts') or [])} conflict(s)) "
-                            f"after {unit_name}"
-                        ),
-                        "--",
-                        rel,
-                    )
-        except Exception as error:  # noqa: BLE001 - gate result already known
-            self.events.emit(
-                "assembly_gate_ledger_error", unit=unit_name, error=str(error)[:400]
-            )
         return result
 
     # ------------------------------------------------------------------ oracle
@@ -2543,13 +2833,11 @@ class WasmUnitDriver:
                 extra={"rounds": rounds},
             )
 
-        # 5. green: artifacts + provenance + commit-per-match
+        # 5. private candidate + pre-publication T2b gate. The authoritative
+        # roots remain untouched until the exact candidate name/digest passes.
         artifact_dir = (
             self.staging_root if compile_only else self.artifact_root
         ) / name
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        for file_name in ("unit.c", "gnt4_shim.h", "unit.wasm", "oracle.log"):
-            shutil.copyfile(workdir / file_name, artifact_dir / file_name)
         provenance = {
             "unit": name,
             "run_id": self.run_id,
@@ -2588,13 +2876,21 @@ class WasmUnitDriver:
                 }
             ),
         }
-        atomic_write_json(artifact_dir / "provenance.json", provenance)
-        # 5a. T2b is a verdict gate, not post-publication telemetry. The
-        # candidate exists in the artifact tree so select_recent_green_units
-        # can compose it with the current window, but it has not yet mutated
-        # the knowledge registry, entered git, been pushed, or been settled.
-        assembly_result = self._maybe_run_assembly_gate(name)
-        if assembly_result.get("passed") is False:
+        attempt_dir, candidate = self._create_promotion_attempt(
+            name=name,
+            attempt=record.get("attempts", 0),
+            workdir=workdir,
+            provenance=provenance,
+            destination=artifact_dir,
+        )
+        assembly_result = self._maybe_run_assembly_gate(
+            name,
+            candidate=candidate,
+            workdir=attempt_dir / "assembly",
+        )
+        expected_binding = {"name": name, "sha256": candidate.sha256}
+        binding_ok = assembly_result.get("candidate") == expected_binding
+        if assembly_result.get("passed") is False or not binding_ok:
             assembly_evidence = {
                 "passed": False,
                 "n": assembly_result.get("n"),
@@ -2602,13 +2898,29 @@ class WasmUnitDriver:
                 "stage": assembly_result.get("stage"),
                 "conflicts": (assembly_result.get("conflicts") or [])[:20],
                 "detail": (assembly_result.get("detail") or "")[:1200],
+                "candidate": assembly_result.get("candidate"),
+                "expected_candidate": expected_binding,
             }
-            # A failed candidate must not be selected by a later gate merely
-            # because its temporary provenance directory still exists.
-            shutil.rmtree(artifact_dir, ignore_errors=True)
+            try:
+                self._cleanup_promotion_attempt(attempt_dir)
+                assembly_evidence["attempt_cleanup"] = "removed"
+            except Exception as cleanup_error:  # noqa: BLE001 - evidence below
+                assembly_evidence["attempt_cleanup"] = "failed"
+                assembly_evidence["cleanup_error"] = str(cleanup_error)[:600]
+                self.events.emit(
+                    "promotion_attempt_cleanup_failed",
+                    unit=name,
+                    attempt_id=attempt_dir.name,
+                    error=str(cleanup_error)[:400],
+                )
             detail = assembly_evidence["detail"] or (
                 f"{len(assembly_evidence['conflicts'])} conflict(s)"
             )
+            if not binding_ok:
+                detail = (
+                    f"candidate binding mismatch: expected {expected_binding}, "
+                    f"observed {assembly_result.get('candidate')}"
+                )
             return self._fail(
                 state,
                 record,
@@ -2618,7 +2930,94 @@ class WasmUnitDriver:
                 stage="assembly",
                 result=RESULT_GATE_FAILED,
                 extra={"rounds": rounds, "assembly_gate": assembly_evidence},
+                journal_required=True,
             )
+
+        install_result: str | None = None
+        try:
+            self._update_promotion_marker(attempt_dir, phase="gate-passed")
+            self._update_promotion_marker(attempt_dir, phase="installing")
+            install_result = self._install_promotion_candidate(candidate, artifact_dir)
+            self._update_promotion_marker(attempt_dir, phase=install_result)
+        except Exception as install_error:  # noqa: BLE001 - refuse any overwrite
+            rollback_error = ""
+            if install_result == "installed":
+                try:
+                    installed = load_unit_artifact(artifact_dir)
+                    if installed is None or installed.sha256 != candidate.sha256:
+                        raise RuntimeError(
+                            "installed destination changed before rollback"
+                        )
+                    artifact_dir.rename(attempt_dir / "candidate")
+                    self._update_promotion_marker(
+                        attempt_dir, phase="install-error-rolled-back"
+                    )
+                except Exception as error:  # noqa: BLE001 - report below
+                    rollback_error = f"; rollback failed: {error}"
+            cleanup_error = ""
+            try:
+                self._cleanup_promotion_attempt(attempt_dir)
+            except Exception as error:  # noqa: BLE001 - reported with verdict
+                cleanup_error = f"; cleanup failed: {error}"
+            return self._fail(
+                state,
+                record,
+                name,
+                f"artifact install refused after assembly pass: {install_error}"
+                f"{rollback_error}{cleanup_error}",
+                stage="artifact-install",
+                result=RESULT_GATE_FAILED,
+                extra={
+                    "rounds": rounds,
+                    "assembly_gate": assembly_result,
+                    "candidate_sha256": candidate.sha256,
+                },
+                journal_required=True,
+            )
+        try:
+            self._cleanup_promotion_attempt(attempt_dir)
+        except Exception as cleanup_error:  # noqa: BLE001 - no publication allowed
+            rollback_detail = ""
+            if install_result == "installed":
+                try:
+                    installed = load_unit_artifact(artifact_dir)
+                    if installed is None or installed.sha256 != candidate.sha256:
+                        raise RuntimeError(
+                            "installed destination changed before rollback"
+                        )
+                    candidate_dir = attempt_dir / "candidate"
+                    if candidate_dir.exists():
+                        raise RuntimeError(
+                            "private candidate path occupied before rollback"
+                        )
+                    artifact_dir.rename(candidate_dir)
+                    if artifact_dir.exists() or not candidate_dir.is_dir():
+                        raise RuntimeError("candidate rollback did not complete")
+                    rollback_detail = "; installed candidate rolled back to attempt"
+                except Exception as rollback_error:  # noqa: BLE001 - evidence below
+                    rollback_detail = f"; rollback failed: {rollback_error}"
+            self.events.emit(
+                "promotion_attempt_cleanup_failed",
+                unit=name,
+                attempt_id=attempt_dir.name,
+                error=str(cleanup_error)[:400],
+            )
+            return self._fail(
+                state,
+                record,
+                name,
+                f"promotion attempt cleanup failed after {install_result}: "
+                f"{cleanup_error}{rollback_detail}",
+                stage="promotion-cleanup",
+                result=RESULT_GATE_FAILED,
+                extra={
+                    "rounds": rounds,
+                    "assembly_gate": assembly_result,
+                    "candidate_sha256": candidate.sha256,
+                },
+                journal_required=True,
+            )
+
         # 5b. registry harvest (section 2.11, T2c [V4-1]): mechanical, no LLM.
         # The unit's own decisions (diffed against the AUGMENTED seed, minus
         # callee stubs) enter the registry at the unit's tier; the unit's
@@ -2711,8 +3110,18 @@ class WasmUnitDriver:
                 f"product commit failed, unit not settled: {push_detail}",
                 stage="commit",
             )
-        self._checkpoint(
-            state,
+        green_update = {
+            "status": "green",
+            "error": None,
+            "oracle_summary": summary,
+            "commit": sha,
+            "pushed": pushed,
+            "tier": "compile_only" if compile_only else "oracle_green",
+            "last_stage": "commit",
+        }
+        projected_green = self._project_record_update(state, name, green_update)
+        checkpointed = self._checkpoint(
+            projected_green,
             UnitTransition(
                 unit=name,
                 result=RESULT_STAGED if compile_only else RESULT_GREEN,
@@ -2730,15 +3139,16 @@ class WasmUnitDriver:
                 tier="compile_only" if compile_only else "oracle_green",
             ),
         )
-        record.update(
-            status="green",
-            error=None,
-            oracle_summary=summary,
-            commit=sha,
-            pushed=pushed,
-            tier="compile_only" if compile_only else "oracle_green",
-            last_stage="commit",
-        )
+        if not checkpointed:
+            self.events.emit(
+                "wasm_unit_journal_blocked",
+                unit=name,
+                stage="commit",
+                result=RESULT_STAGED if compile_only else RESULT_GREEN,
+                error="green projection checkpoint was not durable",
+            )
+            return "journal_blocked"
+        record.update(green_update)
         self._save_state(state)
         self._greens_this_run += 1
         self.events.emit(
@@ -2821,6 +3231,7 @@ class WasmUnitDriver:
         stage: str = "port",
         result: str = RESULT_RETRYABLE,
         extra: dict[str, Any] | None = None,
+        journal_required: bool = False,
     ) -> str:
         # Owner design: no countdown kills a unit; red units sink behind
         # less-attempted work and come around again. `structural_ineligible` is
@@ -2850,11 +3261,23 @@ class WasmUnitDriver:
         )
         record_update = dict(payload)
         record_update.update(status=status, error=error[:2000], last_stage=stage)
-        if status in self.SETTLED_STATUSES:
+        projected_state = self._project_record_update(state, name, record_update)
+        if status in self.SETTLED_STATUSES or journal_required:
             # Settling removes the unit from the queue permanently, and
             # `_reconcile_interrupted` only rescues units left as `porting`.
-            # Record it remotely BEFORE it becomes unrecoverable locally.
-            self._checkpoint(state, transition)
+            # Assembly failures also require durable evidence before canonical
+            # state advances: without it the selector could move on while the
+            # only failure record was lost.
+            checkpointed = self._checkpoint(projected_state, transition)
+            if journal_required and not checkpointed:
+                self.events.emit(
+                    "wasm_unit_journal_blocked",
+                    unit=name,
+                    stage=stage,
+                    result=result,
+                    error="required progress checkpoint was not durable",
+                )
+                return "journal_blocked"
             record.update(record_update)
             self._save_state(state)
         else:
@@ -3938,6 +4361,11 @@ class WasmUnitDriver:
             state = self._load_state()
             for unit in queue:  # make every queued unit visible in state/progress
                 self._unit_state(state, unit["name"])
+            if not self._reconcile_orphan_promotion_attempts():
+                self.events.emit(
+                    "driver_stopped", reason="promotion_attempt_quarantine_failed"
+                )
+                return EXIT_STOPPED
             self._reconcile_interrupted(state)
             self._reconcile_promoted(state)
             self._save_state(state)
@@ -4105,6 +4533,22 @@ class WasmUnitDriver:
                         detail=(self._provider_paused_detail or "")[:300],
                     )
                     return EXIT_PROVIDER_PAUSED
+                if outcome == "journal_blocked":
+                    # Required assembly-failure evidence could not be made
+                    # durable. Leave canonical state at ``porting`` so restart
+                    # reconciliation cannot mistake the unit for settled, and
+                    # stop before selecting any other unit.
+                    self._write_progress(
+                        state,
+                        "stopped_journal_unavailable",
+                        run_state="journal_blocked",
+                    )
+                    self.events.emit(
+                        "driver_stopped",
+                        reason="required_journal_checkpoint_failed",
+                        unit=unit["name"],
+                    )
+                    return EXIT_STOPPED
                 # Section 2.12(b) general lane (T3): after the SECOND failed
                 # attempt, one diagnosis call per unit lifetime. STRUCTURAL
                 # deprioritises + nominates for F4; FIXABLE feeds the

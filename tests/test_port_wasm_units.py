@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from src.port_assembly_gate import unit_artifact_sha256
 from src.port_driver import EXIT_NO_WORK, EXIT_PROGRESSED, EXIT_STOPPED
 from src.port_wasm_units import (
     WasmUnitDriver,
@@ -1136,6 +1137,7 @@ def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
     operation_order = []
 
     def fake_link(workdir, c_files, exports, allowed_extra):
+        assert not (repo / "research/decomp/port-units/unit-a").exists()
         operation_order.append("assembly_link")
         gate_calls.append((sorted(c_files), exports))
         (workdir / "assembly.wasm").write_bytes(b"\x00asm")
@@ -1258,6 +1260,283 @@ def test_assembly_gate_failure_blocks_green_commit_and_push(tmp_path, monkeypatc
     assert any("zz_prior_" in key for key in keys)
 
 
+def test_candidate_binding_defeats_future_dates_and_same_name_shadow(
+    tmp_path, monkeypatch
+):
+    """The attempt candidate is explicit authority, not root/timestamp luck."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    monkeypatch.setenv("OGHIDRA_PORT_ASSEMBLY_N", "2")
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "future-unit", "2999-01-01T00:00:00Z")
+    _seed_green_artifact(repo, "unit-a", "3999-01-01T00:00:00Z")
+    sentinel = repo / "research/decomp/port-units/unit-a/KEEP-SENTINEL"
+    sentinel.write_text("authoritative preimage\n", encoding="utf-8")
+    old_digest = unit_artifact_sha256(sentinel.parent)
+    observed = {}
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def conflicting_link(workdir, c_files, exports, allowed_extra):
+        candidate_dir = workdir.parent / "candidate"
+        observed["sha256"] = unit_artifact_sha256(candidate_dir)
+        observed["source"] = (candidate_dir / "unit.c").read_text(encoding="utf-8")
+        observed["c_files"] = sorted(c_files)
+        return False, "wasm-ld: error: duplicate symbol: zz_test_"
+
+    driver = _driver(
+        repo,
+        journal=FakeJournal(),
+        build_runner=fake_build,
+        assembly_link_runner=conflicting_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    assert driver.run() == EXIT_PROGRESSED
+    record = _state(repo)["units"]["unit-a"]
+    evidence = record["assembly_gate"]
+    assert evidence["expected_candidate"] == {
+        "name": "unit-a",
+        "sha256": observed["sha256"],
+    }
+    assert evidence["candidate"] == evidence["expected_candidate"]
+    assert "return a + 1;" in observed["source"]
+    assert observed["c_files"] == ["future-unit.c", "unit-a.c"]
+    ledger = json.loads(driver.assembly_ledger_path.read_text())
+    assert ledger["last_run"]["candidate"] == evidence["expected_candidate"]
+    assert sentinel.read_text(encoding="utf-8") == "authoritative preimage\n"
+    assert unit_artifact_sha256(sentinel.parent) == old_digest
+    assert not list(driver.promotion_attempt_root.glob("*"))
+
+
+def test_passing_gate_refuses_to_overwrite_same_name_artifact_preimage(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    _seed_green_artifact(repo, "unit-a", "2026-08-02T00:00:00Z")
+    sentinel = repo / "research/decomp/port-units/unit-a/KEEP-SENTINEL"
+    sentinel.write_text("do not replace\n", encoding="utf-8")
+    before = unit_artifact_sha256(sentinel.parent)
+    git_calls = []
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=FakeJournal(),
+        git_runner=lambda *args: git_calls.append(args) or _completed(0),
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    assert driver.run() == EXIT_PROGRESSED
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "red_retryable"
+    assert record["last_stage"] == "artifact-install"
+    assert sentinel.read_text(encoding="utf-8") == "do not replace\n"
+    assert unit_artifact_sha256(sentinel.parent) == before
+    assert git_calls == []
+    assert not list(driver.promotion_attempt_root.glob("*"))
+
+
+def test_cleanup_failure_is_quarantined_on_restart_and_unowned_paths_survive(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=FakeJournal(),
+        build_runner=fake_build,
+        assembly_link_runner=lambda *args: (True, ""),
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+
+    def fail_cleanup(_attempt_dir):
+        raise OSError("simulated locked attempt")
+
+    driver._cleanup_promotion_attempt = fail_cleanup
+    assert driver.run() == EXIT_PROGRESSED
+    assert not (repo / "research/decomp/port-units/unit-a").exists()
+    owned = [path for path in driver.promotion_attempt_root.iterdir() if path.is_dir()]
+    assert len(owned) == 1
+    assert (owned[0] / ".promotion-attempt.json").is_file()
+    assert (owned[0] / "candidate/provenance.json").is_file()
+    unowned = driver.promotion_attempt_root / "do-not-touch"
+    unowned.mkdir()
+    (unowned / "sentinel").write_text("keep", encoding="utf-8")
+
+    restarted = _driver(repo, journal=FakeJournal())
+    assert restarted._reconcile_orphan_promotion_attempts() is True
+    assert unowned.is_dir() and (unowned / "sentinel").read_text() == "keep"
+    assert not owned[0].exists()
+    quarantined = list(restarted.promotion_quarantine_root.iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / ".promotion-attempt.json").is_file()
+
+
+def test_restart_rolls_back_crash_window_install_before_quarantine(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo, journal=FakeJournal())
+    workdir = tmp_path / "candidate-source"
+    workdir.mkdir()
+    (workdir / "unit.c").write_text("int zz_test_(void) { return 1; }\n")
+    (workdir / "gnt4_shim.h").write_text("/* shim */\n")
+    (workdir / "unit.wasm").write_bytes(b"\x00asm")
+    (workdir / "oracle.log").write_text("PASS\n")
+    destination = driver.artifact_root / "unit-a"
+    attempt_dir, candidate = driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=1,
+        workdir=workdir,
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-21T00:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "oracle_green",
+        },
+        destination=destination,
+    )
+    driver._update_promotion_marker(attempt_dir, phase="installing")
+    assert driver._install_promotion_candidate(candidate, destination) == "installed"
+    assert destination.is_dir() and not candidate.directory.exists()
+
+    restarted = _driver(repo, journal=FakeJournal())
+    assert restarted._reconcile_orphan_promotion_attempts() is True
+    assert not destination.exists()
+    quarantined = list(restarted.promotion_quarantine_root.iterdir())
+    assert len(quarantined) == 1
+    restored = quarantined[0] / "candidate"
+    assert restored.is_dir()
+    assert unit_artifact_sha256(restored) == candidate.sha256
+
+
+def test_failed_gate_leaves_real_product_head_and_bare_remote_unchanged(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    remote = tmp_path / "origin.git"
+
+    def git(cwd, *args, check=True):
+        completed = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True
+        )
+        if check:
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+        return completed
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "init")
+    git(repo, "config", "user.email", "port-test@example.invalid")
+    git(repo, "config", "user.name", "Port Test")
+    git(repo, "branch", "-M", "main")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "baseline")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    head_before = git(repo, "rev-parse", "HEAD").stdout.strip()
+    remote_before = git(
+        tmp_path, "--git-dir", str(remote), "rev-parse", "refs/heads/main"
+    ).stdout.strip()
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=FakeJournal(),
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=lambda *args: (False, "link conflict"),
+    )
+    assert driver.run() == EXIT_PROGRESSED
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert (
+        git(tmp_path, "--git-dir", str(remote), "rev-parse", "refs/heads/main")
+        .stdout.strip()
+        == remote_before
+    )
+    assert git(repo, "ls-remote", "origin", "refs/heads/port-staging").stdout == ""
+
+
+def test_assembly_failure_stops_if_required_journal_checkpoint_raises(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+
+    class ExplodingJournal(FakeJournal):
+        def checkpoint(self, **kwargs):
+            raise RuntimeError("journal unavailable")
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=ExplodingJournal(),
+        build_runner=fake_build,
+        assembly_link_runner=lambda *args: (False, "link conflict"),
+    )
+    assert driver.run() == EXIT_STOPPED
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "porting"
+    assert "assembly_gate" not in record
+    events = (driver.run_root / "events.jsonl").read_text(encoding="utf-8")
+    assert '"wasm_unit_journal_blocked"' in events
+    assert '"wasm_unit_green"' not in events
+    assert not list(driver.promotion_attempt_root.glob("*"))
+
+
+def test_green_checkpoint_uses_the_same_projected_record_saved_canonically(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    journal = FakeJournal()
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(repo, journal=journal, build_runner=fake_build)
+    assert driver.run() == EXIT_NO_WORK
+    transition_checkpoint = next(
+        checkpoint
+        for checkpoint in journal.checkpoints
+        if checkpoint["transition"] is not None
+    )
+    journal_record = transition_checkpoint["units"]["unit-a"]
+    canonical_record = _state(repo)["units"]["unit-a"]
+    assert journal_record == canonical_record
+    assert journal_record["status"] == "green"
+    assert journal_record["commit"] == "abc123"
+    assert transition_checkpoint["transition"].product_commit == "abc123"
+
+
 def test_assembly_gate_internal_fault_fails_closed(tmp_path, monkeypatch):
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
@@ -1309,11 +1588,12 @@ def test_single_green_unit_skips_the_gate_quietly(tmp_path, monkeypatch):
     assert '"assembly_gate"' not in events
 
 
-def test_assembly_gate_never_pushes(tmp_path, monkeypatch):
-    """Regression: the gate's ledger commit must NOT carry its own push --
-    a bare `git push` here landed one port-assembly commit on origin/main
-    per green. The only push in a green run is the unit's own product push,
-    and it happens only after the gate succeeds."""
+def test_assembly_gate_ledger_never_touches_git(tmp_path, monkeypatch):
+    """Gate evidence is local journal/ledger data, never a product commit.
+
+    The only git commit/push in a passing run belongs to the promoted artifact,
+    and both happen after T2b succeeds.
+    """
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
@@ -1343,21 +1623,11 @@ def test_assembly_gate_never_pushes(tmp_path, monkeypatch):
     assert driver.run() == EXIT_NO_WORK
     pushes = [args for args in git_calls if args[0] == "push"]
     assert len(pushes) == 1, "exactly the unit's product push, nothing more"
-    ledger_indices = [
-        i for i, args in enumerate(git_calls)
-        if any("assembly-gate.json" in str(a) for a in args)
+    assert not [
+        args
+        for args in git_calls
+        if "assembly-gate.json" in " ".join(map(str, args))
     ]
-    assert ledger_indices, "the material first gate run must commit the ledger"
-    # The ledger commit itself is pathspec'd (never a tree-wide sweep).
-    ledger_commits = [
-        args for args in git_calls[ledger_indices[0]:]
-        if args[0] == "commit" and "assembly-gate.json" in " ".join(map(str, args))
-    ]
-    assert len(ledger_commits) == 1
-    assert "--" in ledger_commits[0]
-    ledger_commit_index = git_calls.index(ledger_commits[0])
-    product_push_index = next(i for i, args in enumerate(git_calls) if args[0] == "push")
-    assert ledger_commit_index < product_push_index
 
 
 def _gate_driver_with_two_greens(repo, git_calls, *, link_ok=True, conflicts=None):
@@ -1397,9 +1667,7 @@ def test_assembly_gate_unchanged_material_mints_no_commit(tmp_path, monkeypatch)
     driver = _gate_driver_with_two_greens(repo, git_calls)
 
     driver._maybe_run_assembly_gate("other-unit")
-    first_run_commits = [args for args in git_calls if args[0] == "commit"]
-    assert len(first_run_commits) == 1  # largest_n_passed 0 -> 2 is material
-    assert not [args for args in git_calls if args[0] == "push"]
+    assert git_calls == []
 
     ledger_path = repo / "research/decomp/data/assembly-gate.json"
     before = json.loads(ledger_path.read_text())
@@ -1426,7 +1694,7 @@ def test_assembly_gate_repeat_conflict_is_immaterial(tmp_path, monkeypatch):
     driver = _gate_driver_with_two_greens(repo, git_calls, link_ok=False)
 
     driver._maybe_run_assembly_gate("other-unit")
-    assert len([args for args in git_calls if args[0] == "commit"]) == 1
+    assert git_calls == []
     git_calls.clear()
     driver._maybe_run_assembly_gate("other-unit")
     assert git_calls == []

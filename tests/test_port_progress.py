@@ -386,6 +386,35 @@ def test_transition_is_durable_locally_even_when_git_is_entirely_broken(repo, tm
     assert "auto-c0000-001" in local
 
 
+def test_checkpoint_reports_not_recorded_when_every_durability_path_fails(
+    repo, tmp_path, monkeypatch
+):
+    journal = ProgressJournal(
+        repo,
+        run_root=tmp_path / "run",
+        worktree=tmp_path / "wt",
+        run_id="r",
+        enable_push=False,
+    )
+
+    def fail_local(_record):
+        raise OSError("disk unavailable")
+
+    def fail_branch(*_args, **_kwargs):
+        raise RuntimeError("progress branch unavailable")
+
+    monkeypatch.setattr(journal, "_append_local_event", fail_local)
+    monkeypatch.setattr(journal, "_checkpoint_locked", fail_branch)
+    result = journal.checkpoint(
+        transition=UnitTransition("auto-c0000-001", RESULT_RETRYABLE, "build", 1),
+        units=UNITS,
+    )
+
+    assert result["recorded"] is False
+    assert result["committed"] is False
+    assert "local journal append failed" in result["detail"]
+
+
 def test_concurrent_writer_is_serialised_by_the_progress_lock(repo, tmp_path):
     first = ProgressJournal(
         repo, run_root=tmp_path / "run", worktree=tmp_path / "wt",

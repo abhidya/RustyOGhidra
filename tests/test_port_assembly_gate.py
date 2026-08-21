@@ -292,6 +292,37 @@ def test_gate_pass_links_merged_workdir_and_smokes(tmp_path):
     assert (workdir / "unit-a.c").read_text() == "int fn_0(int a)\n{\n  return a;\n}\n"
 
 
+def test_gate_fails_if_explicit_candidate_digest_changes_during_link(tmp_path):
+    units = _units(
+        tmp_path,
+        [
+            ("unit-a", DOUBLE_HEADER, "int fn_0(void)\n{\n  return 0;\n}\n"),
+            ("unit-b", DOUBLE_HEADER, "int fn_1(void)\n{\n  return 1;\n}\n"),
+        ],
+    )
+    candidate = units[-1]
+    expected = {"name": candidate.name, "sha256": candidate.sha256}
+
+    def mutating_link(workdir, c_files, exports, allowed_extra):
+        (workdir / ASSEMBLY_WASM).write_bytes(b"\x00asm")
+        (candidate.directory / "unit.c").write_text(
+            "int fn_1(void)\n{\n  return 999;\n}\n", encoding="utf-8"
+        )
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        mutating_link,
+        lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+        candidate=candidate,
+    )
+    assert result["passed"] is False
+    assert result["stage"] == "candidate-integrity"
+    assert result["candidate"] == expected
+    assert expected["sha256"] in result["detail"]
+
+
 def test_gate_merge_conflict_fails_before_any_link(tmp_path):
     units = _units(
         tmp_path,

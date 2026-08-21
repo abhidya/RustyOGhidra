@@ -662,13 +662,16 @@ class ProgressJournal:
             }
         )
         # 1. LOCAL durability first. Everything after this is best-effort.
+        local_recorded = False
+        local_error = ""
         try:
             self._append_local_event(record)
-        except OSError:
-            pass
+            local_recorded = True
+        except OSError as error:
+            local_error = str(error)
 
         try:
-            return self._checkpoint_locked(
+            result = self._checkpoint_locked(
                 record, transition, units, machine, previous_unit, previous_result,
                 current_unit, current_stage, current_attempt, driver_running,
                 queue_counters, timestamp,
@@ -681,8 +684,21 @@ class ProgressJournal:
             self._write_pending(
                 True, f"checkpoint raised: {error}", self._read_pending().get("failures", 0) + 1
             )
-            return {"recorded": True, "committed": False, "pushed": False,
-                    "detail": f"checkpoint raised: {error}"}
+            result = {
+                "committed": False,
+                "pushed": False,
+                "detail": f"checkpoint raised: {error}",
+            }
+        # ``recorded`` means the exact transition is durable somewhere: the
+        # append-only local journal or a committed progress-branch snapshot.
+        # Never report success merely because an exception was suppressed.
+        result["recorded"] = local_recorded or bool(result.get("committed"))
+        if not result["recorded"] and local_error:
+            detail = result.get("detail") or ""
+            result["detail"] = (
+                f"{detail}; local journal append failed: {local_error}"
+            ).strip("; ")
+        return result
 
     def _checkpoint_locked(
         self,
@@ -699,7 +715,7 @@ class ProgressJournal:
         queue_counters: dict[str, Any] | None,
         timestamp: str,
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {"recorded": True, "committed": False, "pushed": False}
+        result: dict[str, Any] = {"recorded": False, "committed": False, "pushed": False}
         if not self.lock.acquire():
             # The driver can hold this lock for the length of a push. A pause or
             # block issued in that window would otherwise never reach

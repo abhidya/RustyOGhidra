@@ -3,11 +3,12 @@
 Every mechanism in the compile-fix loop keeps units *individually* green;
 until this gate nothing ever linked two of them together -- G1's first
 executable evidence sat behind a future assembly workstream. This module makes
-composition continuous: on every green, the last N green/staged units are
-linked in ONE emcc invocation (merged headers, shared flat arena, deduplicated
-externs) and the result is instantiation-smoke-tested under node. The gate
-passes iff the link produces a loadable wasm -- no behaviour is asserted;
-behaviour stays the oracle tier's job.
+composition continuous: before publication, an explicit name+digest-bound
+candidate and up to N-1 green/staged units are linked in ONE emcc invocation
+(merged headers, shared flat arena, deduplicated externs) and the result is
+instantiation-smoke-tested under node. The gate passes iff the link produces a
+loadable wasm -- no behaviour is asserted; behaviour stays the oracle tier's
+job.
 
 Two roles, one mechanism (design section 2.13):
   1. The interim G1 metric: "progress toward a buildable game" is the largest
@@ -24,7 +25,7 @@ the merge loudly rather than picking a winner silently. Identical
 (whitespace/comment-normalized) declarations keep exactly one copy.
 
 On failure the gate pages (events emitted by the caller) and files conflict
-records against the implicated symbols in a tracked ledger
+records against the implicated symbols in a local evidence ledger
 (research/decomp/data/assembly-gate.json) -- the cross-unit reconciliation
 report of section 3, generated as a by-product instead of by archaeology.
 
@@ -36,6 +37,7 @@ is testable offline.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -674,10 +676,37 @@ REQUIRED_ARTIFACTS = ("unit.c", "gnt4_shim.h", "provenance.json")
 class UnitArtifact:
     name: str
     directory: Path
+    sha256: str
     generated_at: str
     exports: list[str]
     allowed_extra_imports: list[str]
     tier: str
+
+
+def unit_artifact_sha256(directory: Path) -> str:
+    """Digest the complete artifact tree using framed relative paths/bytes.
+
+    This binds not just C/header/provenance but also the wasm and oracle
+    evidence that will be published after T2b. Symlinks are refused so the
+    digest never depends on content outside the owned artifact directory.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_symlink():
+            raise OSError(f"artifact tree contains a symlink: {path}")
+        relative = path.relative_to(directory).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        if path.is_dir():
+            digest.update(b"D")
+            continue
+        if not path.is_file():
+            raise OSError(f"artifact tree contains an unsupported entry: {path}")
+        payload = path.read_bytes()
+        digest.update(b"F")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def load_unit_artifact(directory: Path) -> UnitArtifact | None:
@@ -693,6 +722,7 @@ def load_unit_artifact(directory: Path) -> UnitArtifact | None:
     return UnitArtifact(
         name=str(provenance.get("unit") or directory.name),
         directory=directory,
+        sha256=unit_artifact_sha256(directory),
         generated_at=str(provenance.get("generated_at") or ""),
         exports=[str(e) for e in provenance.get("exported_functions") or []],
         allowed_extra_imports=[
@@ -774,6 +804,8 @@ def run_assembly_gate(
     workdir: Path,
     link_runner: Callable[[Path, list[str], list[str], list[str]], tuple[bool, str]],
     smoke_runner: Callable[[Path], tuple[bool, str]] | None = None,
+    *,
+    candidate: UnitArtifact | None = None,
 ) -> dict[str, Any]:
     """Run one N-unit assembly-gate pass. Pure orchestration: emcc and node
     arrive as injected runners.
@@ -790,7 +822,31 @@ def run_assembly_gate(
         "passed": False,
         "stage": "merge",
         "detail": "",
+        "candidate": (
+            {"name": candidate.name, "sha256": candidate.sha256}
+            if candidate is not None
+            else None
+        ),
     }
+    if candidate is not None:
+        matching = [unit for unit in units if unit.name == candidate.name]
+        exact_match = (
+            len(matching) == 1
+            and matching[0].directory.resolve() == candidate.directory.resolve()
+            and matching[0].sha256 == candidate.sha256
+        )
+        try:
+            digest_now = unit_artifact_sha256(candidate.directory)
+        except OSError as error:
+            digest_now = f"unreadable:{error}"
+        if not exact_match or digest_now != candidate.sha256:
+            result["stage"] = "candidate-integrity"
+            result["detail"] = (
+                f"assembly selection did not bind exact candidate "
+                f"{candidate.name}@{candidate.sha256}; observed "
+                f"{digest_now} with {len(matching)} matching name(s)"
+            )
+            return result
     # Defense in depth behind select_recent_green_units' name dedup: the gate
     # writes {name}.c per unit, so a duplicate name would silently overwrite
     # one unit's code with another's. Refuse loudly instead (review R2).
@@ -886,6 +942,19 @@ def run_assembly_gate(
                 )
             ]
             result["detail"] = (log or "").strip()[-1200:]
+            return result
+
+    if candidate is not None:
+        try:
+            digest_after = unit_artifact_sha256(candidate.directory)
+        except OSError as error:
+            digest_after = f"unreadable:{error}"
+        if digest_after != candidate.sha256:
+            result["stage"] = "candidate-integrity"
+            result["detail"] = (
+                f"candidate {candidate.name} changed during assembly: expected "
+                f"{candidate.sha256}, observed {digest_after}"
+            )
             return result
 
     result["stage"] = "pass"
@@ -986,6 +1055,7 @@ def record_gate_result(ledger_path: Path, result: dict[str, Any]) -> dict[str, A
         "stage": result.get("stage"),
         "conflict_count": len(result.get("conflicts") or []),
         "detail": (result.get("detail") or "")[:600],
+        "candidate": result.get("candidate"),
     }
     ledger["updated_at"] = now
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
