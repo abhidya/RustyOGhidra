@@ -483,3 +483,173 @@ def test_return_type_divergence_is_still_a_conflict_after_normalization():
     b = "extern undefined8 gnt4_PSMTXConcat_bl(float *a, float *b, float *out);\n"
     result = merge_headers([("unit-a", a), ("unit-b", b)])
     assert result.conflicts and result.conflicts[0]["class"] == CLASS_COLLISION_STUB
+
+
+# ---------------------------------------- guarded-macro divergence (review R1)
+# Adversarial-review finding: an `#ifndef`-guarded `#define` lives inside an
+# inner conditional block, which the merge treated as an anonymous chunk --
+# divergent guarded definitions were BOTH emitted with zero conflicts filed,
+# and the first unit's definition silently won at preprocess time.
+
+
+def _guarded_header(gc_u8_body: str) -> str:
+    return (
+        "#ifndef GNT4_SHIM_H\n"
+        "#define GNT4_SHIM_H\n"
+        "#include <stdbool.h>\n"
+        "typedef unsigned char undefined;\n"
+        "#ifndef GC_U8\n"
+        f"#define GC_U8(a) {gc_u8_body}\n"
+        "#endif\n"
+        "extern int zz_0066168_();\n"
+        "#endif /* GNT4_SHIM_H */\n"
+    )
+
+
+def test_guarded_macro_divergence_is_a_loud_conflict_never_first_wins():
+    """The review's exact repro: same inner `#ifndef GC_U8` guard, divergent
+    bodies. Must refuse to merge loudly -- never emit both blocks and let the
+    preprocessor pick the first unit's definition silently."""
+    a = _guarded_header("(*(unsigned char *)(unsigned int)(a))")
+    b = _guarded_header("(*(char *)(unsigned int)(a))")
+    result = merge_headers([("unit-a", a), ("unit-b", b)])
+    assert result.merged_text is None
+    gc = [c for c in result.conflicts if c["symbol"] == "GC_U8"]
+    assert gc, f"no GC_U8 conflict filed: {result.conflicts}"
+    assert gc[0]["units"] == ["unit-a", "unit-b"]
+
+
+def test_identical_guarded_macro_blocks_still_merge_to_one_copy():
+    a = _guarded_header("(*(unsigned char *)(unsigned int)(a))")
+    result = merge_headers([("unit-a", a), ("unit-b", a)])
+    assert result.conflicts == []
+    assert result.merged_text is not None
+    assert result.merged_text.count("#define GC_U8(a)") == 1
+
+
+def test_guarded_vs_plain_macro_definition_is_a_loud_conflict():
+    """One unit guards its GC_U8, the other defines it bare: emitting both
+    (guarded block + plain #define) is a redefinition whose winner depends on
+    emission order -- refuse loudly instead."""
+    a = _guarded_header("(*(unsigned char *)(unsigned int)(a))")
+    b = (
+        "#ifndef GNT4_SHIM_H\n#define GNT4_SHIM_H\n"
+        "#define GC_U8(a) (*(char *)(unsigned int)(a))\n"
+        "#endif /* GNT4_SHIM_H */\n"
+    )
+    result = merge_headers([("unit-a", a), ("unit-b", b)])
+    assert result.merged_text is None
+    assert any(c["symbol"] == "GC_U8" for c in result.conflicts)
+
+
+def test_leading_function_like_guarded_define_is_not_an_include_guard():
+    """Sub-bug: in a header with NO outer guard, a leading
+    `#ifndef X / #define X(...)` conditional definition was misread as the
+    include guard and the definition was silently DELETED from the merge.
+    An include guard's #define is object-like and empty; anything else is a
+    real conditional block whose content must survive."""
+    text = (
+        "#ifndef GC_U8\n"
+        "#define GC_U8(a) (*(unsigned char *)(unsigned int)(a))\n"
+        "#endif\n"
+    )
+    chunks = parse_header_chunks(text)
+    assert any("#define GC_U8" in c.text for c in chunks), (
+        "guarded GC_U8 definition was deleted by the include-guard heuristic"
+    )
+    # And the definition must reach the merged header, not vanish.
+    result = merge_headers([("unit-a", text)])
+    assert result.merged_text is not None
+    assert "#define GC_U8(a)" in result.merged_text
+
+
+def test_object_like_valued_leading_define_is_not_an_include_guard():
+    text = "#ifndef GC_NULL\n#define GC_NULL 0\n#endif\nextern int zz_a_();\n"
+    result = merge_headers([("unit-a", text)])
+    assert result.merged_text is not None
+    assert "#define GC_NULL 0" in result.merged_text
+
+
+def test_real_empty_include_guard_is_still_dropped():
+    chunks = parse_header_chunks(DOUBLE_HEADER)
+    assert not any("GNT4_SHIM_H" in c.text for c in chunks)
+
+
+# --------------------------------- cross-root name collision (review R2)
+# Adversarial-review finding: the same unit name present in BOTH roots
+# (scheduled once T3 moves artifacts from staging to port-units) was selected
+# twice; run_assembly_gate writes {name}.c per unit, so the newer artifact
+# silently overwrote the older and was compiled TWICE while the older's code
+# was absent from the tested composition.
+
+
+def test_same_unit_name_in_both_roots_dedups_and_verified_root_wins(tmp_path):
+    verified = tmp_path / "port-units"
+    staging = tmp_path / "port-units-staging"
+    _write_artifact(
+        verified, "auto-x", "2026-08-01T00:00:00Z",
+        unit_c="int fn_v(void)\n{\n  return 1;\n}\n",
+    )
+    _write_artifact(
+        staging, "auto-x", "2026-08-15T00:00:00Z",
+        unit_c="int fn_s(void)\n{\n  return 2;\n}\n",
+    )
+    picked = select_recent_green_units([verified, staging], None)
+    assert [u.name for u in picked] == ["auto-x"]
+    # Authority rule: the earlier root in the list (the caller passes the
+    # verified root first) wins over its staging copy -- even a NEWER one.
+    assert picked[0].directory == verified / "auto-x"
+
+
+def test_cross_root_duplicate_never_reaches_the_gate_twice(tmp_path):
+    verified = tmp_path / "port-units"
+    staging = tmp_path / "port-units-staging"
+    _write_artifact(
+        verified, "auto-x", "2026-08-01T00:00:00Z",
+        unit_c="int fn_v(void)\n{\n  return 1;\n}\n", exports=["fn_v"],
+    )
+    _write_artifact(
+        staging, "auto-x", "2026-08-15T00:00:00Z",
+        unit_c="int fn_s(void)\n{\n  return 2;\n}\n", exports=["fn_s"],
+    )
+    _write_artifact(
+        staging, "auto-y", "2026-08-16T00:00:00Z",
+        unit_c="int fn_y(void)\n{\n  return 3;\n}\n", exports=["fn_y"],
+    )
+    units = select_recent_green_units([verified, staging], None)
+    linked = {}
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        linked["c_files"] = list(c_files)
+        (workdir / ASSEMBLY_WASM).write_bytes(b"\x00asm")
+        return True, ""
+
+    result = run_assembly_gate(units, tmp_path / "work", fake_link, None)
+    assert result["passed"] is True
+    assert sorted(linked["c_files"]) == ["auto-x.c", "auto-y.c"]
+    # The verified artifact's code is what got compiled, not the staging copy.
+    assert (tmp_path / "work" / "auto-x.c").read_text() == (
+        "int fn_v(void)\n{\n  return 1;\n}\n"
+    )
+
+
+def test_gate_refuses_duplicate_unit_names_loudly(tmp_path):
+    """Defense in depth: if a duplicate-name selection ever reaches the gate,
+    it must refuse loudly, never overwrite one unit's .c with another's."""
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    _write_artifact(root_a, "auto-x", "2026-08-01T00:00:00Z")
+    _write_artifact(root_b, "auto-x", "2026-08-15T00:00:00Z")
+    units = (
+        select_recent_green_units([root_a], None)
+        + select_recent_green_units([root_b], None)
+    )
+    assert len(units) == 2  # deliberately bypassing selection-time dedup
+    linked = []
+    result = run_assembly_gate(
+        units, tmp_path / "work", lambda *a: linked.append(a) or (True, ""), None
+    )
+    assert result["passed"] is False
+    assert result["stage"] == "select"
+    assert linked == []
+    assert result["conflicts"] and result["conflicts"][0]["symbol"] == "auto-x"

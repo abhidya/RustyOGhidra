@@ -719,6 +719,31 @@ Two roles, one mechanism:
    definitions, layout-divergent macro use — with the compiler as arbiter
    instead of string comparison.
 
+**T2b review advisories (2026-08-20 adversarial review; recorded, not yet
+implemented).** The review's two required findings are fixed in code (guarded
+`#define` divergence refuses loudly + tightened include-guard heuristic;
+cross-root unit-name dedup with verified-root authority). Four advisories are
+parked here so they are not lost:
+
+- **allowed_extra union weakens the import gate cross-unit.** The gate's link
+  runner unions every unit's `allowed_extra_imports`
+  (`src/port_wasm_units.py:1095-1096`), so a symbol whitelisted by ONE unit
+  excuses an undefined import from ANY unit — laxer than the per-unit builds
+  that earned the greens. Tightening means attributing each undefined import
+  to the unit(s) that reference it.
+- **Import-gate link failures file one generic record.** When the
+  post-link import scan fails, the diagnostics reach
+  `conflicts_from_link_error` as prose, filing a single `link_failure` with
+  `symbol=None` instead of per-symbol records; the offending symbol names are
+  in the message and could be filed individually.
+- **`record_gate_result` is an unlocked read-modify-write.** Writes are
+  atomic, but a concurrent driver hook + manual CLI run is last-writer-wins:
+  one run's conflict records/counters can be lost. Low stakes while the CLI
+  is used rarely; a lock (or fold-on-read) fixes it if usage grows.
+- **`largest_n_passed` never decays.** It is a high-water mark by design;
+  after regressions it overstates current composability. Dashboards must read
+  `last_run` for current truth, `largest_n_passed` only as best-ever.
+
 ### 2.14 Queue ordering toward product gaps — G1, G2 [V4-2, new]
 
 The Tier-0 fixes (status header) corrected what the queue *contains*; this

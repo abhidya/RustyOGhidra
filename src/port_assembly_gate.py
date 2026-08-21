@@ -124,6 +124,14 @@ class HeaderChunk:
 
 _GUARD_OPEN = re.compile(r"#\s*ifndef\s+([A-Za-z_]\w*)\s*$")
 _DEFINE = re.compile(r"#\s*define\s+([A-Za-z_]\w*)")
+# An include guard's #define is object-like and EMPTY (`#define GNT4_SHIM_H`,
+# nothing after the name). A function-like or valued define under a leading
+# `#ifndef X` is the conditional-definition idiom, not a guard -- misreading
+# it as a guard silently DELETES the definition from the merge (review R1
+# sub-bug).
+_GUARD_DEFINE = re.compile(r"#\s*define\s+([A-Za-z_]\w*)\s*$")
+# Line-anchored: every macro DEFINED anywhere inside a conditional block.
+_DEFINE_IN_BLOCK = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)", re.M)
 _TYPEDEF_PAREN = re.compile(r"\(\s*\**\s*([A-Za-z_]\w*)\s*\)")
 
 
@@ -156,10 +164,11 @@ def _c_chunk_symbol(text: str) -> tuple[str, str | None]:
 def parse_header_chunks(text: str) -> list[HeaderChunk]:
     """Split a unit's gnt4_shim.h into declaration-level chunks.
 
-    The outer include guard (``#ifndef X`` immediately followed by
-    ``#define X``, and its matching ``#endif``) is dropped -- the merged
-    header carries its own guard. Inner conditional blocks are kept whole as
-    single chunks. Note the generated headers legitimately carry content
+    The outer include guard (``#ifndef X`` immediately followed by an
+    object-like EMPTY ``#define X``, and its matching ``#endif``) is dropped
+    -- the merged header carries its own guard. A function-like or valued
+    define after ``#ifndef X`` is a conditional definition, never a guard.
+    Inner conditional blocks are kept whole as single chunks. Note the generated headers legitimately carry content
     AFTER the guard's #endif (the auto-generated tail), so parsing continues
     past it.
     """
@@ -183,7 +192,7 @@ def parse_header_chunks(text: str) -> list[HeaderChunk]:
                 while peek < len(lines) and not lines[peek].strip():
                     peek += 1
                 if peek < len(lines):
-                    define = _DEFINE.match(lines[peek].strip())
+                    define = _GUARD_DEFINE.match(lines[peek].strip())
                     if define and define.group(1) == guard_open.group(1):
                         guard_macro = guard_open.group(1)
                         guard_depth = 1
@@ -306,6 +315,13 @@ def merge_headers(headers: list[tuple[str, str]]) -> MergeResult:
     ``headers`` is ``[(unit_name, header_text), ...]``. Identical normalized
     declarations of a symbol dedup to one copy; divergent declarations are
     contested conflicts and fail the merge loudly (no silent winner).
+
+    Macros defined INSIDE inner conditional blocks (``#ifndef GC_U8`` /
+    ``#define GC_U8(...)`` / ``#endif``) get the same treatment: identical
+    blocks dedup, but two units guarding divergent definitions of the same
+    macro -- or one guarding and one defining it bare -- refuse the merge
+    loudly. Before this check (review R1), both blocks were emitted and the
+    first unit's definition silently won at preprocess time.
     """
     # symbol key -> first-seen chunk; variants tracked for conflict records.
     order: list[str] = []
@@ -315,11 +331,24 @@ def merge_headers(headers: list[tuple[str, str]]) -> MergeResult:
     kinds: dict[str, str] = {}
     anonymous: list[HeaderChunk] = []
     seen_anonymous: set[str] = set()
+    # macro name -> {normalized block text: original block text} for defines
+    # living inside conditional chunks; the divergence check below treats them
+    # exactly like keyed symbols.
+    guarded_defines: dict[str, dict[str, str]] = {}
+    guarded_units: dict[str, dict[str, list[str]]] = {}
 
     for unit_name, text in headers:
         for chunk in parse_header_chunks(text):
             if chunk.symbol is None or chunk.kind == "include":
                 key = chunk.normalized
+                if chunk.kind == "conditional":
+                    for macro in _DEFINE_IN_BLOCK.findall(chunk.text):
+                        guarded_defines.setdefault(macro, {}).setdefault(
+                            key, chunk.text
+                        )
+                        guarded_units.setdefault(macro, {}).setdefault(
+                            key, []
+                        ).append(unit_name)
                 if key not in seen_anonymous:
                     seen_anonymous.add(key)
                     anonymous.append(chunk)
@@ -361,6 +390,40 @@ def merge_headers(headers: list[tuple[str, str]]) -> MergeResult:
                 implicated,
                 variant_by_unit,
                 f"{len(variants[key])} divergent {kind} declarations of {symbol}",
+            )
+        )
+    # Guarded-define divergence (review R1): a macro #define'd inside inner
+    # conditional blocks conflicts loudly when (a) two units guard divergent
+    # definitions of it, or (b) it is ALSO defined as a plain (unguarded)
+    # macro chunk -- in either case emitting the variants would hand the
+    # preprocessor a silent first-wins pick.
+    for macro in sorted(guarded_defines):
+        block_variants = guarded_defines[macro]
+        plain_key = f"macro:{macro}"
+        if len(block_variants) <= 1 and plain_key not in variants:
+            continue
+        implicated: list[str] = []
+        variant_by_unit: dict[str, str] = {}
+        for normalized, units in guarded_units[macro].items():
+            implicated.extend(units)
+            for unit in units:
+                variant_by_unit.setdefault(unit, block_variants[normalized])
+        if plain_key in variants:
+            for normalized, units in unit_by_variant[plain_key].items():
+                implicated.extend(units)
+                for unit in units:
+                    variant_by_unit.setdefault(unit, normalized)
+        conflicts.append(
+            _conflict_record(
+                macro,
+                classify_conflict(macro, "macro", list(block_variants)),
+                sorted(set(implicated)),
+                variant_by_unit,
+                f"{macro} is #define'd inside {len(block_variants)} divergent "
+                "conditional block(s)"
+                + (" and as a plain macro" if plain_key in variants else "")
+                + "; emitting them would let the first definition win "
+                "silently at preprocess time",
             )
         )
     if conflicts:
@@ -641,8 +704,19 @@ def select_recent_green_units(
 ) -> list[UnitArtifact]:
     """The last N green/staged unit artifacts across the given roots, oldest
     first (stable link order), recency by provenance generated_at. n=None
-    selects everything (the backfill sweep)."""
+    selects everything (the backfill sweep).
+
+    ``roots`` is in AUTHORITY ORDER: when the same unit name appears in more
+    than one root -- the scheduled T3 scenario where an artifact has been
+    promoted from staging to the verified root but the staging copy still
+    exists -- the EARLIEST root wins, regardless of which copy is newer. The
+    caller passes the verified root (``port-units``) before staging, so the
+    verified artifact always shadows its staging twin. Without this dedup
+    (review R2) both copies were selected, the gate wrote ``{name}.c`` twice
+    (newer silently overwriting older), and the composition compiled one
+    unit's code twice while the other's was silently absent."""
     artifacts: list[UnitArtifact] = []
+    seen_names: set[str] = set()
     for root in roots:
         if not root.is_dir():
             continue
@@ -650,8 +724,10 @@ def select_recent_green_units(
             if not directory.is_dir():
                 continue
             artifact = load_unit_artifact(directory)
-            if artifact is not None:
-                artifacts.append(artifact)
+            if artifact is None or artifact.name in seen_names:
+                continue
+            seen_names.add(artifact.name)
+            artifacts.append(artifact)
     artifacts.sort(key=lambda a: (a.generated_at, a.name))
     if n is not None and n > 0:
         artifacts = artifacts[-n:]
@@ -712,6 +788,32 @@ def run_assembly_gate(
         "stage": "merge",
         "detail": "",
     }
+    # Defense in depth behind select_recent_green_units' name dedup: the gate
+    # writes {name}.c per unit, so a duplicate name would silently overwrite
+    # one unit's code with another's. Refuse loudly instead (review R2).
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        result["stage"] = "select"
+        result["conflicts"] = [
+            _conflict_record(
+                name,
+                CLASS_COLLISION_STUB,
+                [
+                    f"{unit.name} ({unit.directory})"
+                    for unit in units
+                    if unit.name == name
+                ],
+                {},
+                f"unit name {name} selected more than once; compiling it "
+                "twice would silently drop one artifact's code",
+            )
+            for name in duplicate_names
+        ]
+        result["detail"] = (
+            "selection contains duplicate unit name(s): "
+            + ", ".join(duplicate_names)
+        )
+        return result
     headers = [
         (unit.name, (unit.directory / "gnt4_shim.h").read_text(encoding="utf-8-sig"))
         for unit in units
