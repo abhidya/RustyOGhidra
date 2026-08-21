@@ -16,6 +16,7 @@ import pytest
 from src.port_assembly_gate import prelude_region
 from src.port_fp_transform import (
     CURRENT,
+    comma_operand_sites,
     HELPER_DEFINITION,
     HELPER_NAME,
     RESTAMP,
@@ -24,6 +25,7 @@ from src.port_fp_transform import (
     TRANSFORM_VERSION,
     census_text,
     dataflow_residual_risk,
+    transform_record,
     ensure_bitcast_helper,
     restamp_in_place,
     rewrite_fp_reinterpret,
@@ -197,6 +199,35 @@ def test_comment_between_cast_and_call():
     assert HELPER_NAME in out
 
 
+def test_newline_between_cast_and_operand_preserves_line_count():
+    # Review M2: the gap between the cast's ')' and the operand start.
+    for src in (
+        "d = (double)\nCONCAT44(a, b) - M;",
+        "d = (double)\n(CONCAT44(a, b) ^ K);",
+        "d = (\ndouble)\nCONCAT44(a, b) - M;",
+    ):
+        out, sites = rewrite_fp_reinterpret(src)
+        assert sites == 1, src
+        assert out.count("\n") == src.count("\n"), src
+
+
+def test_comma_operand_is_refused_and_flagged():
+    # Review M3: (double)(CONCAT44(a,b), other) casts `other` -- a rewrite
+    # would change semantics. Refused; flagged residual-risk style.
+    src = "d = (double)(CONCAT44(a, b), other);"
+    out, sites = rewrite_fp_reinterpret(src)
+    assert sites == 0
+    assert out == src
+    assert comma_operand_sites(src) == 1
+    counts = census_text(src)
+    assert counts["comma_operand_sites"] == 1
+    assert counts["double_cast_sites"] == 0
+    # And it lands in the transform record's residual-risk stamp.
+    _blocks, record = transform_record([src])
+    assert record["sites"] == 0
+    assert record["d5_residual_risk"] == 1
+
+
 # ------------------------------------------------------------ F-D5-2 guard
 
 
@@ -229,14 +260,45 @@ def _provenance(version: int, sha: str) -> dict:
     }
 
 
-def test_staleness_no_transform_key_is_stale():
+def test_staleness_no_transform_key_is_stale_when_non_identity():
     assert transform_staleness({}, "abc") == STALE
     assert transform_staleness(None, "abc") == STALE
     assert transform_staleness({"transform": {"name": "other"}}, "x") == STALE
+    assert (
+        transform_staleness({"extracted_sha256": "old"}, "different") == STALE
+    )
+
+
+def test_staleness_pre_d5_identity_artifact_is_restamp_with_added_block():
+    # Review M1 / D5-6 identity carve-out: a pre-D5 SITE-FREE artifact
+    # (knockback-core, collision-core) has extracted == current transformed
+    # output; its verdict stands and restamp ADDS the identity block.
+    prov = {
+        "extracted_sha256": "same",
+        "extractions": [{"file": "x", "start": 1, "end": 2}, {"file": "y", "start": 3, "end": 4}],
+    }
+    assert transform_staleness(prov, "same") == RESTAMP
+    restamp_in_place(prov)
+    block = prov["transform"]
+    assert block["name"] == TRANSFORM_NAME
+    assert block["version"] == TRANSFORM_VERSION
+    assert block["sites"] == 0
+    assert block["sites_per_block"] == [0, 0]
+    assert block["transformed_sha256"] == "same"
+    assert transform_staleness(prov, "same") == CURRENT
 
 
 def test_staleness_current_version_is_current():
     assert transform_staleness(_provenance(TRANSFORM_VERSION, "abc"), "zzz") == CURRENT
+
+
+def test_staleness_future_version_is_stale_not_trusted():
+    # Review M4 nit: a rolled-back driver must never trust a future-grammar
+    # artifact silently.
+    assert (
+        transform_staleness(_provenance(TRANSFORM_VERSION + 1, "abc"), "abc")
+        == STALE
+    )
 
 
 def test_staleness_old_version_matching_output_is_restamp_in_place():

@@ -211,7 +211,9 @@ def _match_site(text: str, i: int) -> dict[str, Any] | None:
             "end": end,
             "form": form,
             "operand": operand,
-            "cast_newlines": "\n" * text.count("\n", i, cast_end),
+            # Count newlines up to the OPERAND start, not merely the cast's
+            # closing paren [review M2]: "(double)\nCONCAT44" keeps its line.
+            "cast_newlines": "\n" * text.count("\n", i, m),
             "hi": re.sub(r"\s+", " ", hi),
         }
 
@@ -236,7 +238,17 @@ def _match_site(text: str, i: int) -> dict[str, Any] | None:
             if p < len(text) and text[p] == "(":
                 q = _match_paren(text, m)
                 if q > 0:
-                    return _site("paren", p, text[m + 1 : q - 1], q)
+                    inner = text[m + 1 : q - 1]
+                    if _has_top_level_comma(inner):
+                        # Comma OPERAND [review M3]: in
+                        # (double)(CONCAT44(a,b), other) the cast applies to
+                        # `other` via the comma operator -- any rewrite here
+                        # is semantics-changing. Refused, and flagged
+                        # residual-risk style so a first-ever occurrence
+                        # pages instead of silently building (zero in the
+                        # fleet today).
+                        return _site("paren_comma", p, inner, q)
+                    return _site("paren", p, inner, q)
     return None
 
 
@@ -326,13 +338,14 @@ def _rewrite_once(text: str) -> tuple[str, int]:
         site = _match_site(text, i)
         if site is None:
             return None
-        operand = site["operand"]
-        if site["form"] == "paren" and _has_top_level_comma(operand):
-            # A top-level comma operator inside the reused parens would split
-            # the helper's argument list; keep the original grouping intact.
-            operand = "(" + operand + ")"
+        if site["form"] == "paren_comma":
+            # Refused, never rewritten [review M3]; counted by
+            # comma_operand_sites() into the residual-risk stamp.
+            return site["end"]
         out.append(text[consumed:i])
-        out.append(HELPER_NAME + site["cast_newlines"] + "(" + operand + ")")
+        out.append(
+            HELPER_NAME + site["cast_newlines"] + "(" + site["operand"] + ")"
+        )
         consumed = site["end"]
         count += 1
         return site["end"]
@@ -398,6 +411,15 @@ def dataflow_residual_risk(text: str) -> int:
     return count
 
 
+def comma_operand_sites(text: str) -> int:
+    """Grammar-G paren-form matches whose operand carries a top-level comma
+    operator [review M3]: the cast really applies to the comma's RIGHT
+    operand, so the transform refuses them; any occurrence is stamped into
+    the residual risk so the unit pages instead of silently building.
+    Zero in the fleet today."""
+    return sum(1 for site in scan_sites(text) if site["form"] == "paren_comma")
+
+
 # ---------------------------------------------------------------------------
 # Provenance semantics (D5-4).
 
@@ -427,8 +449,11 @@ def transform_record(pre_blocks: list[str]) -> tuple[list[str], dict[str, Any]]:
         "transformed_sha256": hashlib.sha256(
             combined.encode("utf-8")
         ).hexdigest(),
-        # F-D5-2 guard verdict on the post-transform text.
-        "d5_residual_risk": dataflow_residual_risk(combined),
+        # F-D5-2-style guard verdict on the post-transform text: the
+        # dataflow-separated shape grammar G cannot see, plus the refused
+        # comma-operand shape it must not rewrite [review M3].
+        "d5_residual_risk": dataflow_residual_risk(combined)
+        + comma_operand_sites(combined),
     }
     return post_blocks, record
 
@@ -445,19 +470,35 @@ def transform_staleness(
 
     An artifact is D5-stale iff it has no transform key (pre-D5 artifact)
     OR its transform version is older AND the current transform's output
-    differs from the recorded ``transformed_sha256``. An old-version
-    artifact whose bytes the current transform reproduces is RESTAMP: the
-    version is bumped in place, no rebuild, no revocation (the identity
-    case).
+    differs from the recorded ``transformed_sha256``. An artifact whose
+    bytes the current transform reproduces is RESTAMP: the version (or, for
+    a pre-D5 artifact, the whole block) is stamped in place, no rebuild, no
+    revocation -- the identity case. The D5-6 identity carve-out applies to
+    pre-D5 artifacts too [review M1]: a site-free pre-D5 artifact's
+    ``extracted_sha256`` IS the current transform's output, so its verdict
+    stands (this is what keeps the oracle-green site-free PoC units --
+    knockback-core, collision-core -- out of the revocation set).
+
+    A version NEWER than this code's is STALE, not CURRENT [review M4 nit]:
+    under a rolled-back driver a future-grammar artifact must never be
+    silently trusted -- the mix pages through the census instead.
     """
     block = (provenance or {}).get("transform")
     if not isinstance(block, dict) or block.get("name") != TRANSFORM_NAME:
+        if (
+            current_transformed_sha256
+            and (provenance or {}).get("extracted_sha256")
+            == current_transformed_sha256
+        ):
+            return RESTAMP  # pre-D5 identity artifact: stands, gains a block
         return STALE
     try:
         version = int(block.get("version") or 0)
     except (TypeError, ValueError):
         return STALE
-    if version >= TRANSFORM_VERSION:
+    if version > TRANSFORM_VERSION:
+        return STALE  # future-grammar artifact under a rolled-back driver
+    if version == TRANSFORM_VERSION:
         return CURRENT
     if block.get("transformed_sha256") == current_transformed_sha256:
         return RESTAMP
@@ -465,10 +506,29 @@ def transform_staleness(
 
 
 def restamp_in_place(provenance: dict[str, Any]) -> dict[str, Any]:
-    """Apply the RESTAMP consequence: bump the version on the artifact's
-    existing transform block. Caller (the migration step) must only invoke
-    this after ``transform_staleness`` returned RESTAMP."""
-    provenance["transform"]["version"] = TRANSFORM_VERSION
+    """Apply the RESTAMP consequence in place. Caller (the migration step)
+    must only invoke this after ``transform_staleness`` returned RESTAMP.
+
+    Two variants [review M1]:
+    - existing block, older version: bump the version;
+    - pre-D5 artifact (no block): add the identity block. Sites are 0 by
+      construction -- a no-key artifact only ever classifies RESTAMP via
+      the identity carve-out (extracted == transformed), i.e. the transform
+      changes nothing. d5_residual_risk 0 rides on the same fact plus the
+      census's standing fleet-wide zero for the dataflow-separated shape.
+    """
+    block = provenance.get("transform")
+    if isinstance(block, dict) and block.get("name") == TRANSFORM_NAME:
+        block["version"] = TRANSFORM_VERSION
+        return provenance
+    provenance["transform"] = {
+        "name": TRANSFORM_NAME,
+        "version": TRANSFORM_VERSION,
+        "sites": 0,
+        "sites_per_block": [0] * len(provenance.get("extractions") or []),
+        "transformed_sha256": provenance.get("extracted_sha256"),
+        "d5_residual_risk": 0,
+    }
     return provenance
 
 
@@ -542,11 +602,17 @@ def _other_cast_sites(text: str) -> int:
 def census_text(text: str) -> dict[str, int]:
     """The D5-1 categories for one text."""
     sites = scan_sites(text)
+    rewritable = [s for s in sites if s["form"] != "paren_comma"]
     return {
         "concat44_calls": _count_calls(text, "CONCAT44"),
-        "double_cast_sites": len(sites),
-        "xor_outside_sites": sum(1 for s in sites if s["form"] == "paren"),
-        "non_magic_hi_sites": sum(1 for s in sites if s["hi"] != _MAGIC_HI),
+        "double_cast_sites": len(rewritable),
+        "xor_outside_sites": sum(
+            1 for s in rewritable if s["form"] == "paren"
+        ),
+        "non_magic_hi_sites": sum(
+            1 for s in rewritable if s["hi"] != _MAGIC_HI
+        ),
+        "comma_operand_sites": len(sites) - len(rewritable),
         "other_cast_sites": _other_cast_sites(text),
         "dataflow_separated": dataflow_residual_risk(text),
         "sub84_calls": _count_calls(text, "SUB84"),
@@ -598,8 +664,8 @@ def run_census(repo_root: Path, as_json: bool = False) -> str:
         lines.append(f"== {label}: {data['files']} files ==")
         for key in (
             "concat44_calls", "double_cast_sites", "xor_outside_sites",
-            "non_magic_hi_sites", "other_cast_sites", "dataflow_separated",
-            "sub84_calls", "helper_calls",
+            "non_magic_hi_sites", "comma_operand_sites", "other_cast_sites",
+            "dataflow_separated", "sub84_calls", "helper_calls",
         ):
             lines.append(f"  {key}: {totals.get(key, 0)}")
         offenders = {

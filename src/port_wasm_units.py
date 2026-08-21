@@ -2012,11 +2012,11 @@ class WasmUnitDriver:
             )
             return self._fail(
                 state, record, name,
-                "D5 residual-risk guard (F-D5-2): "
-                f"{materialized.transform['d5_residual_risk']} dataflow-"
-                "separated CONCAT44->(double) site(s) that grammar G cannot "
-                "rewrite; blocked pending a dataflow rule or manual "
-                "disposition",
+                "D5 residual-risk guard (F-D5-2 / review M3): "
+                f"{materialized.transform['d5_residual_risk']} CONCAT44 "
+                "site(s) the transform cannot soundly rewrite (dataflow-"
+                "separated and/or comma-operand shapes); blocked pending a "
+                "grammar extension or manual disposition",
                 stage="extract", result=RESULT_GATE_FAILED,
             )
 
@@ -2408,6 +2408,12 @@ class WasmUnitDriver:
                     )
                 record["registry_deviations"] = deviations
                 self._save_state(state)
+            # D5 [review M4]: re-ensure the seed-tier helper on EVERY
+            # model-returned header -- absence becomes impossible rather than
+            # loud-then-model-defined (closes the F-D5-4 "model drops or
+            # redefines the helper" channel deterministically).
+            if materialized.transform["sites"]:
+                fixed = ensure_bitcast_helper(fixed)
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             # Section 2.3 [V4-4]: snapshots are ATTEMPT-scoped
             # (header-attempt{A}-iter{I}.h) so a later attempt can never
@@ -3444,7 +3450,15 @@ class WasmUnitDriver:
         """One offline replay of the compile-fix loop: extraction, (deep-copied)
         registry augmentation, build + LLM rounds with the stage-aware stuck
         rule. Touches only its own workdir -- no state, no journal, no
-        registry writes, no verdicts."""
+        registry writes, no verdicts.
+
+        D5 migration-step-4 caution (reviewer): this replay reads the unit's
+        queue ``header_seed`` -- the shared INTEGER seed lineage -- never a
+        fork unit's committed union-macro header. Replaying a T2b
+        double-cohort unit here therefore exercises the canonical
+        integer-seed + transform world, which is exactly what step 4's
+        re-materialization wants; it must never be read as evidence about
+        the unit's historical union-header build."""
         name = unit["name"]
         workdir = self.work_root / "_f4" / name
         workdir.mkdir(parents=True, exist_ok=True)
@@ -3504,6 +3518,8 @@ class WasmUnitDriver:
                     break
             if fixed is None:
                 return False, "no new header in replay round"
+            if materialized.transform["sites"]:  # D5 [review M4]
+                fixed = ensure_bitcast_helper(fixed)
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             header_applied = True
         return False, f"not linked: {summarise_build_error(build_error)[:300]}"
