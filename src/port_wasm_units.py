@@ -58,6 +58,21 @@ from src.port_assembly_gate import (
     select_recent_green_units,
 )
 from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
+from src.port_knowledge_registry import (
+    REGISTRY_RELPATH,
+    TIER_COMPILE_ONLY,
+    TIER_ORACLE_GREEN,
+    augment_seed,
+    check_survival,
+    harvest_unit,
+    is_holdout,
+    load_registry,
+    prelude_prototypes,
+    registry_version,
+    relevant_delta,
+    save_registry,
+    unit_symbol_set,
+)
 from src.port_driver import (
     EXIT_NO_WORK,
     EXIT_PROGRESSED,
@@ -185,6 +200,18 @@ Function signatures must be read off the CALL SITES in the .c file, which is
 verbatim decompiler output and authoritative. If a call passes 16 arguments,
 declare 16 parameters; if a result is assigned, the return type must not be
 void. Do not invent an arity or a return type that disagrees with the caller.
+
+The header may carry two kinds of REGISTRY blocks from previously ported
+units of this same program (design section 2.11):
+
+- Lines in or marked by "REGISTRY (authoritative)" were established by
+  BEHAVIOURALLY-VERIFIED units of this same program. Do not alter them --
+  adapt your other declarations instead.
+- The commented block marked "REGISTRY (advisory)" holds typings that
+  previous units of this program merely COMPILED with. Verify each against
+  THIS unit's use sites before adopting it; you are free to disagree -- a
+  reasoned disagreement is wanted data. Never adopt an advisory line that
+  contradicts what this .c file's own use sites require.
 
 Output the COMPLETE corrected gnt4_shim.h in a single ```c code block. No other text
 is used by the pipeline."""
@@ -496,12 +523,22 @@ def is_stuck(
 # reworded constraint. Pure typo/whitespace fixes that cannot change model
 # behaviour do not count. Bumping it is a world-change: every zero-delta red
 # becomes schedulable again, so bump deliberately, never casually.
-PROMPT_VERSION = 1
+# v2 (T2c): SYSTEM_PROMPT gained the registry authoritative/advisory block
+# rules -- a semantic change by the bump rule.
+PROMPT_VERSION = 2
 
-# Knowledge-registry version component. The registry does not exist until T2c
-# (design section 2.11); a constant 0 keeps the world-hash shape stable so
-# verdicts recorded now stay comparable when the registry lands.
-REGISTRY_VERSION = 0
+
+def registry_version_component(repo_root: Path) -> int:
+    """The knowledge registry's monotonic version counter (design section
+    2.11), read from the tracked registry file. Absent file => 0, keeping the
+    world-hash shape stable with pre-T2c verdicts. An unreadable registry
+    raises in load_registry; HERE it degrades to 0 -- the gate must not take
+    the selector down, and a corrupt registry surfaces loudly on the
+    harvest/augment paths that actually need its content."""
+    try:
+        return registry_version(load_registry(Path(repo_root) / REGISTRY_RELPATH))
+    except (ValueError, OSError):
+        return 0
 
 
 def serving_config_hash(model: str, context_length: int, timeout: int) -> str:
@@ -586,7 +623,7 @@ def compute_world_version(repo_root: Path, model_config: Any) -> dict[str, str]:
         ).hexdigest(),
         "driver_rev": driver_git_rev(),
         "prompt_version": str(PROMPT_VERSION),
-        "registry_version": str(REGISTRY_VERSION),
+        "registry_version": str(registry_version_component(repo_root)),
     }
 
 
@@ -692,7 +729,15 @@ class WasmUnitDriver:
         # World-version (section 2.8 [V4-3]): computed once per run -- the
         # serving config, toolchain, driver rev and prompt version cannot
         # change under a running driver, and git/emsdk reads are not free.
+        # The REGISTRY component is the exception: this driver's own harvests
+        # bump it mid-run (every green re-opens the reds its symbols touch),
+        # so _world_version refreshes it from the file, mtime-cached.
         self._world_version_cache: dict[str, str] | None = None
+        # Knowledge registry (section 2.11, T2c): tracked in-repo next to the
+        # queue files (the [V4-8] gitignore negation exception makes the path
+        # trackable inside the wholesale-ignored generated dir).
+        self.registry_path = self.repo_root / REGISTRY_RELPATH
+        self._registry_cache: tuple[float, dict[str, Any]] | None = None
         # product_priority sidecar (section 2.14 [V4-2]). Lives in the tracked
         # data dir, NOT under generated/finish-game-port/ (that directory is
         # wholesale-gitignored in GotYaForce, .gitignore:63). Absent file =>
@@ -759,7 +804,34 @@ class WasmUnitDriver:
             self._world_version_cache = compute_world_version(
                 self.repo_root, self._model_config
             )
-        return self._world_version_cache
+        # Registry component stays live: this run's own greens bump it.
+        world = dict(self._world_version_cache)
+        world["registry_version"] = str(registry_version(self._registry()))
+        return world
+
+    def _registry(self) -> dict[str, Any]:
+        """The knowledge registry, mtime-cached (read per selector pass over
+        1,396 units; re-read only when the file actually changed)."""
+        try:
+            mtime = self.registry_path.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+        if self._registry_cache is None or self._registry_cache[0] != mtime:
+            try:
+                self._registry_cache = (mtime, load_registry(self.registry_path))
+            except (ValueError, OSError) as error:
+                # A corrupt registry must not take the driver down; it
+                # surfaces as an event and the run proceeds registry-less
+                # (advisory means losing it costs warmth, never correctness).
+                self.events.emit("registry_unreadable", error=str(error)[:400])
+                from src.port_knowledge_registry import empty_registry
+
+                self._registry_cache = (mtime, empty_registry())
+        return self._registry_cache[1]
+
+    def _save_registry(self, registry: dict[str, Any]) -> None:
+        save_registry(self.registry_path, registry)
+        self._registry_cache = None  # force re-read; mtime moved
 
     def _unit_priority(self, name: str) -> int:
         """product_priority from the sidecar (section 2.14): higher serves
@@ -849,6 +921,14 @@ class WasmUnitDriver:
                 "units_known": len(units),
                 "model_requests_total": sum(
                     record.get("model_requests", 0) for record in units.values()
+                ),
+                # Section 4 registry rows (T2c): version for delta-watching,
+                # contested count for the >5%-of-dat_typing page threshold.
+                "registry_version": registry_version(self._registry()),
+                "registry_contested": sum(
+                    1
+                    for entry in (self._registry().get("entries") or {}).values()
+                    if entry.get("contested")
                 ),
             },
             "queue": [
@@ -1282,16 +1362,24 @@ class WasmUnitDriver:
          creationflags=NO_WINDOW)
 
     def _commit_unit(
-        self, name: str, summary: str, *, staging: bool = False
+        self,
+        name: str,
+        summary: str,
+        *,
+        staging: bool = False,
+        extra_paths: list[str] | None = None,
     ) -> tuple[str | None, bool, str]:
         """git add + commit + push the unit's artifact dir. Returns
-        (commit_sha or None, pushed, detail)."""
+        (commit_sha or None, pushed, detail). ``extra_paths`` ride the SAME
+        commit (T2c: the harvested knowledge registry lands with the unit
+        that produced it -- one push, G3-preserving)."""
         rel = (
             f"research/decomp/port-units-staging/{name}"
             if staging
             else f"research/decomp/port-units/{name}"
         )
-        added = self._git_runner("add", rel)
+        paths = [rel, *(extra_paths or [])]
+        added = self._git_runner("add", *paths)
         if added.returncode != 0:
             return None, False, (added.stdout + added.stderr)[-400:]
         message = (
@@ -1299,7 +1387,7 @@ class WasmUnitDriver:
             if staging
             else f"port: {name} wasm unit green (oracle {summary})"
         )
-        committed = self._git_runner("commit", "-m", message, "--", rel)
+        committed = self._git_runner("commit", "-m", message, "--", *paths)
         if committed.returncode != 0:
             return None, False, (committed.stdout + committed.stderr)[-400:]
         sha = ""
@@ -1375,12 +1463,80 @@ class WasmUnitDriver:
                 state, record, name, f"header seed: {error}",
                 stage="header-seed", result=RESULT_RETRYABLE,
             )
+
+        # 2b. knowledge-registry augmentation (section 2.11, T2c [V4-1/V4-5]).
+        # The unit's symbol set is recorded regardless (the section-2.8
+        # relevant-delta gate needs it on reds), as are registry_version_used,
+        # the holdout flag (F6) and the prompt version this attempt ran under.
+        # ADVISORY BOUNDARY: augmentation only rewrites the STARTING header --
+        # it never touches verdicts, never suppresses a conflict, and a
+        # holdout unit starts from the cold seed untouched. Any registry
+        # fault degrades to a cold seed + event; warmth is optional,
+        # correctness is not.
+        exports = unit["exported_functions"]
+        symbols = unit_symbol_set(unit_c, exports)
+        record["symbol_set"] = sorted(symbols)
+        record["prompt_version"] = PROMPT_VERSION
+        holdout = is_holdout(name)
+        record["registry_holdout"] = holdout
+        authoritative_injected: list[dict[str, Any]] = []
+        advisory_injected_count = 0
+        registry = self._registry()
+        record["registry_version_used"] = registry_version(registry)
+        if not holdout and registry.get("entries"):
+            try:
+                prelude_decls = prelude_prototypes(prelude)
+                augmented = augment_seed(
+                    registry,
+                    unit_name=name,
+                    seed_text=header,
+                    symbols=symbols,
+                    prelude_declarations=prelude_decls,
+                )
+                header = augmented.header_text
+                authoritative_injected = augmented.authoritative
+                advisory_injected_count = len(augmented.advisory)
+                if augmented.registry_changed:
+                    # Prelude-vs-registry prototype disagreements: recorded on
+                    # the entry as pending conflicts -- data, surfaced, never
+                    # an injection (the prelude outranks a sibling's guess).
+                    self._save_registry(registry)
+                    for pending in augmented.pending_conflicts:
+                        self.events.emit(
+                            "registry_conflict",
+                            unit=name,
+                            key=pending.get("key"),
+                            symbol=pending.get("symbol"),
+                            entry_kind=pending.get("kind"),
+                            pending=True,
+                        )
+                if augmented.injected_any:
+                    (workdir / "seed-augmented.h").write_text(
+                        header, encoding="utf-8", newline="\n"
+                    )
+                    self.events.emit(
+                        "registry_injected",
+                        unit=name,
+                        registry_version=record["registry_version_used"],
+                        authoritative=len(authoritative_injected),
+                        advisory=advisory_injected_count,
+                        skipped_contested=len(augmented.skipped_contested),
+                    )
+            except Exception as error:  # noqa: BLE001 - warmth is optional
+                self.events.emit(
+                    "registry_augment_error", unit=name, error=str(error)[:400]
+                )
+                header = header_seed.read_text(encoding="utf-8")
+                authoritative_injected = []
+        self._save_state(state)
+        # The (augmented) seed is what the harvest diffs the winning header
+        # against: anything already in it is seed-inherited, never harvested.
+        augmented_seed_text = header
         (workdir / "gnt4_shim.h").write_text(header, encoding="utf-8", newline="\n")
 
         # 3. build + LLM compile-fix loop (header-only edits; depth capped by
         #    OGHIDRA_PORT_MAX_ITERS per section 2.1, stage-aware stuck-abort
         #    per section 2.2, round-level malformed replies per section 2.5)
-        exports = unit["exported_functions"]
         model_used: str | None = None
         iterations = 0
         linked = False
@@ -1399,6 +1555,9 @@ class WasmUnitDriver:
         # recovered round (header applied) resets the consecutive count.
         consecutive_no_header = 0
         no_header_shapes: list[str] = []
+        # Symbols already paged as registry deviations (one event per symbol
+        # per attempt; the model re-emits the whole header every round).
+        reported_deviations: set[str] = set()
         current_header_path = str(header_seed)
         # Per-round memory (section 2.3 [V4-4]): stage, error count, header
         # path, plus the NORMALIZED DIAGNOSTIC SET and its fingerprint --
@@ -1533,6 +1692,31 @@ class WasmUnitDriver:
                     )
                 continue
             consecutive_no_header = 0
+            # Section 2.11 survival check [V4-6]: SEMANTIC (normalized token
+            # sequences on re-parse), and applied ONLY to oracle_green
+            # authoritative entries -- advisory entries are free to be
+            # ignored; that is their point [V4-1]. A deviation never aborts
+            # the round (the header may still compile): it is recorded, and
+            # if the unit goes green with it, harvest turns it into a
+            # conflict record.
+            if authoritative_injected:
+                deviations = check_survival(authoritative_injected, fixed)
+                for deviation in deviations:
+                    if deviation.get("symbol") in reported_deviations:
+                        continue
+                    reported_deviations.add(deviation.get("symbol"))
+                    self.events.emit(
+                        "registry_deviation",
+                        unit=name,
+                        iteration=iteration,
+                        key=deviation.get("key"),
+                        symbol=deviation.get("symbol"),
+                        entry_kind=deviation.get("kind"),
+                        expected=deviation.get("expected"),
+                        found=deviation.get("found"),
+                    )
+                record["registry_deviations"] = deviations
+                self._save_state(state)
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             # Section 2.3 [V4-4]: snapshots are ATTEMPT-scoped
             # (header-attempt{A}-iter{I}.h) so a later attempt can never
@@ -1602,6 +1786,16 @@ class WasmUnitDriver:
             "verified": not compile_only,
             "tier": "compile_only" if compile_only else "oracle_green",
             "allowed_extra_imports": unit.get("allowed_extra_imports") or [],
+            # F6 provenance: which registry the unit started warm from (or
+            # that it was a holdout and started cold).
+            "registry": {
+                "version_used": record.get("registry_version_used", 0),
+                "holdout": record.get("registry_holdout", False),
+                "authoritative_injected": [
+                    r.get("symbol") for r in authoritative_injected
+                ],
+                "advisory_injected": advisory_injected_count,
+            },
             "oracle": (
                 {"type": "compile_only", "summary": summary}
                 if compile_only
@@ -1613,8 +1807,65 @@ class WasmUnitDriver:
             ),
         }
         atomic_write_json(artifact_dir / "provenance.json", provenance)
+        # 5b. registry harvest (section 2.11, T2c [V4-1]): mechanical, no LLM.
+        # The unit's own decisions (diffed against the AUGMENTED seed, minus
+        # callee stubs) enter the registry at the unit's tier; the unit's
+        # independent derivation doubles as the per-entry replication
+        # experiment, so a disagreement with an advisory entry is filed as a
+        # conflict here -- surfaced immediately, never deferred to assembly.
+        # The registry file rides the unit's own artifact commit (one push,
+        # G3-preserving). A harvest fault never costs the green.
+        registry_rel: str | None = None
         try:
-            sha, pushed, push_detail = self._commit_unit(name, summary, staging=compile_only)
+            final_header = (workdir / "gnt4_shim.h").read_text(encoding="utf-8")
+            registry = self._registry()
+            harvest = harvest_unit(
+                registry,
+                unit_name=name,
+                tier=TIER_COMPILE_ONLY if compile_only else TIER_ORACLE_GREEN,
+                seed_text=augmented_seed_text,
+                header_text=final_header,
+                unit_c_text=unit_c,
+                holdout=holdout,
+            )
+            if harvest.changed:
+                self._save_registry(registry)
+                registry_rel = REGISTRY_RELPATH
+            for conflict in harvest.new_conflicts:
+                payload = {
+                    "unit": name,
+                    "key": conflict.get("key"),
+                    "symbol": conflict.get("symbol"),
+                    "entry_kind": conflict.get("kind"),
+                    "tier": conflict.get("tier"),
+                    "against_tier": conflict.get("against_tier"),
+                    "contested": conflict.get("contested"),
+                    "green_green": conflict.get("green_green"),
+                }
+                self.events.emit("registry_conflict", **payload)
+                if conflict.get("green_green"):
+                    # Section 4 invariant row: two behaviourally-verified
+                    # units disagreeing on one symbol's typing is a real
+                    # program-semantics finding -- page the owner.
+                    self.events.emit("registry_green_green_conflict", **payload)
+            if harvest.changed:
+                self.events.emit(
+                    "registry_harvested",
+                    unit=name,
+                    registry_version=harvest.version,
+                    added=len(harvest.added),
+                    agreed=len(harvest.agreed),
+                    conflicts=len(harvest.new_conflicts),
+                )
+        except Exception as error:  # noqa: BLE001 - harvest never fails a unit
+            self.events.emit(
+                "registry_harvest_error", unit=name, error=str(error)[:400]
+            )
+        try:
+            sha, pushed, push_detail = self._commit_unit(
+                name, summary, staging=compile_only,
+                extra_paths=[registry_rel] if registry_rel else None,
+            )
         except (OSError, subprocess.SubprocessError) as error:
             # A stalled `git push` hits the 300s timeout and raises
             # TimeoutExpired (a SubprocessError, NOT an OSError). Unguarded, it
@@ -1948,11 +2199,35 @@ class WasmUnitDriver:
         current one in EVERY component. Retrying it would feed the model the
         exact inputs that already failed -- the section 0.1 forbidden retry.
         A red with no recorded world-version predates the gate and stays
-        schedulable (its world is unknown, so a delta cannot be excluded)."""
+        schedulable (its world is unknown, so a delta cannot be excluded).
+
+        The registry component is finer-grained than the other four (T2c,
+        section 2.8: "skips a red whose recorded world-hash equals the
+        current hash AND whose symbol set gained no registry entries"): a
+        version bump alone is not a delta FOR THIS UNIT unless entries
+        touching its recorded symbol set were added or changed since its
+        verdict. A red without a recorded symbol set predates that capture
+        and re-opens on any registry movement -- unknown, so a delta cannot
+        be excluded."""
         if record.get("status") != "red_retryable":
             return False
         recorded = record.get("world_version")
-        return isinstance(recorded, dict) and recorded == self._world_version()
+        if not isinstance(recorded, dict):
+            return False
+        current = self._world_version()
+        for component in ("config_hash", "toolchain_hash", "driver_rev", "prompt_version"):
+            if recorded.get(component) != current.get(component):
+                return False
+        if recorded.get("registry_version") == current.get("registry_version"):
+            return True
+        symbols = record.get("symbol_set")
+        if not isinstance(symbols, list) or not symbols:
+            return False
+        try:
+            since = int(recorded.get("registry_version") or 0)
+        except (TypeError, ValueError):
+            return False
+        return not relevant_delta(self._registry(), set(symbols), since)
 
     def _next_unit(
         self,
