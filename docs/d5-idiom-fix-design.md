@@ -60,8 +60,15 @@ Scanner: paren-matching, whitespace/newline-tolerant between all tokens
 `(\n double)CONCAT44`, which single-line grep misses). Comments and string
 literals do not occur inside the matched shape in either tree.
 
-**Staged trees** (`research/decomp/port-units-staging/`, 21 units;
-`research/decomp/port-units/`, 3 oracle-green PoC units):
+**Staged trees** (`research/decomp/port-units-staging/`;
+`research/decomp/port-units/`, 3 oracle-green PoC units). **Snapshot
+semantics [R1]: this table is a dated census run, not a stable fact — the
+live driver stages new units continuously (between this doc's first commit
+and its review, hours apart, the driver staged five more idiom-bearing
+integer-seed units: auto-c0035-006 (5 sites), auto-c0011-004 (4),
+auto-c0011-012 (3), auto-c0011-011 (1), auto-c0019-000 (1)). The scanner is
+the authority; the table is its 2026-08-21 output.** Original-snapshot rows
+kept, refresh rows added:
 
 | Unit | Sites | `CONCAT44` macro | `undefined8` | Idiom result today |
 |---|---|---|---|---|
@@ -69,6 +76,11 @@ literals do not occur inside the matched shape in either tree.
 | auto-c0001-014 | 12 | integer | ull | **WRONG** |
 | auto-c0035-002 | 3 | integer | ull | **WRONG** (the probed unit) |
 | auto-c0034-018 | 1 | integer | ull | **WRONG** |
+| auto-c0035-006 | 5 | integer | ull | **WRONG** (staged after first commit) |
+| auto-c0011-004 | 4 | integer | ull | **WRONG** (staged after first commit) |
+| auto-c0011-012 | 3 | integer | ull | **WRONG** (staged after first commit) |
+| auto-c0011-011 | 1 | integer | ull | **WRONG** (staged after first commit) |
+| auto-c0019-000 | 1 | integer | ull | **WRONG** (staged after first commit) |
 | auto-c0001-012 | 7 | union bit-cast | double | correct at idiom sites; fork-conflicted (T2b Class 1) |
 | auto-c0001-003 | 6 | union bit-cast | ull | correct at idiom sites; half-converted (T2b) |
 | auto-c0000-006 | 2 | union bit-cast | double | correct; fork-conflicted |
@@ -76,13 +88,16 @@ literals do not occur inside the matched shape in either tree.
 | auto-c0001-007 | 1 | union bit-cast | double | correct; fork-conflicted |
 | auto-c0001-010 | 1 | union bit-cast | double | correct; fork-conflicted |
 | damage-core (oracle-green) | 1 | union bit-cast | double | correct (PoC island) |
-| 11 other staging units + collision-core, knockback-core | 0 | — | — | unaffected |
+| other site-free staging units + collision-core, knockback-core | 0 | — | — | unaffected |
 
-Totals: **48 idiom sites across 10 staging units** (the defect memo's "42"
-was a single-line-grep undercount — 6 sites wrap the `CONCAT44(0x43300000,`
-across a line break), plus 1 site in oracle-green `damage-core`. Of the 48:
-**30 sites in 4 units are computing wrong values in the staged artifacts
-today** (integer macro); the other 18 sites in 6 units are correct only
+Totals, 2026-08-21 refresh: **62 idiom sites across 15 staging units**
+(first-commit snapshot: 48/10; the defect memo's "42" was additionally a
+single-line-grep undercount — 6 sites wrap the `CONCAT44(0x43300000,`
+across a line break), plus 1 site in oracle-green `damage-core`. Of the 62:
+**44 sites in 9 units are computing wrong values in the staged artifacts
+today** (integer macro; 30/4 at first commit — the delta is one night of
+driver output, which is the mint-rate datum D5-6's provision prices in);
+the other 18 sites in 6 units are correct only
 because those units still carry the PoC union macro — i.e. they are exactly
 the T2b `undefined8_fork` cohort scheduled for re-port under the integer
 seed, at which point **their 18 sites would silently join the broken set**.
@@ -121,14 +136,14 @@ every future unit extracts from):
 
 ## D5-2. Idiom grammar (all variants present in the trees)
 
-Variants, with tonight's counts (fleet / staged):
+Variants, with counts (fleet / staged as of the 2026-08-21 refresh):
 
 | # | Shape (normalized) | Fleet | Staged |
 |---|---|---|---|
-| V1 | `(double)CONCAT44(0x43300000, X ^ 0x80000000) − M` — signed, xor inside lo, subtract adjacent | 1,272 | 15 |
-| V2 | `(double)(CONCAT44(0x43300000, X) ^ 0x80000000)` — signed, xor OUTSIDE on the u64 (flips lo bit 31; same value), subtract usually deferred | 170+59* | 5+4* |
-| V3 | `(double)CONCAT44(0x43300000, X) − M` — unsigned, subtract adjacent | 603 | 24 |
-| V4 | V1/V3 with the subtraction textually deferred (result stored to a `double` local, `− M` on a later statement) | 79 | 6 |
+| V1 | `(double)CONCAT44(0x43300000, X ^ 0x80000000) − M` — signed, xor inside lo, subtract adjacent | 1,272 | 21 |
+| V2 | `(double)(CONCAT44(0x43300000, X) ^ 0x80000000)` — signed, xor OUTSIDE on the u64 (flips lo bit 31; same value), subtract usually deferred | 170+59* | 8+4* |
+| V3 | `(double)CONCAT44(0x43300000, X) − M` — unsigned, subtract adjacent | 603 | 29 |
+| V4 | V1/V3 with the subtraction textually deferred (result stored to a `double` local, `− M` on a later statement) | 79 | 5 |
 | V5 | `(double)CONCAT44(E_hi, E_lo)` — non-magic high word (copysign / exponent assembly) | 18 | 0 |
 
 \* the two deferred-xor rows overlap V4's counting; the union of all rows is
@@ -152,7 +167,7 @@ one rule, not five:
 > whose leftmost primary is the call (V2's xor-outside shape). Whitespace and
 > newlines may appear between any two tokens, including inside `( double )`.
 
-G matches all 2,143 fleet sites and all 49 staged sites, subtractions and
+G matches all 2,143 fleet sites and all 63 staged sites, subtractions and
 xors untouched. G deliberately does **not** condition on `0x43300000` (V5),
 on the xor, or on the subtraction — matching on those would trade a complete
 census-verified shape for a fragile pattern-of-patterns.
@@ -270,13 +285,15 @@ every concrete encoding fails on one cohort or the other:
 - **`__attribute__((transparent_union))`**: applies to function *parameters*
   only — it makes a union accept multiple argument types, it does nothing
   for a *returned* value's conversions.
-- **Compile units as C++** (conversion operators would genuinely work):
-  changes the language of verbatim code that is C by construction — Ghidra
-  emits C, the preludes and casts assume C semantics, `emcc` name mangling
-  breaks the `EXPORTED_FUNCTIONS`/import seam, and the entire staged corpus
-  + oracle harness would need revalidation. A toolchain migration to fix one
-  idiom is out of all proportion, and reviewability of "C++ now compiles
-  this differently where?" is hopeless.
+- **Compile units as C++** (conversion operators would genuinely work, and
+  `extern "C"` would keep the export/import seam un-mangled): still
+  rejected on proportionality and semantics — it changes the language of
+  verbatim code that is C by construction (Ghidra emits C; preludes,
+  casts, and implicit conversions assume C semantics, and C++ diverges
+  exactly in the conversion rules this defect lives in), forcing
+  revalidation of the entire staged corpus + oracle harness. A toolchain
+  migration to fix one idiom is out of all proportion, and reviewability
+  of "C++ now compiles this differently where?" is hopeless.
 
 No preprocessor or type-system construct can make one expression have two
 types depending on its consumer. The fork exists because C forces a choice
@@ -359,8 +376,25 @@ neither.**
   driver-rev suspenders: per-unit staleness becomes decidable from the
   artifact alone, no git archaeology).
 
-Absence of the `transform` key = pre-D5 artifact. That single predicate is
-the migration census (D5-6) and the staleness detector, mechanically.
+**Staleness predicate, generalized [R2]** — an artifact is D5-stale iff
+
+```
+no transform key                                       (pre-D5 artifact)
+∨ ( transform.version < current
+    ∧ T_current(extractions) ≠ transform.transformed_sha256 )
+```
+
+The first disjunct is the migration census (D5-6); the second covers every
+future grammar bump: an artifact built by an older transform whose *output
+would now differ* is stale, while an old-version artifact whose bytes the
+current transform reproduces is re-stamped in place (version bump in
+provenance, no rebuild — the identity case). **Policy [R2]: a green whose
+recorded `transformed_sha256` differs from the current transform's output is
+revoked through the same `verdict_revoked` journal path as the D5-6
+migration — never rebuilt-in-place around a settled verdict, and never
+hand-edited in state.** Absence-of-key and version-stale-with-differing-
+output are thereby one predicate with one consequence, mechanically
+evaluable from the artifact alone.
 
 ## D5-5. Interactions with the running mechanisms
 
@@ -406,27 +440,53 @@ the migration census (D5-6) and the staleness detector, mechanically.
 
 ## D5-6. Migration
 
-Census predicate (mechanical): staged artifact lacks `transform` key ∧
-transform-on-its-extractions is non-identity. Running it tonight yields
-exactly the 10 staging units of the D5-1 table; for the 11 site-free staging
-units and knockback/collision-core the transform is identity, so **their
-artifacts and verdicts stand** — asserted, not assumed, by the identity
-check (`transformed_sha256 == extracted_sha256` recorded at their next
-routine touch; no revocation, no rebuild).
+Census predicate (mechanical): **D5-stale per D5-4 [R2]** — lacks
+`transform` key (∨ version-stale with differing output, for future bumps) —
+∧ transform-on-its-extractions is non-identity. For site-free artifacts the
+transform is identity, so **their artifacts and verdicts stand** — asserted,
+not assumed, by the identity check (`transformed_sha256 ==
+extracted_sha256`, stamped at their next routine touch; no revocation, no
+rebuild).
+
+**The predicate, not any unit list, is the migration input [R1].** This
+doc's first commit named four wrong-today units; the live driver staged
+five more idiom-bearing integer-seed units within hours (D5-1), silently
+obsoleting the list while the predicate stayed exactly correct. A migration
+step that names units contradicts the census it defines. So:
 
 Order of operations:
 
 1. **Land the transform + helper + prompt rule + tests** (D5-7 gate items
    1–2 green) behind the cooperative driver recycle, like every tranche.
-2. **Revoke-and-requeue the 4 wrong-today units** (`auto-c0001-011`,
-   `auto-c0001-014`, `auto-c0034-018`, `auto-c0035-002`) via the journal
-   revocation path. Cost honesty: these went green cheaply (c0035-002:
-   1 iteration, 0 model calls) and the transform *removes* the hardest
-   header decision, so expected re-port cost is ~0–2 model calls per unit;
-   worst case is a normal attempt. Their harvested registry entries: all
-   are `compile_only`-tier; revocation triggers the [V4-7] demote path
-   (tombstoned where sole-sourced) and re-harvest on the new green
-   re-supplies them — no special case.
+2. **Revoke-and-requeue every integer-macro unit the census predicate
+   selects, EVALUATED AT MIGRATION TIME** via the journal revocation path
+   (as of the 2026-08-21 refresh the predicate selects 9 units / 44 sites:
+   c0001-011, c0001-014, c0011-004, c0011-011, c0011-012, c0019-000,
+   c0034-018, c0035-002, c0035-006 — recorded here as the current
+   evaluation, never as the input). Cost honesty: these go green cheaply
+   (c0035-002: 1 iteration, 0 model calls) and the transform *removes* the
+   hardest header decision, so expected re-port cost is ~0–2 model calls
+   per unit; worst case is a normal attempt. Their harvested registry
+   entries: all are `compile_only`-tier; revocation triggers the [V4-7]
+   demote path (tombstoned where sole-sourced) and re-harvest on the new
+   green re-supplies them — no special case.
+
+   **Mint-rate provision [R1]: minting of D5-wrong greens CONTINUES until
+   step 1 lands — accepted, not gated.** The alternative — holding back
+   pending units whose extractions contain idiom sites — would gate on a
+   property of 96.1% of the fleet's CONCAT44 uses spread over 77 of 80
+   chunks: effectively pausing the pipeline for the fix's landing time,
+   spending the driver's only irreplaceable resource (wall-clock GPU
+   throughput, G2/G3) to avoid rework that costs ~0–2 model calls per
+   affected unit and is swept up by the same predicate evaluation either
+   way. Each night of continued minting adds roughly what tonight added
+   (5 units / 14 sites — the measured mint-rate datum, D5-1); the rework
+   stays strictly cheaper than the stall unless landing slips by weeks.
+   Bound, so the acceptance is falsifiable rather than open-ended: if the
+   transform has not landed within 14 days of this doc's acceptance, or if
+   predicate-selected units exceed 40, the choice is re-decided at §4-page
+   level (the census script makes the count a one-command check) — that is
+   a re-decision trigger, not an automatic gate.
 3. **Revoke-and-requeue the 6 union-macro staging units** (c0000-006,
    c0001-003, c0001-004, c0001-007, c0001-010, c0001-012 — with c0000-004,
    c0000-008, c0000-018, c0001-005, c0002-001, the rest of the T2b
@@ -523,11 +583,14 @@ Order of operations:
   predicate (D5-4) makes the mix enumerable at any instant, and gate item 2
   stays red until it drains — the state is visible, not latent.
 - **F-D5-9: the reverse idiom (SUB84 family, 24 fleet sites) reaches
-  staging before a D6 design exists.** Same defect shape mirrored
-  (double→bits under an integer SUB84 is fine — SUB84 on a *double* operand
-  under integer typedefs won't compile, so it fails loudly, not silently —
-  but the census script watches it anyway). Filed as a watch item with the
-  fleet count; no silent-wrongness path identified today.
+  staging before a D6 design exists.** Louder than the D5 shape at every
+  layer: the seed defines **no SUB84 macro at all**, so a site fails at
+  compile as an undeclared identifier (or, past clang's implicit-decl
+  error, at the link/import gate) — never silently. The residual risk is
+  the compile-fix loop *authoring* a wrong SUB84 macro to clear that
+  diagnostic; the census script watches SUB84 counts in staged trees so a
+  first-ever staged site triggers the D6 design review before, not after,
+  a model-authored macro settles anything.
 - **F-D5-10: counting disputes.** Every number in D5-1/D5-2 regenerates
   from two ~40-line scanner scripts run against the working tree; the memo's
   42-vs-48 delta is explained (line-wrapped sites) rather than averaged.
