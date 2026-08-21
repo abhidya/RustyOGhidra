@@ -1,6 +1,19 @@
-# Oracle workstream plan — converting compile-only inventory into verified units (v2, defended design)
+# Oracle workstream plan — converting compile-only inventory into verified units (v3, defended design)
 
-Status: v2. **v1 (`72f4b23`) failed adversarial review** on seven findings
+Status: v3. v2 (`1642e31`) passed re-review on all S1–S7 applications but
+**failed narrowly on two new-mechanism defects**, fixed here: [R1] the
+mandated anchored total-line pattern could never match — `_run_oracle`
+calls `re.search` with no flags on a multi-line log, so the mandate is now
+the spec-side `(?m)` inline flag, pinned in §3.4 and I-5; [R2] the replay
+fixture gained an integrity-binding header record and explained-case index
+records (dump-file only), the result schema's `corpus` became a tagged
+union carrying the fixture sha, and I-2's determinism tuple includes it;
+plus two reviewer notes (log-identity proves non-perturbation, not dump
+fidelity — loud at replay; gate term 4 exercises comparison machinery, not
+the codec) and the Phase 1 requirement that the damage-core spec declare a
+nonzero `rounding_bound` for `zz_003cd5c_`.
+
+**v1 (`72f4b23`) failed adversarial review** on seven findings
 (S1–S7); v2 applies the verdict in full — each fix mapped to its section
 in the changelog below and re-verified against the cited files. Authored against
 the repo state of 2026-08-20 (registry commit `0b84c788`). DESIGN ONLY — no
@@ -284,7 +297,9 @@ fields = malformed = fail):
   "harness": {"entry": "research/decomp/oracle-harness/run-unit.mjs",
                "git_rev": "<GotYaForce HEAD at run time>"},
   "wasm": {"path": "<as invoked>", "sha256": "<hex>"},
-  "corpus": {"seed": "0x6f42", "n": 20000},
+  "corpus": {"mode": "replay",
+              "file": "research/decomp/oracle-harness/corpora/damage-core-poc.jsonl",
+              "sha256": "<hex of the fixture file>", "n": 20000},
   "spec_sha256": "<hex of the unit oracle-spec file, §3.4>",
   "functions": [
     {"name": "zz_003cd5c_", "cases": 20000, "exact": 19998,
@@ -298,6 +313,10 @@ fields = malformed = fail):
   "verdict": "pass"
 }
 ```
+
+`corpus` is a tagged union: `mode: "replay"` carries `{file, sha256, n}`
+(the fixture file's sha256 binds the run to one exact corpus); generated
+corpora carry `mode: "generate"` with `{seed, n}` instead.
 
 Rules: `verdict` is `"pass"` iff every function verdict is `"pass"`;
 a function passes iff `unexplained == 0` **and** the rounding-explained
@@ -419,7 +438,7 @@ gap-aligned units overwhelmingly take actor pointers.
         "cwd": "research/decomp/oracle-harness",
         "env": {"ORACLE_WASM": "{wasm}"},
         "success_patterns": [
-          "^ORACLE TOTAL functions=2/2 cases=40000 UNEXPLAINED: 0 VERDICT: PASS$",
+          "(?m)^ORACLE TOTAL functions=2/2 cases=40000 UNEXPLAINED: 0 VERDICT: PASS$",
           "\\[zz_0123456_\\] .* unexplained: 0 .* verdict: pass",
           "\\[zz_0abcdef_\\] .* unexplained: 0 .* verdict: pass"
         ]
@@ -435,13 +454,27 @@ only — there is no negative-pattern support (verified in
 `"verdict": "pass"` is satisfied by a *partially failing* multi-function log
 in which one function passes. Two requirements therefore bind every spec:
 
-1. **One anchored total line, mandatory.** The harness prints, as its last
-   log line and *only* when every function passed, a single aggregate:
+1. **One anchored total line, mandatory — with the `(?m)` inline flag.**
+   The harness prints, as its last log line and *only* when every function
+   passed, a single aggregate:
    `ORACLE TOTAL functions=<k>/<k> cases=<n> UNEXPLAINED: 0 VERDICT: PASS`.
    The spec's first pattern anchors this exact line (with the expected
    `<k>/<k>` literal). A partially failing run prints
    `ORACLE TOTAL functions=<j>/<k> … VERDICT: FAIL` — which the anchored
-   pattern cannot match.
+   pattern cannot match. **Anchoring mechanics, pinned:** `_run_oracle`
+   evaluates `re.search(pattern, log)` with **no flags**
+   (`src/port_wasm_units.py:1346`, verified) against the multi-line
+   stdout+stderr string, so bare `^`/`$` anchor only at string start/end
+   and a bare-anchored total-line pattern **can never match** — every
+   spec-authored unit would go spuriously oracle-red. The mandated form is
+   therefore the **spec-side inline flag `(?m)^…$`** — chosen over the
+   alternative (teaching the driver overlay to add `re.M`) because it
+   keeps the driver's pattern evaluation byte-identical for all specs, old
+   and new, and keeps the contract visible in the committed spec itself.
+   `(?m)$` is safe against `\r` litter: the driver runs the harness with
+   `text=True`, which normalizes `\r\n` to `\n` in the captured log.
+   Sidecar validation rejects any `success_patterns` entry containing an
+   un-`(?m)`-prefixed `^` or `$`.
 2. **Per-function patterns, one per exported function.** The model is the
    committed damage-core queue spec (verified), which pins each function's
    own result line (`"type category \(zz_0066298_\): 232/232 exact"`,
@@ -521,11 +554,12 @@ the damage-core result before any second unit gets a spec.**
   command ending pass. Unchanged from the pipeline; restated because the
   result-artifact file (§3.2) could tempt a reader to treat its presence as
   a verdict. It is evidence, not a verdict.
-- **I-2 (determinism).** Given (wasm sha256, spec sha256, harness rev, seed,
-  N), a harness run is bit-reproducible: same verdict, same counts, same
-  result JSON modulo `generated_at`. All randomness flows from the seeded
-  PRNG (`mulberry32` lineage); the seed is in the spec and echoed in the
-  result.
+- **I-2 (determinism).** Given (wasm sha256, spec sha256, harness rev,
+  corpus) — where corpus is the fixture file's sha256 for replay runs, or
+  (seed, N) for generated runs — a harness run is bit-reproducible: same
+  verdict, same counts, same result JSON modulo `generated_at`. All
+  generation randomness flows from the seeded PRNG (`mulberry32` lineage);
+  the seed or fixture sha is in the spec/result as `corpus`.
 - **I-3 (DOL-sourced arena).** Arena content comes from `boot.dol` (or other
   shipped game data) via generators; no hand-entered memory values, ever.
   Byte-order conversion happens at generation time (the `gen_arena.py`
@@ -537,11 +571,14 @@ the damage-core result before any second unit gets a spec.**
   1–4). Zero-fill of scratch regions is forbidden in the generic harness.
 - **I-5 (exit-code + pattern double gate).** A unit passes only if the
   harness exits 0 **and** every `success_patterns` regex matches. Specs MUST
-  include the anchored `ORACLE TOTAL … functions=<k>/<k> … VERDICT: PASS`
-  line plus one per-function pattern per exported function (§3.4 pattern
-  discipline). Naked substring patterns that a partially failing log can
+  include the anchored total line in the exact form
+  `(?m)^ORACLE TOTAL functions=<k>/<k> cases=<n> UNEXPLAINED: 0 VERDICT: PASS$`
+  — the `(?m)` inline flag is part of the mandate, because `_run_oracle`
+  calls `re.search` with no flags on a multi-line log and bare `^`/`$`
+  would never match (§3.4) — plus one per-function pattern per exported
+  function. Naked substring patterns that a partially failing log can
   satisfy are forbidden — `_run_oracle` has no negative-pattern support, so
-  the totals line is the only pattern shape that composes safely.
+  the flagged totals line is the only pattern shape that composes safely.
 - **I-6 (no epsilon).** The only permitted non-exact agreement is
   f32-rounding-explained, defined as `wasm === oracle32(case)` where
   `oracle32` mirrors the ROM's op-level float structure. No relative/absolute
@@ -676,13 +713,42 @@ a different — incomparable — corpus from the same seed, and "≥ 19,998" ove
 a different corpus proves nothing about the codec. The gate is therefore
 defined over the **PoC's own cases, replayed**: a one-time audited dump
 hook in `harness.mjs` (env `POC_DUMP_CORPUS=<path>`; append-only
-serialization of each generated case object at the point of use, touching
-no generation logic) writes
+serialization touching no generation logic) writes
 `research/decomp/oracle-harness/corpora/damage-core-poc.jsonl` (tracked) —
 all 20,000 main cases, the 232 exhaustive category inputs, the 4,000 hp
-triples, and the 2,000 unit-B memory images. Non-interference proof: the
-instrumented run must still print the committed `oracle.log` numbers
-byte-for-byte. This is the sole amendment to the PoC freeze (I-7).
+triples, and the 2,000 unit-B memory images. The hook emits **two record
+kinds beyond the case objects**, and the doc says so plainly because both
+extend it past pure input serialization:
+
+- a **fixture header record** (first line) binding the dump to its
+  provenance: sha256 of `harness.mjs` *as instrumented*, of
+  `unit_poc.wasm`, of `arena.json`, and of the committed
+  `port-units/damage-core/oracle.log` the replay must reproduce, plus the
+  dump date. Replay refuses a fixture whose header is missing or whose
+  `oracle.log` sha no longer matches the committed artifact — an unbound
+  corpus file proves nothing.
+- **explained-case index records**: the classification loop's outcome per
+  case (`{n, class: exact|rounding|unexplained}`) for the main corpus, so
+  the fixture records *which* 2 cases were rounding-explained. These go
+  **to the dump file only, never to the log** — the non-interference
+  proof (below) requires the log byte-identical, and gate term 1's "the
+  same 2 case indices" is checkable only because the fixture carries them.
+
+Non-interference proof: the instrumented run must still print the
+committed `oracle.log` numbers byte-for-byte. Scope of that proof, stated
+honestly: byte-identical log proves the hook **did not perturb the
+corpus**; it does **not** prove dump fidelity (a serialization bug writes
+a faithful log and a wrong fixture) — accepted, because a wrong fixture is
+loud at replay: it diffs against the pinned counts instead of matching
+them. This hook is the sole amendment to the PoC freeze (I-7).
+
+Two scope notes on the gate itself: gate term 4 replays unit-B *memory
+images*, which exercises the harness's comparison machinery but **not the
+generic codec** (no TS-field encoding happens) — codec coverage claims
+rest on terms 1–3 and 5 only. And the Phase 1 damage-core spec must
+**declare a nonzero `rounding_bound` for `zz_003cd5c_`** (2/20,000 with
+the oracle32 witness); under F-5's default-0 bound the expected 2
+explained cases would fail the function and make gate term 1 unreachable.
 
 Then build `oracle-harness/` (runner, codec, field-map extractor, arena
 generalization) and a `damage-core` spec, and replay the dumped corpus
@@ -690,7 +756,8 @@ through the generic codec + harness.
 
 *Gate (all seven, exact — equality, not thresholds):*
 1. `zz_003cd5c_` on the replayed 20,000: **exactly** 19,998 exact,
-   2 rounding-explained, 0 unexplained — the same 2 case indices;
+   2 rounding-explained, 0 unexplained — the same 2 case indices as the
+   fixture's explained-case index records;
 2. `zz_0066298_`: 232/232 exact (exhaustive, replay and re-generation
    coincide);
 3. `zz_003d344_` on the replayed 4,000: 4,000/4,000 exact incl. lethal
