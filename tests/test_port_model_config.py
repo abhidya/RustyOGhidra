@@ -172,3 +172,21 @@ def test_the_template_resolves_to_the_same_port_model_configuration():
     assert template.gguf_variant == live.gguf_variant
     assert template.max_seq_length == live.max_seq_length
     assert template.port_mode == live.port_mode
+
+
+def test_autonomous_profiles_use_neutral_logging_without_embeddings():
+    """The wasm-unit profile must not silently recreate the retired sidecar."""
+    expected_log = "logs/port-llm-interactions.jsonl"
+    for path in (port_model_config.ENV_PATH, TEMPLATE):
+        values = read_env_file(path)
+        assert values["LLM_LOG_FILE"] == expected_log
+        assert "CUSTOM_API_EMBEDDING_MODEL" not in values
+        assert "CUSTOM_API_EMBEDDING_URL" not in values
+
+
+def test_autonomous_profiles_pin_the_verified_60k_context():
+    for path in (port_model_config.ENV_PATH, TEMPLATE):
+        values = read_env_file(path)
+        assert values["CONTEXT_BUDGET"] == "60000"
+        assert values["OGHIDRA_PORT_CONTEXT_TOKENS"] == "60000"
+        assert values["CUSTOM_API_MAX_SEQ_LEN"] == "60000"
