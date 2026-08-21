@@ -444,6 +444,115 @@ def test_pending_push_is_retried_and_cleared_on_success(repo, tmp_path):
     assert journal.push_is_pending() is False
 
 
+def test_authoritative_receipt_fetches_advertised_sha_without_moving_refs_or_fetch_head(
+    repo, tmp_path
+):
+    remote = tmp_path / "origin.git"
+    assert git("init", "--bare", str(remote), cwd=tmp_path).returncode == 0
+    assert git("remote", "add", "origin", str(remote), cwd=repo).returncode == 0
+    assert git("push", "-u", "origin", "main", cwd=repo).returncode == 0
+    transition = UnitTransition(
+        unit="damage-core",
+        result=RESULT_GREEN,
+        stage="commit",
+        product_commit="a" * 40,
+        product_pushed=True,
+        extra={
+            "transition_id": "authoritative-fetch-fallback",
+            "transition_timestamp": "2026-08-21T12:34:56Z",
+            "transition_run_id": "publisher-run",
+            "candidate_sha256": "b" * 64,
+        },
+    )
+    publisher = ProgressJournal(
+        repo,
+        run_root=tmp_path / "publisher-run",
+        worktree=tmp_path / "publisher-wt",
+        run_id="publisher-run",
+        enable_push=True,
+    )
+    outcome = publisher.checkpoint(transition=transition, units=UNITS)
+    assert outcome["recorded"] and outcome["committed"] and outcome["pushed"]
+    advertised = git(
+        "ls-remote", "--heads", "origin", "refs/heads/port-progress", cwd=repo
+    ).stdout.split()[0]
+
+    # A repository with only the remote configured has neither the advertised
+    # commit object nor any local/tracking ref that could be mistaken for the
+    # authoritative receipt.
+    reader_repo = tmp_path / "reader"
+    reader_repo.mkdir()
+    assert git("init", "-b", "main", cwd=reader_repo).returncode == 0
+    assert git("remote", "add", "origin", str(remote), cwd=reader_repo).returncode == 0
+    fetch_head = Path(
+        git("rev-parse", "--git-path", "FETCH_HEAD", cwd=reader_repo).stdout.strip()
+    )
+    if not fetch_head.is_absolute():
+        fetch_head = reader_repo / fetch_head
+    assert not fetch_head.exists()
+    refs_before = git(
+        "for-each-ref",
+        "--format=%(refname):%(objectname)",
+        "refs/heads",
+        "refs/remotes",
+        cwd=reader_repo,
+    ).stdout
+    calls = []
+
+    def tracked_git(*args, cwd=None):
+        calls.append(args)
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd or reader_repo),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    reader = ProgressJournal(
+        reader_repo,
+        run_root=tmp_path / "reader-run",
+        worktree=tmp_path / "reader-wt",
+        run_id="reader-run",
+        git_runner=tracked_git,
+        enable_push=False,
+    )
+    receipt = reader.authoritative_transition_receipt(
+        "authoritative-fetch-fallback"
+    )
+    assert receipt["authoritative"] and receipt["remote"]
+    assert receipt["remote_sha"] == advertised
+    assert len(receipt["remote_records"]) == 1
+    assert reader.transition_semantics(receipt["remote_records"][0]) == (
+        reader.transition_semantics(transition.to_record("", ""))
+    )
+    assert any(
+        call[:3] == ("fetch", "--no-tags", "--no-write-fetch-head")
+        and call[-1] == advertised
+        for call in calls
+    )
+    assert not fetch_head.exists()
+    assert git(
+        "for-each-ref",
+        "--format=%(refname):%(objectname)",
+        "refs/heads",
+        "refs/remotes",
+        cwd=reader_repo,
+    ).stdout == refs_before
+    shown = git(
+        "show", f"{advertised}:workflow-progress/events.jsonl", cwd=reader_repo
+    )
+    assert shown.returncode == 0
+    authoritative_records = [
+        json.loads(line) for line in shown.stdout.splitlines() if line.strip()
+    ]
+    assert any(
+        record.get("extra", {}).get("transition_id")
+        == "authoritative-fetch-fallback"
+        for record in authoritative_records
+    )
+
+
 def test_transition_is_durable_locally_even_when_git_is_entirely_broken(repo, tmp_path):
     def broken_git(*args, cwd=None):
         return subprocess.CompletedProcess(args, 128, "", "fatal: not a git repository")

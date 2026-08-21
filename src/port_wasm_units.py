@@ -871,6 +871,10 @@ TARGETED_MAX_SYMBOLS = 5
 # F4), not a cost constant: a structural-diagnosed red sinks behind ALL
 # schedulable non-structural work across product_priority bands.
 DIAGNOSIS_MALFORMED_LIMIT = 2
+# Source diagnosis answers one narrow question: whether the compiler/linker
+# failure can be repaired through the generated shim.  Promotion and control
+# failures have no source-level evidence and must never spend this lane.
+SOURCE_DIAGNOSIS_STAGES = frozenset({"compile-fix", "wasm-link"})
 
 _SYMBOL_DIAG_PATTERNS = [
     re.compile(r"use of undeclared identifier '([A-Za-z_]\w*)'"),
@@ -1910,8 +1914,13 @@ class WasmUnitDriver:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-") or "unit"
         attempt_id = f"{safe_name}-a{attempt}-{uuid.uuid4().hex}"
         attempt_dir = self.promotion_attempt_root / attempt_id
-        attempt_dir.mkdir(exist_ok=False)
         artifact_preimage_exists = destination.exists()
+        if artifact_preimage_exists and (
+            destination.is_symlink()
+            or (hasattr(destination, "is_junction") and destination.is_junction())
+        ):
+            raise RuntimeError("artifact destination is a link")
+        attempt_dir.mkdir(exist_ok=False)
         artifact_preimage_sha256 = (
             unit_artifact_sha256(destination)
             if artifact_preimage_exists and destination.is_dir()
@@ -1964,14 +1973,27 @@ class WasmUnitDriver:
         if not isinstance(raw, str) or not unit:
             return None
         try:
-            destination = (self.repo_root / raw).resolve()
+            destination = Path(os.path.abspath(self.repo_root / raw))
             allowed = {
-                (self.artifact_root / unit).resolve(),
-                (self.staging_root / unit).resolve(),
+                Path(os.path.abspath(self.artifact_root / unit)),
+                Path(os.path.abspath(self.staging_root / unit)),
             }
         except OSError:
             return None
-        return destination if destination in allowed else None
+        if destination not in allowed:
+            return None
+        if destination.is_symlink() or (
+            hasattr(destination, "is_junction") and destination.is_junction()
+        ):
+            return None
+        try:
+            if destination.parent.resolve() not in {
+                self.artifact_root.resolve(), self.staging_root.resolve()
+            }:
+                return None
+        except OSError:
+            return None
+        return destination
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
@@ -2059,10 +2081,58 @@ class WasmUnitDriver:
         candidate_dir = attempt_dir / "candidate"
         preimage = marker.get("artifact_preimage") or {}
         if preimage.get("exists"):
-            if not destination.is_dir():
-                raise RuntimeError("artifact preimage disappeared during transaction")
-            if unit_artifact_sha256(destination) != preimage.get("sha256"):
-                raise RuntimeError("artifact preimage changed during transaction")
+            expected_preimage = preimage.get("sha256")
+            replacement = marker.get("replacement_authorization")
+            if not isinstance(replacement, dict):
+                if not destination.is_dir():
+                    raise RuntimeError("artifact preimage disappeared during transaction")
+                if unit_artifact_sha256(destination) != expected_preimage:
+                    raise RuntimeError("artifact preimage changed during transaction")
+                return
+
+            backup_name = replacement.get("backup")
+            if backup_name != "artifact.preimage":
+                raise RuntimeError("replacement preimage backup is not owned")
+            backup = attempt_dir / backup_name
+            candidate_sha = marker.get("candidate_sha256")
+            destination_sha = (
+                unit_artifact_sha256(destination) if destination.is_dir() else None
+            )
+            backup_sha = unit_artifact_sha256(backup) if backup.is_dir() else None
+
+            # Before the first rename the authoritative preimage is untouched.
+            if (
+                destination_sha == expected_preimage
+                and not backup.exists()
+                and candidate_dir.is_dir()
+            ):
+                return
+            # Crash gap: old destination was detached, candidate not installed.
+            if (
+                not destination.exists()
+                and backup_sha == expected_preimage
+                and candidate_dir.is_dir()
+            ):
+                backup.rename(destination)
+            # Crash gap: candidate installed, marker write not yet durable.
+            elif (
+                destination_sha == candidate_sha
+                and backup_sha == expected_preimage
+                and not candidate_dir.exists()
+            ):
+                destination.rename(candidate_dir)
+                backup.rename(destination)
+            else:
+                raise RuntimeError(
+                    "replacement rollback found an ambiguous artifact state"
+                )
+            if (
+                unit_artifact_sha256(destination) != expected_preimage
+                or backup.exists()
+                or not candidate_dir.is_dir()
+                or unit_artifact_sha256(candidate_dir) != candidate_sha
+            ):
+                raise RuntimeError("replacement rollback did not restore preimage")
             return
         if candidate_dir.is_dir() and not destination.exists():
             return
@@ -2220,9 +2290,43 @@ class WasmUnitDriver:
         return prepared
 
     @staticmethod
-    def _promotion_green_update(marker: dict[str, Any]) -> dict[str, Any]:
-        outcome = marker.get("outcome") or {}
+    def _replacement_green_evidence(
+        marker: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        authorization = marker.get("replacement_authorization")
+        if not isinstance(authorization, dict):
+            return None
+        inventory = authorization.get("preimage_inventory") or []
+        proof = authorization.get("proof") or {}
+        inventory_payload = json.dumps(
+            inventory, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        proof_payload = json.dumps(
+            proof, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         return {
+            "schema": 1,
+            "transaction_id": marker.get("transaction_id"),
+            "revocation_transition_id": authorization.get(
+                "revocation_transition_id"
+            ),
+            "previous_commit": authorization.get("previous_commit"),
+            "preimage_sha256": authorization.get("preimage_sha256"),
+            "preimage_inventory_sha256": hashlib.sha256(
+                inventory_payload
+            ).hexdigest(),
+            "preimage_inventory_entries": len(inventory),
+            "proof_binding": (
+                proof.get("binding") if isinstance(proof, dict) else None
+            ),
+            "proof_sha256": hashlib.sha256(proof_payload).hexdigest(),
+            "candidate_sha256": marker.get("candidate_sha256"),
+        }
+
+    @classmethod
+    def _promotion_green_update(cls, marker: dict[str, Any]) -> dict[str, Any]:
+        outcome = marker.get("outcome") or {}
+        update = {
             "status": "green",
             "error": None,
             "oracle_summary": outcome.get("summary"),
@@ -2234,11 +2338,25 @@ class WasmUnitDriver:
             "promotion_transition_id": marker.get("transition_id"),
             "candidate_sha256": marker.get("candidate_sha256"),
         }
+        replacement = cls._replacement_green_evidence(marker)
+        if replacement is not None:
+            update["replacement_evidence"] = replacement
+        return update
 
-    @staticmethod
-    def _promotion_transition(marker: dict[str, Any]) -> UnitTransition:
+    @classmethod
+    def _promotion_transition(cls, marker: dict[str, Any]) -> UnitTransition:
         outcome = marker.get("outcome") or {}
         transition_id = str(marker.get("transition_id") or "")
+        extra = {
+            "transition_id": transition_id,
+            "transition_timestamp": marker.get("transition_timestamp"),
+            "transition_run_id": marker.get("transition_run_id"),
+            "promotion_transaction_id": marker.get("transaction_id"),
+            "candidate_sha256": marker.get("candidate_sha256"),
+        }
+        replacement = cls._replacement_green_evidence(marker)
+        if replacement is not None:
+            extra["replacement_evidence"] = replacement
         return UnitTransition(
             unit=str(marker.get("unit") or ""),
             result=str(outcome.get("result") or RESULT_GREEN),
@@ -2250,18 +2368,49 @@ class WasmUnitDriver:
             oracle_summary=outcome.get("summary"),
             model=outcome.get("model"),
             tier=outcome.get("tier"),
-            extra={
-                "transition_id": transition_id,
-                "transition_timestamp": marker.get("transition_timestamp"),
-                "transition_run_id": marker.get("transition_run_id"),
-                "promotion_transaction_id": marker.get("transaction_id"),
-                "candidate_sha256": marker.get("candidate_sha256"),
-            },
+            extra=extra,
         )
 
-    def _journal_has_transition(self, transition_id: str) -> bool:
+    @staticmethod
+    def _transition_semantics(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in record.items()
+            if key not in {"timestamp", "run_id"}
+        }
+
+    def _journal_transition_status(
+        self, expected: UnitTransition, *, require_remote: bool = False
+    ) -> str:
+        """Classify one transition, optionally requiring authoritative publication."""
+        transition_id = str(expected.extra.get("transition_id") or "")
         if not transition_id:
-            return False
+            return "absent"
+        expected_semantics = self._transition_semantics(
+            expected.to_record("", "")
+        )
+        found = False
+
+        def classify(records: list[dict[str, Any]]) -> str | None:
+            nonlocal found
+            matching = []
+            for record in records:
+                extra = record.get("extra") if isinstance(record, dict) else None
+                if (
+                    isinstance(extra, dict)
+                    and extra.get("transition_id") == transition_id
+                ):
+                    matching.append(record)
+            if not matching:
+                return None
+            found = True
+            if any(
+                self._transition_semantics(record) != expected_semantics
+                for record in matching
+            ):
+                return "conflict"
+            return "exact"
+
         receipt_reader = getattr(self._journal, "transition_receipt", None)
         if callable(receipt_reader):
             try:
@@ -2269,20 +2418,20 @@ class WasmUnitDriver:
             except Exception:  # noqa: BLE001 - recovery remains fail closed
                 receipt = {}
             if isinstance(receipt, dict) and receipt.get("recorded"):
-                return True
+                records = receipt.get("records")
+                if not isinstance(records, list) or not records:
+                    return "conflict"
+                receipt_status = classify(records)
+                if receipt_status != "exact":
+                    return "conflict"
         reader = getattr(self._journal, "_local_events", None)
         if callable(reader):
             try:
                 records = reader()
             except Exception:  # noqa: BLE001 - recovery remains fail closed
                 records = []
-            for record in records:
-                extra = record.get("extra") if isinstance(record, dict) else None
-                if (
-                    isinstance(extra, dict)
-                    and extra.get("transition_id") == transition_id
-                ):
-                    return True
+            if classify(records) == "conflict":
+                return "conflict"
         checkpoints = getattr(self._journal, "checkpoints", None)
         if isinstance(checkpoints, list):
             for checkpoint in checkpoints:
@@ -2291,13 +2440,32 @@ class WasmUnitDriver:
                     if isinstance(checkpoint, dict)
                     else None
                 )
-                extra = getattr(transition, "extra", None)
-                if (
-                    isinstance(extra, dict)
-                    and extra.get("transition_id") == transition_id
-                ):
-                    return True
-        return False
+                if isinstance(transition, UnitTransition):
+                    status = classify([transition.to_record("", "")])
+                    if status == "conflict":
+                        return "conflict"
+        if require_remote:
+            remote_reader = getattr(
+                self._journal, "authoritative_transition_receipt", None
+            )
+            if not callable(remote_reader):
+                return "pending_remote"
+            try:
+                remote_receipt = remote_reader(transition_id)
+            except Exception:  # noqa: BLE001 - remote proof is fail closed
+                return "pending_remote"
+            if not isinstance(remote_receipt, dict):
+                return "pending_remote"
+            remote_records = remote_receipt.get("remote_records")
+            if not isinstance(remote_records, list):
+                return "pending_remote"
+            remote_status = classify(remote_records)
+            if remote_status == "conflict":
+                return "conflict"
+            if not remote_receipt.get("authoritative") or remote_status != "exact":
+                return "pending_remote"
+            return "exact"
+        return "exact" if found else "absent"
 
     def _finalize_promotion_transaction(
         self,
@@ -2317,6 +2485,7 @@ class WasmUnitDriver:
         if candidate is None or candidate.sha256 != marker.get("candidate_sha256"):
             raise RuntimeError("installed candidate unavailable during finalization")
         transaction = PromotionTransaction(attempt_dir, candidate, destination)
+        self._verify_transaction_replacement_state(transaction)
         transition_id = str(marker.get("transition_id") or uuid.uuid4().hex)
         transition_timestamp = str(marker.get("transition_timestamp") or utc_now())
         transition_run_id = str(
@@ -2338,6 +2507,7 @@ class WasmUnitDriver:
         if remote not in {remote_preimage, prepared}:
             raise RuntimeError("port-staging moved outside promotion transaction")
         if remote != prepared:
+            self._verify_transaction_replacement_state(transaction)
             pushed = self._push_product_sha(prepared)
             remote = self._remote_port_staging_sha()
             if pushed.returncode != 0 or remote != prepared:
@@ -2357,6 +2527,7 @@ class WasmUnitDriver:
             push_result={"pushed": True, "detail": "", "remote_sha": prepared},
         )
         self._promotion_phase_boundary("push", transaction)
+        self._verify_transaction_replacement_state(transaction)
         marker = self._promotion_marker(attempt_dir) or marker
         green_update = self._promotion_green_update(marker)
         projected = self._project_record_update(
@@ -2366,20 +2537,56 @@ class WasmUnitDriver:
         # metadata describes the superseded verdict and must not survive to
         # contradict this green record (or poison assembly eligibility).
         projected["units"][str(marker.get("unit"))].pop("revoked", None)
+        for stale_key in (
+            "diagnosis",
+            "diagnosis_malformed",
+            "diagnosis_invalidation",
+            "f4_nominated",
+            "source_failure_id",
+            "failure_domain",
+            "diagnosis_eligible",
+        ):
+            projected["units"][str(marker.get("unit"))].pop(stale_key, None)
         self._update_promotion_marker(
             attempt_dir, phase="checkpointing", green_record=green_update
         )
-        if not self._journal_has_transition(transition_id):
-            if not self._checkpoint(projected, self._promotion_transition(marker)):
+        self._verify_transaction_replacement_state(transaction)
+        expected_transition = self._promotion_transition(marker)
+        journal_status = self._journal_transition_status(
+            expected_transition, require_remote=True
+        )
+        if journal_status == "conflict":
+            raise RuntimeError(
+                "promotion transition id exists with different durable semantics"
+            )
+        if journal_status != "exact":
+            if not self._checkpoint(
+                projected, expected_transition, require_progress_push=True
+            ):
                 return False
+        if self._journal_transition_status(
+            expected_transition, require_remote=True
+        ) != "exact":
+            raise RuntimeError(
+                "promotion transition lacks an exact authoritative semantic receipt"
+            )
         self._promotion_phase_boundary("checkpoint_durable", transaction)
+        self._verify_transaction_replacement_state(transaction)
         self._update_promotion_marker(attempt_dir, phase="checkpointed")
         self._promotion_phase_boundary("checkpoint", transaction)
+        self._verify_transaction_replacement_state(transaction)
+        self._update_promotion_marker(
+            attempt_dir,
+            phase="state-saving",
+            green_state_content_sha256=self._state_content_sha256(projected),
+        )
+        self._verify_transaction_replacement_state(transaction)
         self._save_state(projected)
         state.clear()
         state.update(projected)
         self._update_promotion_marker(attempt_dir, phase="state-saved")
         self._promotion_phase_boundary("state_save", transaction)
+        self._verify_transaction_replacement_state(transaction)
         self._cleanup_promotion_attempt(attempt_dir)
         return True
 
@@ -2489,26 +2696,277 @@ class WasmUnitDriver:
                 )
         return ok
 
-    def _install_promotion_candidate(
-        self, candidate: UnitArtifact, destination: Path
-    ) -> str:
-        """Atomically install an absent candidate or accept an exact preimage.
+    @staticmethod
+    def _record_sha256(record: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
-        A same-name destination with any other contents is authoritative and
-        must never be overwritten or recursively deleted.
+    @classmethod
+    def _state_content_sha256(cls, state: dict[str, Any]) -> str:
+        """Bind canonical content while excluding its write-time timestamp."""
+        return cls._record_sha256({
+            key: value for key, value in state.items() if key != "updated_at"
+        })
+
+    @staticmethod
+    def _artifact_inventory(directory: Path) -> list[dict[str, Any]]:
+        if directory.is_symlink() or (
+            hasattr(directory, "is_junction") and directory.is_junction()
+        ):
+            raise RuntimeError("artifact preimage directory is a link")
+        inventory: list[dict[str, Any]] = []
+        for path in sorted(directory.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                raise RuntimeError("artifact preimage inventory contains a link")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise RuntimeError("artifact preimage inventory has unsupported entry")
+            payload = path.read_bytes()
+            inventory.append({
+                "path": path.relative_to(directory).as_posix(),
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+        return inventory
+
+    def _replacement_authorization(
+        self, transaction: PromotionTransaction, record: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Bind one same-unit rebuild to its sanctioned revoked preimage.
+
+        Mutable disk is never its own authorization.  Current lifecycles use
+        their journal-carried digest; digest-less legacy lifecycles must prove
+        the directory against the recorded commit on the authoritative remote
+        publication lineage before a rename can occur.
         """
+        marker = self._promotion_marker(transaction.attempt_dir)
+        if marker is None:
+            raise RuntimeError("promotion replacement lost ownership marker")
+        snapshot = load_canonical_state_snapshot(self.state_path)
+        canonical = snapshot.units.get(transaction.candidate.name)
+        if (
+            not isinstance(canonical, dict)
+            or canonical.get("status") != record.get("status")
+            or canonical.get("attempts") != record.get("attempts")
+            or canonical.get("revoked") != record.get("revoked")
+        ):
+            raise RuntimeError("canonical unit state changed before replacement")
+        revoked = canonical.get("revoked")
+        if (
+            canonical.get("status") != "porting"
+            or int(canonical.get("attempts", 0)) != int(marker.get("attempt", -1))
+            or not isinstance(revoked, dict)
+            or revoked.get("via") != "revoke-unit"
+            or revoked.get("previous_status") != "green"
+            or revoked.get("previous_tier") != transaction.candidate.tier
+            or not isinstance(revoked.get("reason"), str)
+            or not revoked.get("reason", "").strip()
+            or re.fullmatch(
+                r"verdict-revoke-[0-9a-f]{64}",
+                str(revoked.get("transition_id") or ""),
+                re.I,
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(revoked.get("previous_record_sha256") or ""), re.I
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{7,64}", str(revoked.get("previous_commit") or ""), re.I
+            )
+            is None
+        ):
+            raise RuntimeError("artifact preimage has no eligible revoked lifecycle")
+        destination = transaction.destination
+        expected_root = (
+            self.artifact_root
+            if transaction.candidate.tier == "oracle_green"
+            else self.staging_root
+        )
+        if Path(os.path.abspath(destination)) != Path(
+            os.path.abspath(expected_root / transaction.candidate.name)
+        ):
+            raise RuntimeError("revoked artifact destination has wrong tier root")
+        if destination.is_symlink() or (
+            hasattr(destination, "is_junction") and destination.is_junction()
+        ):
+            raise RuntimeError("revoked artifact destination is a link")
+        existing = load_unit_artifact(destination)
+        preimage = marker.get("artifact_preimage") or {}
+        if (
+            existing is None
+            or existing.name != transaction.candidate.name
+            or existing.tier != transaction.candidate.tier
+            or existing.sha256 != preimage.get("sha256")
+        ):
+            raise RuntimeError("revoked artifact preimage changed before authorization")
+
+        previous_digest = revoked.get("previous_candidate_sha256")
+        proof: dict[str, Any]
+        if previous_digest is not None:
+            if previous_digest != existing.sha256:
+                raise RuntimeError("revoked artifact digest does not match preimage")
+            proof = {
+                "binding": "revocation-canonical-digest",
+                "artifact_sha256": existing.sha256,
+                "commit": revoked.get("previous_commit"),
+            }
+        else:
+            backfill = canonical.get("artifact_digest_backfill")
+            if (
+                isinstance(backfill, dict)
+                and backfill.get("artifact_sha256") == existing.sha256
+                and backfill.get("commit") == revoked.get("previous_commit")
+            ):
+                proof = {
+                    "binding": "revocation-journaled-backfill",
+                    "artifact_sha256": existing.sha256,
+                    "commit": revoked.get("previous_commit"),
+                    "backfill_transition_id": backfill.get("transition_id"),
+                }
+            else:
+                remote_sha = self._remote_port_staging_sha(strict=True)
+                if remote_sha is None:
+                    raise RuntimeError(
+                        "authoritative port-staging ref unavailable for legacy preimage"
+                    )
+                proof, proof_error = prove_legacy_artifact_commit_tree(
+                    existing,
+                    {"commit": revoked.get("previous_commit")},
+                    repo_root=self.repo_root,
+                    git_runner=self._git_runner,
+                    publication_ref="refs/heads/port-staging",
+                    publication_sha=remote_sha,
+                    required_committed_files=BACKFILL_REQUIRED_COMMITTED_FILES,
+                    allowed_ignored_extras=BACKFILL_ALLOWED_IGNORED_EVIDENCE,
+                )
+                if proof is None:
+                    raise RuntimeError(
+                        f"legacy revoked artifact proof failed: {proof_error}"
+                    )
+        return {
+            "schema": 1,
+            "unit": transaction.candidate.name,
+            "tier": transaction.candidate.tier,
+            "canonical_state_sha256": snapshot.sha256,
+            "canonical_record_sha256": self._record_sha256(canonical),
+            "revocation_transition_id": revoked.get("transition_id"),
+            "previous_record_sha256": revoked.get("previous_record_sha256"),
+            "previous_commit": revoked.get("previous_commit"),
+            "preimage_sha256": existing.sha256,
+            "candidate_sha256": transaction.candidate.sha256,
+            "backup": "artifact.preimage",
+            "preimage_inventory": self._artifact_inventory(destination),
+            "proof": proof,
+        }
+
+    def _verify_replacement_state(
+        self,
+        authorization: dict[str, Any],
+        marker: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            snapshot = load_canonical_state_snapshot(self.state_path)
+        except ValueError as error:
+            raise RuntimeError("canonical state unavailable during replacement") from error
+        if marker is not None and marker.get("green_state_content_sha256"):
+            try:
+                payload = self.state_path.read_bytes()
+                if hashlib.sha256(payload).hexdigest() != snapshot.sha256:
+                    raise RuntimeError(
+                        "canonical state changed during replacement verification"
+                    )
+                current_state = json.loads(payload.decode("utf-8-sig"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    "canonical state unavailable during replacement verification"
+                ) from error
+            if self._state_content_sha256(current_state) == marker.get(
+                "green_state_content_sha256"
+            ):
+                return
+        canonical = snapshot.units.get(str(authorization.get("unit") or ""))
+        if (
+            snapshot.sha256 != authorization.get("canonical_state_sha256")
+            or not isinstance(canonical, dict)
+            or self._record_sha256(canonical)
+            != authorization.get("canonical_record_sha256")
+        ):
+            raise RuntimeError("canonical state changed during artifact replacement")
+
+    def _verify_transaction_replacement_state(
+        self, transaction: PromotionTransaction
+    ) -> None:
+        marker = self._promotion_marker(transaction.attempt_dir)
+        if marker is None:
+            raise RuntimeError("promotion transaction lost its ownership marker")
+        authorization = marker.get("replacement_authorization")
+        if isinstance(authorization, dict):
+            self._verify_replacement_state(authorization, marker)
+
+    def _install_promotion_candidate(
+        self, transaction: PromotionTransaction, record: dict[str, Any]
+    ) -> str:
+        """Install a candidate, replacing only its exact revoked predecessor.
+
+        The two-directory swap is journaled in the owned attempt marker.  Its
+        rollback understands both rename gaps, so restart restores the exact
+        old artifact until the replacement has a published green transition.
+        """
+        candidate = transaction.candidate
+        destination = transaction.destination
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
+            if destination.is_symlink() or (
+                hasattr(destination, "is_junction") and destination.is_junction()
+            ):
+                raise RuntimeError("artifact destination is a link")
             existing = load_unit_artifact(destination)
             if (
                 existing is None
                 or existing.name != candidate.name
                 or existing.sha256 != candidate.sha256
             ):
-                raise RuntimeError(
-                    f"artifact destination already exists with a different "
-                    f"preimage: {destination}"
+                authorization = self._replacement_authorization(transaction, record)
+                backup = transaction.attempt_dir / authorization["backup"]
+                if backup.exists():
+                    raise RuntimeError("replacement preimage backup already exists")
+                self._update_promotion_marker(
+                    transaction.attempt_dir,
+                    phase="replacement-authorized",
+                    replacement_authorization=authorization,
                 )
+                self._promotion_phase_boundary("replacement_authorized", transaction)
+                self._verify_replacement_state(authorization)
+                if unit_artifact_sha256(destination) != authorization["preimage_sha256"]:
+                    raise RuntimeError("artifact preimage raced replacement authorization")
+                destination.rename(backup)
+                self._promotion_phase_boundary("replacement_preimage_renamed", transaction)
+                if (
+                    destination.exists()
+                    or unit_artifact_sha256(backup) != authorization["preimage_sha256"]
+                ):
+                    raise RuntimeError("revoked artifact preimage detach failed")
+                self._update_promotion_marker(
+                    transaction.attempt_dir, phase="replacement-preimage-detached"
+                )
+                self._verify_replacement_state(authorization)
+                candidate.directory.rename(destination)
+                self._promotion_phase_boundary("replacement_candidate_renamed", transaction)
+                self._verify_replacement_state(authorization)
+                installed = load_unit_artifact(destination)
+                if (
+                    installed is None
+                    or installed.name != candidate.name
+                    or installed.sha256 != candidate.sha256
+                    or unit_artifact_sha256(backup) != authorization["preimage_sha256"]
+                ):
+                    raise RuntimeError("replacement artifact digest verification failed")
+                return "revoked-preimage-replaced"
             return "preimage-verified"
         try:
             candidate.directory.rename(destination)
@@ -3520,7 +3978,7 @@ class WasmUnitDriver:
         try:
             self._update_promotion_marker(attempt_dir, phase="gate-passed")
             self._update_promotion_marker(attempt_dir, phase="installing")
-            install_result = self._install_promotion_candidate(candidate, artifact_dir)
+            install_result = self._install_promotion_candidate(transaction, record)
             self._update_promotion_marker(
                 attempt_dir,
                 phase="artifact-installed",
@@ -3529,7 +3987,12 @@ class WasmUnitDriver:
                 outcome=promotion_outcome,
             )
             self._promotion_phase_boundary("install", transaction)
+            self._verify_transaction_replacement_state(transaction)
         except Exception as install_error:  # noqa: BLE001 - refuse any overwrite
+            install_marker = self._promotion_marker(attempt_dir) or {}
+            replacement_authorization = install_marker.get(
+                "replacement_authorization"
+            )
             try:
                 self._rollback_uncommitted_transaction(
                     transaction, reason="artifact-install"
@@ -3545,6 +4008,24 @@ class WasmUnitDriver:
                     error=f"{install_error}{rollback_detail}"[:600],
                 )
                 return "journal_blocked"
+            if isinstance(replacement_authorization, dict):
+                try:
+                    current_snapshot = load_canonical_state_snapshot(self.state_path)
+                except ValueError:
+                    current_snapshot = None
+                if (
+                    current_snapshot is None
+                    or current_snapshot.sha256
+                    != replacement_authorization.get("canonical_state_sha256")
+                ):
+                    self.events.emit(
+                        "promotion_transaction_blocked",
+                        unit=name,
+                        phase="artifact-install",
+                        error="canonical state changed during replacement; "
+                        "artifact restored, refusing stale verdict write",
+                    )
+                    return "journal_blocked"
             return self._fail(
                 state,
                 record,
@@ -3634,6 +4115,28 @@ class WasmUnitDriver:
             )
         self._record_registry_postimage(transaction)
         self._promotion_phase_boundary("registry", transaction)
+        try:
+            self._verify_transaction_replacement_state(transaction)
+        except RuntimeError as state_error:
+            try:
+                self._rollback_uncommitted_transaction(
+                    transaction, reason="replacement-state-changed"
+                )
+            except Exception as rollback_error:  # noqa: BLE001 - fail closed
+                self.events.emit(
+                    "promotion_transaction_blocked",
+                    unit=name,
+                    phase="replacement-state-rollback",
+                    error=f"{state_error}; rollback failed: {rollback_error}"[:600],
+                )
+                return "journal_blocked"
+            self.events.emit(
+                "promotion_transaction_blocked",
+                unit=name,
+                phase="replacement-state-changed",
+                error=str(state_error)[:600],
+            )
+            return "journal_blocked"
 
         paths, commit_message = self._unit_commit_spec(
             name,
@@ -3808,6 +4311,11 @@ class WasmUnitDriver:
         world = self._world_version()
         payload: dict[str, Any] = dict(extra or {})
         payload["world_version"] = world
+        diagnosis_eligible = stage in SOURCE_DIAGNOSIS_STAGES
+        payload["failure_domain"] = (
+            "source-compiler" if diagnosis_eligible else "pipeline-control"
+        )
+        payload["diagnosis_eligible"] = diagnosis_eligible
         transition = UnitTransition(
             unit=name,
             result=result,
@@ -3822,6 +4330,14 @@ class WasmUnitDriver:
         record_update = dict(payload)
         record_update.update(status=status, error=error[:2000], last_stage=stage)
         projected_state = self._project_record_update(state, name, record_update)
+        projected_record = projected_state["units"][name]
+        source_failure_id = self._source_failure_id(name, projected_record)
+        if source_failure_id is not None:
+            record_update["source_failure_id"] = source_failure_id
+            projected_record["source_failure_id"] = source_failure_id
+        else:
+            projected_record.pop("source_failure_id", None)
+            record_update["source_failure_id"] = None
         if status in self.SETTLED_STATUSES or journal_required:
             # Settling removes the unit from the queue permanently, and
             # `_reconcile_interrupted` only rescues units left as `porting`.
@@ -4011,6 +4527,7 @@ class WasmUnitDriver:
             backup = self._backup_state()
             previous_tier = record.get("tier")
             previous_commit = record.get("commit")
+            previous_candidate_sha256 = record.get("candidate_sha256")
             previous_record = json.loads(json.dumps(record))
             previous_record_sha256 = hashlib.sha256(
                 json.dumps(
@@ -4040,6 +4557,7 @@ class WasmUnitDriver:
                 "previous_status": previous_status,
                 "previous_tier": previous_tier,
                 "previous_commit": previous_commit,
+                "previous_candidate_sha256": previous_candidate_sha256,
                 "previous_oracle_summary": record.get("oracle_summary"),
                 "previous_record_sha256": previous_record_sha256,
                 "transition_id": transition_id,
@@ -4081,6 +4599,7 @@ class WasmUnitDriver:
                     "previous_status": previous_status,
                     "previous_tier": previous_tier,
                     "previous_commit": previous_commit,
+                    "previous_candidate_sha256": previous_candidate_sha256,
                     "previous_record_sha256": previous_record_sha256,
                     "transition_id": transition_id,
                 },
@@ -4140,6 +4659,122 @@ class WasmUnitDriver:
                 "registry_changed": retier.changed,
                 "backup": backup,
                 "already_requeued": False,
+                "state_file": str(self.state_path),
+            }
+        finally:
+            self.lock.release()
+
+    def invalidate_diagnosis(
+        self, unit_name: str, reason: str
+    ) -> dict[str, Any]:
+        """Sanction removal of a misrouted diagnosis through the journal.
+
+        The product, artifact, and registry trees are outside this maintenance
+        transaction.  The exact canonical record is its preimage; the durable
+        progress receipt precedes the atomic canonical-state update.
+        """
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("diagnosis invalidation requires a non-empty reason")
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; diagnosis "
+                "invalidation would race its state writes"
+            )
+        try:
+            state = self._load_state()
+            record = state.get("units", {}).get(unit_name)
+            if not isinstance(record, dict):
+                raise ValueError(f"unknown canonical unit {unit_name!r}")
+            prior = record.get("diagnosis_invalidation")
+            if (
+                not record.get("diagnosis")
+                and not record.get("diagnosis_malformed")
+                and not record.get("f4_nominated")
+            ):
+                if isinstance(prior, dict) and prior.get("reason") == reason:
+                    return {
+                        "unit": unit_name,
+                        "transition_id": prior.get("transition_id"),
+                        "already_invalidated": True,
+                        "backup": None,
+                        "state_file": str(self.state_path),
+                    }
+                raise ValueError(f"unit {unit_name!r} has no diagnosis to invalidate")
+            previous_record = json.loads(json.dumps(record))
+            previous_record_sha256 = self._record_sha256(previous_record)
+            transition_id = "diagnosis-invalidate-" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "unit": unit_name,
+                        "reason": reason,
+                        "previous_record": previous_record,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            projected = json.loads(json.dumps(state))
+            projected_record = projected["units"][unit_name]
+            removed = {
+                key: projected_record.pop(key)
+                for key in ("diagnosis", "diagnosis_malformed", "f4_nominated")
+                if key in projected_record
+            }
+            invalidation = {
+                "via": "invalidate-diagnosis",
+                "reason": reason,
+                "previous_record_sha256": previous_record_sha256,
+                "transition_id": transition_id,
+                "invalidated_stage": previous_record.get("last_stage"),
+                "invalidated_source_failure_id": (
+                    (previous_record.get("diagnosis") or {}).get("source_failure_id")
+                    if isinstance(previous_record.get("diagnosis"), dict)
+                    else None
+                ),
+            }
+            projected_record["diagnosis_invalidation"] = invalidation
+            backup = self._backup_state()
+            transition = UnitTransition(
+                unit=unit_name,
+                result=RESULT_DEFERRED,
+                stage="diagnosis-invalidate",
+                attempt=record.get("attempts", 0),
+                detail=f"diagnosis invalidated: {reason}",
+                model=self._model_config.model,
+                extra={
+                    **invalidation,
+                    "transition_id": transition_id,
+                    "removed_keys": sorted(removed),
+                },
+            )
+            if not self._checkpoint(
+                projected,
+                transition,
+                workflow_state="maintenance",
+                driver_running=False,
+                require_progress_push=True,
+            ):
+                raise RuntimeError(
+                    "diagnosis invalidation was not committed and pushed to "
+                    "port-progress; canonical state remains unchanged"
+                )
+            self._save_state(projected)
+            self.events.emit(
+                "diagnosis_invalidated",
+                unit=unit_name,
+                reason=reason[:600],
+                transition_id=transition_id,
+                removed_keys=sorted(removed),
+                via="invalidate-diagnosis",
+            )
+            return {
+                "unit": unit_name,
+                "transition_id": transition_id,
+                "already_invalidated": False,
+                "removed_keys": sorted(removed),
+                "backup": backup,
                 "state_file": str(self.state_path),
             }
         finally:
@@ -4509,6 +5144,39 @@ class WasmUnitDriver:
 
     # ------------------------------------------------- diagnosis (section 2.12b)
 
+    @staticmethod
+    def _source_failure_id(name: str, record: dict[str, Any]) -> str | None:
+        """Return the deterministic identity of the current source failure."""
+        if (
+            record.get("last_stage") not in SOURCE_DIAGNOSIS_STAGES
+            or record.get("diagnosis_eligible") is not True
+            or record.get("failure_domain") != "source-compiler"
+        ):
+            return None
+        rounds = record.get("rounds") or []
+        last_round = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}
+        preimage = {
+            "schema": 1,
+            "unit": name,
+            "stage": record.get("last_stage"),
+            "error": str(record.get("error") or "")[:2000],
+            "diagnostic_fingerprint": last_round.get("fingerprint"),
+            "world_version": record.get("world_version"),
+        }
+        return "source-failure-" + hashlib.sha256(
+            json.dumps(preimage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _diagnosis_is_current(cls, name: str, record: dict[str, Any]) -> bool:
+        diagnosis = record.get("diagnosis")
+        source_failure_id = cls._source_failure_id(name, record)
+        return (
+            isinstance(diagnosis, dict)
+            and source_failure_id is not None
+            and diagnosis.get("source_failure_id") == source_failure_id
+        )
+
     def _diagnose_unit(
         self, unit: dict[str, Any], record: dict[str, Any], state: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -4522,7 +5190,17 @@ class WasmUnitDriver:
         scheduled attempt carries. Any fault degrades to an event and leaves
         the question unconsumed."""
         name = unit["name"]
-        if record.get("diagnosis"):
+        source_failure_id = self._source_failure_id(name, record)
+        if source_failure_id is None:
+            self.events.emit(
+                "diagnosis_skipped",
+                unit=name,
+                stage=record.get("last_stage"),
+                failure_domain=record.get("failure_domain"),
+                reason="failure domain is not source-diagnosable",
+            )
+            return None
+        if self._diagnosis_is_current(name, record):
             return record["diagnosis"]
         try:
             # Same materialization seam as the build (F-D5-6): the diagnosis
@@ -4583,6 +5261,8 @@ class WasmUnitDriver:
                     "reason": f"{malformed} malformed replies; question retired",
                     "attempts_at": record.get("attempts", 0),
                     "at": utc_now(),
+                    "source_stage": record.get("last_stage"),
+                    "source_failure_id": source_failure_id,
                 }
                 self.events.emit(
                     "diagnosis_unparseable", unit=name, malformed=malformed
@@ -4598,6 +5278,8 @@ class WasmUnitDriver:
             "reason": reason,
             "attempts_at": record.get("attempts", 0),
             "at": utc_now(),
+            "source_stage": record.get("last_stage"),
+            "source_failure_id": source_failure_id,
         }
         record["diagnosis"] = diagnosis
         if verdict == "STRUCTURAL":
@@ -5025,6 +5707,8 @@ class WasmUnitDriver:
                 name
                 for name, record in units.items()
                 if record.get("f4_nominated")
+                and self._diagnosis_is_current(name, record)
+                and (record.get("diagnosis") or {}).get("verdict") == "STRUCTURAL"
                 and record.get("status") == "red_retryable"
                 and name in queue
             ]
@@ -5288,7 +5972,8 @@ class WasmUnitDriver:
             # across every product_priority band, and still runs when it is
             # the only work left.
             structural = int(
-                (record.get("diagnosis") or {}).get("verdict") == "STRUCTURAL"
+                self._diagnosis_is_current(name, record)
+                and (record.get("diagnosis") or {}).get("verdict") == "STRUCTURAL"
             )
             # Section 2.14 [V4-2]: product_priority leads the key (higher
             # serves first, hence negated); chunk/queue order stays the tail
@@ -5430,7 +6115,9 @@ class WasmUnitDriver:
                         for waiting_name in waiting:
                             waiting_record = self._unit_state(state, waiting_name)
                             if (
-                                not waiting_record.get("diagnosis")
+                                not self._diagnosis_is_current(
+                                    waiting_name, waiting_record
+                                )
                                 and waiting_name in queue_by_name
                             ):
                                 self._diagnose_unit(
@@ -5438,7 +6125,13 @@ class WasmUnitDriver:
                                     waiting_record,
                                     state,
                                 )
-                            diagnosis = waiting_record.get("diagnosis") or {}
+                            diagnosis = (
+                                waiting_record.get("diagnosis") or {}
+                                if self._diagnosis_is_current(
+                                    waiting_name, waiting_record
+                                )
+                                else {}
+                            )
                             diagnoses.append(
                                 {
                                     "unit": waiting_name,
@@ -5528,7 +6221,9 @@ class WasmUnitDriver:
                     failed_record = self._unit_state(state, unit["name"])
                     if (
                         failed_record.get("attempts", 0) >= 2
-                        and not failed_record.get("diagnosis")
+                        and not self._diagnosis_is_current(
+                            unit["name"], failed_record
+                        )
                     ):
                         self._diagnose_unit(unit, failed_record, state)
                 processed.add(unit["name"])
@@ -5585,6 +6280,19 @@ def main(argv: list[str] | None = None) -> int:
         help="why this verdict is invalid (journaled verbatim)",
     )
     revoke.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    invalidate = sub.add_parser(
+        "invalidate-diagnosis",
+        help="remove one misrouted diagnosis through a lock-held, journal-first "
+        "maintenance transition; never edits artifacts, registry, or product refs",
+    )
+    invalidate.add_argument("--unit", required=True, help="canonical unit name")
+    invalidate.add_argument(
+        "--reason", required=True,
+        help="why the recorded diagnosis is invalid (journaled verbatim)",
+    )
+    invalidate.add_argument(
+        "--repo-root", default=None, help="GotYaForce checkout root"
+    )
     backfill = sub.add_parser(
         "backfill-artifact-digest",
         help="sanction one digest-less historical green through an exact "
@@ -5659,6 +6367,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "revoke-unit":
         driver = WasmUnitDriver(repo_root=args.repo_root)
         print(json.dumps(driver.revoke_unit(args.unit, args.reason), indent=2))
+        return 0
+    if args.command == "invalidate-diagnosis":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        print(json.dumps(
+            driver.invalidate_diagnosis(args.unit, args.reason), indent=2
+        ))
         return 0
     if args.command == "backfill-artifact-digest":
         driver = WasmUnitDriver(repo_root=args.repo_root)

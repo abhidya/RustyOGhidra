@@ -484,7 +484,10 @@ class ProgressJournal:
         return str(extra.get("transition_id") or "")
 
     @classmethod
-    def _jsonl_has_transition(cls, text: str, transition_id: str) -> bool:
+    def _jsonl_transition_records(
+        cls, text: str, transition_id: str
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
         for line in text.splitlines():
             try:
                 record = json.loads(line)
@@ -494,30 +497,47 @@ class ProgressJournal:
                 isinstance(record, dict)
                 and cls._transition_id(record) == transition_id
             ):
-                return True
-        return False
+                records.append(record)
+        return records
+
+    @staticmethod
+    def transition_semantics(record: dict[str, Any]) -> dict[str, Any]:
+        """Normalize one transition for replay/conflict comparison."""
+        return {
+            key: value
+            for key, value in record.items()
+            if key not in {"timestamp", "run_id"}
+        }
 
     def transition_receipt(self, transition_id: str) -> dict[str, Any]:
         """Locate one stable transition in either durable journal copy."""
         if not transition_id:
             return {"recorded": False, "local": False, "branch": False}
-        local = any(
-            self._transition_id(record) == transition_id
+        local_records = [
+            record
             for record in self._local_events()
-        )
+            if self._transition_id(record) == transition_id
+        ]
+        branch_records: list[dict[str, Any]] = []
         try:
             shown = self._git_runner(
                 "show", f"refs/heads/{self.branch}:{PROGRESS_DIR}/events.jsonl"
             )
-            branch = shown.returncode == 0 and self._jsonl_has_transition(
-                shown.stdout, transition_id
-            )
+            if shown.returncode == 0:
+                branch_records = self._jsonl_transition_records(
+                    shown.stdout, transition_id
+                )
         except Exception:  # noqa: BLE001 - receipt lookup is read-only fallback
-            branch = False
+            branch_records = []
+        local = bool(local_records)
+        branch = bool(branch_records)
         receipt: dict[str, Any] = {
             "recorded": local or branch,
             "local": local,
             "branch": branch,
+            "local_records": local_records,
+            "branch_records": branch_records,
+            "records": [*local_records, *branch_records],
         }
         if branch:
             try:
@@ -526,6 +546,94 @@ class ProgressJournal:
                     receipt["commit"] = head.stdout.strip()
             except Exception:  # noqa: BLE001 - event receipt is still durable
                 pass
+        return receipt
+
+    def authoritative_transition_receipt(self, transition_id: str) -> dict[str, Any]:
+        """Read one transition from the branch tip advertised by the remote.
+
+        Local mirrors and ``refs/heads/port-progress`` prove only local
+        durability.  Promotion finalization needs the stronger publication
+        fact: the exact semantic event must be present in the commit currently
+        advertised by the configured remote.  ``ls-remote`` is authoritative;
+        object inspection uses the advertised SHA directly and never updates a
+        tracked or remote-tracking ref.  A missing local object is fetched with
+        ``--no-write-fetch-head`` before the read-only ``git show``.
+        """
+        receipt = self.transition_receipt(transition_id)
+        receipt.update({
+            "remote": False,
+            "remote_records": [],
+            "authoritative": False,
+        })
+        if not transition_id:
+            return receipt
+        remote_ref = f"refs/heads/{self.branch}"
+
+        def advertised_sha() -> tuple[str | None, str]:
+            try:
+                advertised = self._git_runner(
+                    "ls-remote", "--heads", self.remote, remote_ref
+                )
+            except Exception as error:  # noqa: BLE001 - fail-closed receipt
+                return None, f"ls-remote failed: {error}"
+            if advertised.returncode != 0:
+                return None, (advertised.stdout + advertised.stderr)[-400:]
+            matches: list[str] = []
+            for line in advertised.stdout.splitlines():
+                fields = line.split()
+                if len(fields) == 2 and fields[1] == remote_ref:
+                    matches.append(fields[0])
+            if len(matches) != 1 or re.fullmatch(
+                r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", matches[0]
+            ) is None:
+                return None, "remote branch has no unique valid advertised tip"
+            return matches[0].lower(), ""
+
+        remote_sha, remote_error = advertised_sha()
+        if remote_sha is None:
+            receipt["remote_error"] = remote_error
+            return receipt
+        receipt["remote_sha"] = remote_sha
+        shown = self._git_runner(
+            "show", f"{remote_sha}:{PROGRESS_DIR}/events.jsonl"
+        )
+        if shown.returncode != 0:
+            fetched = self._git_runner(
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                self.remote,
+                remote_sha,
+            )
+            if fetched.returncode != 0:
+                receipt["remote_error"] = (
+                    "advertised progress object unavailable: "
+                    + (fetched.stdout + fetched.stderr)[-300:]
+                )
+                return receipt
+            shown = self._git_runner(
+                "show", f"{remote_sha}:{PROGRESS_DIR}/events.jsonl"
+            )
+        if shown.returncode != 0:
+            receipt["remote_error"] = (
+                "advertised progress journal unavailable: "
+                + (shown.stdout + shown.stderr)[-300:]
+            )
+            return receipt
+        remote_records = self._jsonl_transition_records(
+            shown.stdout, transition_id
+        )
+        confirmed_sha, confirm_error = advertised_sha()
+        if confirmed_sha != remote_sha:
+            receipt["remote_error"] = (
+                confirm_error or "remote progress branch moved during receipt lookup"
+            )
+            return receipt
+        receipt.update({
+            "remote": bool(remote_records),
+            "remote_records": remote_records,
+            "authoritative": True,
+        })
         return receipt
 
     def _write_events(self, record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -733,6 +841,21 @@ class ProgressJournal:
         }
         if transition_id:
             receipt = self.transition_receipt(transition_id)
+            expected_record = (
+                transition.to_record("", "") if transition is not None else {}
+            )
+            expected_semantics = self.transition_semantics(expected_record)
+            if receipt["recorded"] and any(
+                self.transition_semantics(record) != expected_semantics
+                for record in receipt.get("records") or []
+            ):
+                return {
+                    "recorded": False,
+                    "committed": bool(receipt.get("branch")),
+                    "pushed": False,
+                    "semantic_conflict": True,
+                    "detail": "transition id already exists with different semantics",
+                }
             if receipt["branch"]:
                 outcome = {
                     "recorded": True,

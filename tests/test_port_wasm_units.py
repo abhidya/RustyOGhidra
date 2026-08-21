@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -128,6 +129,11 @@ def _driver(repo: Path, **kwargs) -> WasmUnitDriver:
         build_runner=lambda workdir, exports, extra=None: (True, ""),
         oracle_runner=lambda unit, wasm: (True, "1/1", "PASS log"),
         git_runner=lambda *args: _completed(0, "abc123\n"),
+        # Most unit tests isolate the product transaction.  A green promotion
+        # now correctly requires an authoritative progress-remote receipt, so
+        # the generic fixture must model that pushed journal explicitly rather
+        # than accidentally constructing a real journal over fake product Git.
+        journal=FakeJournal(),
     )
     defaults.update(kwargs)
     return WasmUnitDriver(**defaults)
@@ -1033,6 +1039,19 @@ class FakeJournal:
         self.checkpoints.append(kwargs)
         return {"recorded": True, "committed": True, "pushed": True}
 
+    def authoritative_transition_receipt(self, transition_id):
+        records = [
+            item["transition"].to_record("", "")
+            for item in self.checkpoints
+            if item.get("transition") is not None
+            and item["transition"].extra.get("transition_id") == transition_id
+        ]
+        return {
+            "authoritative": True,
+            "remote": bool(records),
+            "remote_records": records,
+        }
+
     def push_is_pending(self):
         return False
 
@@ -1149,6 +1168,7 @@ def test_revoke_unit_backs_up_journals_projected_pending_and_is_idempotent(
                         "oracle_summary": "compile-only (UNVERIFIED)",
                         "commit": "badc0ffee",
                         "pushed": True,
+                        "candidate_sha256": "c" * 64,
                         "world_version": {"driver_rev": "old"},
                     }
                 },
@@ -1189,6 +1209,8 @@ def test_revoke_unit_backs_up_journals_projected_pending_and_is_idempotent(
     assert record["last_stage"] == "manual-revoke"
     assert record["revoked"]["reason"] == reason
     assert record["revoked"]["previous_tier"] == "compile_only"
+    assert record["revoked"]["previous_candidate_sha256"] == "c" * 64
+    assert transition.extra["previous_candidate_sha256"] == "c" * 64
     for stale_key in ("tier", "oracle_summary", "commit", "pushed", "world_version"):
         assert stale_key not in record
     events = [
@@ -2599,6 +2621,726 @@ def test_passing_gate_refuses_to_overwrite_same_name_artifact_preimage(
     assert not list(driver.promotion_attempt_root.glob("*"))
 
 
+def _seed_revoked_replacement(repo: Path) -> tuple[Path, str]:
+    _seed_green_artifact(
+        repo, "unit-a", "2026-08-20T00:00:00Z", canonical=False
+    )
+    destination = repo / "research/decomp/port-units/unit-a"
+    old_digest = unit_artifact_sha256(destination)
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {
+            "unit-a": {
+                "status": "pending",
+                "attempts": 2,
+                "revoked": {
+                    "via": "revoke-unit",
+                    "at": "2026-08-21T13:27:00Z",
+                    "reason": "reviewed rebuild required",
+                    "previous_status": "green",
+                    "previous_tier": "oracle_green",
+                    "previous_commit": "1022b6c9",
+                    "previous_candidate_sha256": old_digest,
+                    "previous_record_sha256": "a" * 64,
+                    "transition_id": "verdict-revoke-" + "b" * 64,
+                },
+                "diagnosis": {
+                    "verdict": "STRUCTURAL",
+                    "reason": "bogus control-plane diagnosis",
+                },
+                "f4_nominated": True,
+            }
+        },
+    }), encoding="utf-8")
+    return destination, old_digest
+
+
+def _promotion_source(tmp_path: Path) -> Path:
+    workdir = tmp_path / "replacement-source"
+    workdir.mkdir()
+    (workdir / "unit.c").write_text("int zz_test_(void) { return 7; }\n")
+    (workdir / "gnt4_shim.h").write_text("/* replacement */\n")
+    (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+    (workdir / "oracle.log").write_text("PASS replacement\n")
+    return workdir
+
+
+def test_revoked_same_unit_preimage_is_replaced_transactionally_and_settles_green(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    journal = FakeJournal()
+    git_calls = []
+    remote_sha = ["base0000"]
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        if args[0] == "ls-remote":
+            return _completed(0, f"{remote_sha[0]}\trefs/heads/port-staging\n")
+        if args[0] == "push":
+            remote_sha[0] = "deadbeef"
+        return _completed(0)
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    driver = _driver(
+        repo, journal=journal, git_runner=fake_git, build_runner=fake_build
+    )
+    assert driver.run() == EXIT_NO_WORK
+    record = _state(repo)["units"]["unit-a"]
+    assert record["status"] == "green"
+    assert record["candidate_sha256"] == unit_artifact_sha256(destination)
+    assert record["candidate_sha256"] != old_digest
+    replacement = record["replacement_evidence"]
+    assert replacement["preimage_sha256"] == old_digest
+    assert replacement["candidate_sha256"] == record["candidate_sha256"]
+    assert replacement["revocation_transition_id"] == "verdict-revoke-" + "b" * 64
+    assert replacement["transaction_id"] == record["promotion_transaction_id"]
+    assert replacement["preimage_inventory_entries"] == 3
+    assert len(replacement["preimage_inventory_sha256"]) == 64
+    assert len(replacement["proof_sha256"]) == 64
+    assert len(json.dumps(replacement)) < 1500
+    for stale in ("revoked", "diagnosis", "diagnosis_malformed", "f4_nominated"):
+        assert stale not in record
+    assert len([call for call in git_calls if call[0] == "commit"]) == 1
+    assert len([call for call in git_calls if call[0] == "push"]) == 1
+    green_transitions = [
+        item for item in journal.checkpoints
+        if item.get("transition") is not None
+        and item["transition"].extra.get("promotion_transaction_id")
+    ]
+    assert len(green_transitions) == 1
+    assert green_transitions[0]["transition"].extra["replacement_evidence"] == replacement
+    assert not list(driver.promotion_attempt_root.glob("*"))
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    ["replacement_preimage_renamed", "replacement_candidate_renamed"],
+)
+def test_revoked_replacement_restart_restores_exact_preimage_from_both_rename_gaps(
+    tmp_path, monkeypatch, crash_phase
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    state = _state(repo)
+    state["units"]["unit-a"]["status"] = "porting"
+    state["units"]["unit-a"]["attempts"] = 3
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    driver = _driver(repo, journal=FakeJournal())
+    transaction = driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=3,
+        workdir=_promotion_source(tmp_path),
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-21T14:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "oracle_green",
+        },
+        destination=destination,
+    )
+
+    def crash(phase, _transaction):
+        if phase == crash_phase:
+            raise KeyboardInterrupt(f"crash at {phase}")
+
+    driver._promotion_phase_boundary = crash
+    with pytest.raises(KeyboardInterrupt, match=crash_phase):
+        driver._install_promotion_candidate(
+            transaction, state["units"]["unit-a"]
+        )
+
+    restarted = _driver(repo, journal=FakeJournal())
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert unit_artifact_sha256(destination) == old_digest
+    assert not list(restarted.promotion_attempt_root.glob("*"))
+    quarantined = list(restarted.promotion_quarantine_root.iterdir())
+    assert len(quarantined) == 1
+    assert load_unit_artifact(quarantined[0] / "candidate") is not None
+
+
+def test_revoked_replacement_registry_phase_crash_restores_artifact_and_registry_preimages(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    git_calls = []
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=FakeJournal(),
+        git_runner=lambda *args: git_calls.append(args) or _completed(0, "abc123\n"),
+        build_runner=fake_build,
+    )
+
+    def crash(phase, _transaction):
+        if phase == "registry":
+            raise KeyboardInterrupt("crash after registry")
+
+    driver._promotion_phase_boundary = crash
+    with pytest.raises(KeyboardInterrupt, match="after registry"):
+        driver.run()
+    state = driver._load_state()
+    restarted = _driver(repo, journal=FakeJournal())
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert unit_artifact_sha256(destination) == old_digest
+    assert not restarted.registry_path.exists()
+    assert not list(restarted.promotion_attempt_root.glob("*"))
+    assert not [call for call in git_calls if call[0] in {"commit", "push"}]
+
+
+def test_revoked_replacement_state_or_preimage_race_never_overwrites_destination(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, _old_digest = _seed_revoked_replacement(repo)
+    state = _state(repo)
+    state["units"]["unit-a"]["status"] = "porting"
+    state["units"]["unit-a"]["attempts"] = 3
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    driver = _driver(repo, journal=FakeJournal())
+    transaction = driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=3,
+        workdir=_promotion_source(tmp_path),
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-21T14:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "oracle_green",
+        },
+        destination=destination,
+    )
+
+    def race(phase, _transaction):
+        if phase == "replacement_authorized":
+            (destination / "external-change").write_text("unowned race\n")
+
+    driver._promotion_phase_boundary = race
+    with pytest.raises(RuntimeError, match="raced replacement authorization"):
+        driver._install_promotion_candidate(
+            transaction, state["units"]["unit-a"]
+        )
+    assert (destination / "external-change").read_text() == "unowned race\n"
+    assert transaction.candidate.directory.is_dir()
+
+
+@pytest.mark.parametrize(
+    "mutation_phase",
+    [
+        "replacement_preimage_renamed",
+        "replacement_candidate_renamed",
+        "install",
+        "registry",
+    ],
+)
+def test_revoked_replacement_canonical_state_race_restores_artifact_and_blocks_stale_verdict(
+    tmp_path, monkeypatch, mutation_phase
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    journal = FakeJournal()
+    git_calls = []
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=lambda *args: git_calls.append(args) or _completed(0, "abc123\n"),
+        build_runner=fake_build,
+    )
+    changed = {"done": False}
+
+    def mutate_state(phase, _transaction):
+        if phase == mutation_phase and not changed["done"]:
+            changed["done"] = True
+            external = _state(repo)
+            external["external_owner_marker"] = "preserve-me"
+            _state_path(repo).write_text(json.dumps(external), encoding="utf-8")
+
+    driver._promotion_phase_boundary = mutate_state
+    assert driver.run() == EXIT_STOPPED
+    assert unit_artifact_sha256(destination) == old_digest
+    assert _state(repo)["external_owner_marker"] == "preserve-me"
+    assert journal.checkpoints == []
+    assert not [call for call in git_calls if call[0] in {"commit", "push"}]
+    assert not list(driver.promotion_attempt_root.glob("*"))
+    assert len(list(driver.promotion_quarantine_root.glob("*"))) == 1
+
+
+def test_revoked_replacement_state_change_after_local_commit_blocks_before_push_or_green(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    journal = FakeJournal()
+    git_calls = []
+
+    def fake_git(*args):
+        git_calls.append(args)
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        if args[0] == "ls-remote":
+            return _completed(0, "base0000\trefs/heads/port-staging\n")
+        return _completed(0)
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    driver = _driver(
+        repo, journal=journal, git_runner=fake_git, build_runner=fake_build
+    )
+
+    def mutate_after_commit(phase, _transaction):
+        if phase == "local_commit":
+            external = _state(repo)
+            external["external_owner_marker"] = "preserve-after-commit"
+            _state_path(repo).write_text(json.dumps(external), encoding="utf-8")
+
+    driver._promotion_phase_boundary = mutate_after_commit
+    assert driver.run() == EXIT_STOPPED
+    assert _state(repo)["external_owner_marker"] == "preserve-after-commit"
+    assert len([call for call in git_calls if call[0] == "commit"]) == 1
+    assert not [call for call in git_calls if call[0] == "push"]
+    assert journal.checkpoints == []
+    attempts = list(driver.promotion_attempt_root.glob("*"))
+    assert len(attempts) == 1
+    marker = json.loads((attempts[0] / ".promotion-attempt.json").read_text())
+    assert marker["replacement_authorization"]["preimage_sha256"] == old_digest
+    assert unit_artifact_sha256(attempts[0] / "artifact.preimage") == old_digest
+    assert unit_artifact_sha256(destination) == marker["candidate_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("revoked_update", "error"),
+    [
+        ({"previous_tier": "compile_only"}, "no eligible revoked lifecycle"),
+        ({"transition_id": "not-journaled"}, "no eligible revoked lifecycle"),
+        ({"previous_candidate_sha256": "0" * 64}, "does not match preimage"),
+        ({"previous_candidate_sha256": None}, "port-staging ref unavailable"),
+    ],
+)
+def test_revoked_replacement_rejects_wrong_tier_transition_or_digest_without_mutation(
+    tmp_path, monkeypatch, revoked_update, error
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    state = _state(repo)
+    record = state["units"]["unit-a"]
+    record["status"] = "porting"
+    record["attempts"] = 3
+    record["revoked"].update(revoked_update)
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    driver = _driver(repo, journal=FakeJournal())
+    transaction = driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=3,
+        workdir=_promotion_source(tmp_path),
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-21T14:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "oracle_green",
+        },
+        destination=destination,
+    )
+    with pytest.raises(RuntimeError, match=error):
+        driver._install_promotion_candidate(transaction, record)
+    assert unit_artifact_sha256(destination) == old_digest
+    assert transaction.candidate.directory.is_dir()
+    assert not (transaction.attempt_dir / "artifact.preimage").exists()
+
+
+def test_promotion_attempt_refuses_linked_destination_before_private_state_exists(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    driver = _driver(repo, journal=FakeJournal())
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == destination or real_is_symlink(path),
+    )
+    with pytest.raises(RuntimeError, match="destination is a link"):
+        driver._create_promotion_attempt(
+            name="unit-a",
+            attempt=3,
+            workdir=_promotion_source(tmp_path),
+            provenance={
+                "unit": "unit-a",
+                "generated_at": "2026-08-21T14:00:00Z",
+                "exported_functions": ["zz_test_"],
+                "allowed_extra_imports": [],
+                "tier": "oracle_green",
+            },
+            destination=destination,
+        )
+    assert unit_artifact_sha256(destination) == old_digest
+    assert not list(driver.promotion_attempt_root.glob("*"))
+
+
+def test_revoked_replacement_refuses_matching_artifact_in_wrong_tier_root(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    wrong_destination = repo / "research/decomp/port-units-staging/unit-a"
+    wrong_destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.rename(wrong_destination)
+    state = _state(repo)
+    record = state["units"]["unit-a"]
+    record["status"] = "porting"
+    record["attempts"] = 3
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    driver = _driver(repo, journal=FakeJournal())
+    transaction = driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=3,
+        workdir=_promotion_source(tmp_path),
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-21T14:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "oracle_green",
+        },
+        destination=wrong_destination,
+    )
+    with pytest.raises(RuntimeError, match="wrong tier root"):
+        driver._install_promotion_candidate(transaction, record)
+    assert unit_artifact_sha256(wrong_destination) == old_digest
+    assert transaction.candidate.directory.is_dir()
+
+
+def test_identical_existing_candidate_uses_fast_path_without_revocation_or_backup(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo, journal=FakeJournal())
+    destination = driver.artifact_root / "unit-a"
+    transaction = driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=1,
+        workdir=_promotion_source(tmp_path),
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-21T14:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "oracle_green",
+        },
+        destination=destination,
+    )
+    shutil.copytree(transaction.candidate.directory, destination)
+    assert driver._install_promotion_candidate(transaction, {}) == "preimage-verified"
+    assert transaction.candidate.directory.is_dir()
+    marker = driver._promotion_marker(transaction.attempt_dir)
+    assert "replacement_authorization" not in marker
+    assert not (transaction.attempt_dir / "artifact.preimage").exists()
+
+
+def test_artifact_install_failure_never_calls_source_diagnosis_immediate_or_terminal(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "unit-a", "2026-08-20T00:00:00Z", canonical=False)
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {"unit-a": {"status": "pending", "attempts": 1}},
+    }), encoding="utf-8")
+    calls = []
+
+    class RejectDiagnosisLLM:
+        default_model = "fake"
+
+        def generate(self, **kwargs):
+            calls.append(kwargs.get("phase"))
+            raise AssertionError("control-plane failure reached the LLM")
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo, journal=FakeJournal(), llm=RejectDiagnosisLLM(), build_runner=fake_build
+    )
+    assert driver.run() == EXIT_PROGRESSED
+    record = _state(repo)["units"]["unit-a"]
+    assert record["last_stage"] == "artifact-install"
+    assert record["failure_domain"] == "pipeline-control"
+    assert record["diagnosis_eligible"] is False
+    assert record.get("model_requests", 0) == 0
+    assert "diagnosis" not in record and "f4_nominated" not in record
+    assert calls == []
+
+    # A zero-delta terminal pass crosses the second diagnosis call site and
+    # must apply the same deny-by-default predicate.
+    restarted = _driver(repo, journal=FakeJournal(), llm=RejectDiagnosisLLM())
+    assert restarted.run() == EXIT_NO_WORK
+    assert calls == []
+    assert "diagnosis" not in _state(repo)["units"]["unit-a"]
+
+
+def test_source_failure_diagnosis_is_bound_once_and_stale_structural_is_ignored(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {"unit-a": {"status": "pending", "attempts": 1}},
+    }), encoding="utf-8")
+    phases = []
+
+    class SourceLLM:
+        default_model = "fake"
+
+        def generate(self, **kwargs):
+            phase = kwargs.get("phase")
+            phases.append(phase)
+            if str(phase).startswith("wasm_diagnosis:"):
+                return "STRUCTURAL: compiler evidence proves the shim cannot repair it"
+            return "no fenced header"
+
+    driver = _driver(
+        repo,
+        journal=FakeJournal(),
+        llm=SourceLLM(),
+        build_runner=lambda workdir, exports, extra=None: (
+            False, "unit.c:9:3: error: unknown type name 'BAD'"
+        ),
+    )
+    assert driver.run() == EXIT_PROGRESSED
+    record = _state(repo)["units"]["unit-a"]
+    assert record["failure_domain"] == "source-compiler"
+    assert record["diagnosis_eligible"] is True
+    assert record["diagnosis"]["source_failure_id"] == record["source_failure_id"]
+    assert record["diagnosis"]["source_stage"] == record["last_stage"]
+    assert phases.count("wasm_diagnosis:unit-a") == 1
+
+    # Once bound, a terminal pass spends nothing. If the failure domain later
+    # changes, the same STRUCTURAL text no longer influences selection.
+    restarted = _driver(repo, journal=FakeJournal(), llm=SourceLLM())
+    assert restarted.run() == EXIT_NO_WORK
+    assert phases.count("wasm_diagnosis:unit-a") == 1
+    record["last_stage"] = "artifact-install"
+    record["failure_domain"] = "pipeline-control"
+    record["diagnosis_eligible"] = False
+    record["status"] = "pending"
+    other = {"status": "pending", "attempts": record["attempts"]}
+    selected = driver._next_unit(
+        [{"name": "unit-a"}, {"name": "unit-b"}],
+        {"units": {"unit-a": record, "unit-b": other}},
+        set(),
+    )
+    assert selected["name"] == "unit-a"
+    stale = json.loads(json.dumps(record))
+    stale["status"] = "red_retryable"
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1, "units": {"unit-a": stale}
+    }), encoding="utf-8")
+    driver._replay_unit_offline = lambda _unit: pytest.fail(
+        "stale non-source nomination reached F4 replay"
+    )
+    assert driver.f4_recheck(5)["sample"] == []
+
+
+def test_invalidate_diagnosis_is_lock_held_journal_first_idempotent_and_scoped(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    preserved = {
+        "status": "red_retryable",
+        "attempts": 3,
+        "last_stage": "artifact-install",
+        "world_version": {"driver_rev": "abc"},
+        "assembly_gate": {"passed": True, "n": 5},
+        "diagnosis": {"verdict": "STRUCTURAL", "reason": "misrouted"},
+        "diagnosis_malformed": 1,
+        "f4_nominated": True,
+    }
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1, "units": {"unit-a": preserved}
+    }), encoding="utf-8")
+    artifact = repo / "research/decomp/port-units-staging/unit-a"
+    artifact.mkdir(parents=True)
+    (artifact / "sentinel").write_text("unchanged\n")
+    artifact_before = unit_artifact_sha256(artifact)
+    journal = FakeJournal()
+    git_calls = []
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=lambda *args: git_calls.append(args) or _completed(0),
+    )
+    reason = "control-plane artifact-install failure was not source evidence"
+    result = driver.invalidate_diagnosis("unit-a", reason)
+    after = _state(repo)["units"]["unit-a"]
+    for key in ("status", "attempts", "last_stage", "world_version", "assembly_gate"):
+        assert after[key] == preserved[key]
+    for key in ("diagnosis", "diagnosis_malformed", "f4_nominated"):
+        assert key not in after
+    assert after["diagnosis_invalidation"]["reason"] == reason
+    assert result["backup"] and (_state_path(repo).parent / result["backup"]).is_file()
+    assert len(journal.checkpoints) == 1
+    assert journal.checkpoints[0]["transition"].stage == "diagnosis-invalidate"
+    assert git_calls == []
+    assert unit_artifact_sha256(artifact) == artifact_before
+
+    replay = driver.invalidate_diagnosis("unit-a", reason)
+    assert replay["already_invalidated"] is True
+    assert replay["transition_id"] == result["transition_id"]
+    assert len(journal.checkpoints) == 1
+
+
+def test_invalidate_diagnosis_journal_failure_leaves_canonical_state_byte_exact(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {
+            "unit-a": {
+                "status": "red_retryable",
+                "attempts": 3,
+                "last_stage": "artifact-install",
+                "diagnosis": {"verdict": "STRUCTURAL", "reason": "bogus"},
+                "f4_nominated": True,
+            }
+        },
+    }), encoding="utf-8")
+    before = _state_path(repo).read_bytes()
+
+    class FailedJournal(FakeJournal):
+        def checkpoint(self, **kwargs):
+            self.checkpoints.append(kwargs)
+            return {"recorded": True, "committed": True, "pushed": False}
+
+    driver = _driver(repo, journal=FailedJournal())
+    with pytest.raises(RuntimeError, match="canonical state remains unchanged"):
+        driver.invalidate_diagnosis("unit-a", "misrouted control failure")
+    assert _state_path(repo).read_bytes() == before
+
+
+def test_invalidate_diagnosis_replays_same_transition_after_state_save_crash(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {
+            "unit-a": {
+                "status": "red_retryable",
+                "attempts": 3,
+                "last_stage": "artifact-install",
+                "diagnosis": {"verdict": "STRUCTURAL", "reason": "bogus"},
+                "f4_nominated": True,
+            }
+        },
+    }), encoding="utf-8")
+    before = _state_path(repo).read_bytes()
+    journal = FakeJournal()
+    first = _driver(repo, journal=journal)
+    real_save = first._save_state
+    failed = {"done": False}
+
+    def fail_once(state):
+        if not failed["done"]:
+            failed["done"] = True
+            raise OSError("simulated atomic save fault")
+        real_save(state)
+
+    first._save_state = fail_once
+    reason = "artifact install was not source evidence"
+    with pytest.raises(OSError, match="save fault"):
+        first.invalidate_diagnosis("unit-a", reason)
+    assert _state_path(repo).read_bytes() == before
+    assert len(journal.checkpoints) == 1
+    transition_id = journal.checkpoints[0]["transition"].extra["transition_id"]
+
+    restarted = _driver(repo, journal=journal)
+    result = restarted.invalidate_diagnosis("unit-a", reason)
+    assert result["transition_id"] == transition_id
+    assert len(journal.checkpoints) == 1
+    assert "diagnosis" not in _state(repo)["units"]["unit-a"]
+
+
+def test_invalidate_diagnosis_cli_journals_remote_without_product_publication(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    from src.port_wasm_units import main
+
+    repo = _write_repo(tmp_path)
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {
+            "unit-a": {
+                "status": "red_retryable",
+                "attempts": 3,
+                "last_stage": "artifact-install",
+                "diagnosis": {"verdict": "STRUCTURAL", "reason": "bogus"},
+                "f4_nominated": True,
+            }
+        },
+    }), encoding="utf-8")
+    remote, baseline = _init_bare_origin(repo, tmp_path)
+    reason = "control-plane artifact install is not source evidence"
+    assert main([
+        "invalidate-diagnosis",
+        "--unit", "unit-a",
+        "--reason", reason,
+        "--repo-root", str(repo),
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_invalidated"] is False
+    assert "diagnosis" not in _state(repo)["units"]["unit-a"]
+    events = _remote_progress_events(remote)
+    invalidations = [
+        event for event in events
+        if event.get("extra", {}).get("via") == "invalidate-diagnosis"
+    ]
+    assert len(invalidations) == 1
+    assert invalidations[0]["extra"]["reason"] == reason
+    assert _git(repo, "ls-remote", "origin", "refs/heads/main").stdout.split()[0] == baseline
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging", check=False
+    ).stdout == ""
+
+
 def test_post_state_cleanup_failure_is_finished_on_restart_and_unowned_paths_survive(
     tmp_path, monkeypatch
 ):
@@ -2672,7 +3414,7 @@ def test_restart_rolls_back_crash_window_install_before_quarantine(
     attempt_dir = transaction.attempt_dir
     candidate = transaction.candidate
     driver._update_promotion_marker(attempt_dir, phase="installing")
-    assert driver._install_promotion_candidate(candidate, destination) == "installed"
+    assert driver._install_promotion_candidate(transaction, {}) == "installed"
     assert destination.is_dir() and not candidate.directory.exists()
 
     restarted = _driver(repo, journal=FakeJournal())
@@ -2956,10 +3698,10 @@ def test_promotion_operation_failure_restarts_to_exact_prepared_sha(
     assert transitions[0].extra["transition_id"] == record["promotion_transition_id"]
 
 
-def test_branch_only_green_receipt_prevents_replay_after_checkpoint_crash(
+def test_branch_only_green_receipt_blocks_until_authoritative_retry(
     tmp_path, monkeypatch
 ):
-    """A branch commit is a durable receipt even when the local append failed."""
+    """A local branch receipt blocks green until restart publishes it remotely."""
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
@@ -3023,8 +3765,7 @@ def test_branch_only_green_receipt_prevents_replay_after_checkpoint_crash(
             raise KeyboardInterrupt("crash after branch-only checkpoint")
 
     driver._promotion_phase_boundary = crash_after_durable_checkpoint
-    with pytest.raises(KeyboardInterrupt, match="branch-only checkpoint"):
-        driver.run()
+    assert driver.run() == EXIT_STOPPED
 
     attempts = list(driver.promotion_attempt_root.glob("*"))
     assert len(attempts) == 1
@@ -3033,6 +3774,14 @@ def test_branch_only_green_receipt_prevents_replay_after_checkpoint_crash(
     transition_id = marker["transition_id"]
     assert not journal.transition_receipt(transition_id)["local"]
     assert journal.transition_receipt(transition_id)["branch"]
+    assert _git(
+        repo,
+        "ls-remote",
+        "origin",
+        "refs/heads/port-progress",
+    ).stdout.strip() == ""
+    assert driver._load_state()["units"]["unit-a"]["status"] != "green"
+    assert attempts[0].is_dir()
 
     state = driver._load_state()
     restarted_journal = ProgressJournal(
@@ -3040,7 +3789,7 @@ def test_branch_only_green_receipt_prevents_replay_after_checkpoint_crash(
         run_root=run_root,
         worktree=progress_worktree,
         run_id="restart-journal-run",
-        enable_push=False,
+        enable_push=True,
     )
     restarted = _driver(repo, journal=restarted_journal, git_runner=None)
     assert restarted._reconcile_orphan_promotion_attempts(state) is True
@@ -3076,6 +3825,314 @@ def test_branch_only_green_receipt_prevents_replay_after_checkpoint_crash(
     assert record["status"] == "green"
     assert record["commit"] == product_head
     assert record["promotion_transition_id"] == transition_id
+
+
+def test_local_mirror_only_green_receipt_cannot_finalize_or_delete_preimage(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    _remote, _baseline = _init_bare_origin(repo, tmp_path)
+    run_root = repo / "research/decomp/generated/finish-game-port"
+    progress_worktree = tmp_path / "progress-worktree"
+    journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="mirror-only-original",
+        enable_push=False,
+    )
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    assert driver.run() == EXIT_STOPPED
+    attempt = next(driver.promotion_attempt_root.iterdir())
+    marker = json.loads((attempt / ".promotion-attempt.json").read_text())
+    transition_id = marker["transition_id"]
+    assert journal.transition_receipt(transition_id)["local"]
+    events_path = progress_worktree / PROGRESS_DIR / "events.jsonl"
+    records = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    events_path.write_text(
+        "".join(
+            json.dumps(record, sort_keys=True) + "\n"
+            for record in records
+            if record.get("extra", {}).get("transition_id") != transition_id
+        ),
+        encoding="utf-8",
+    )
+    _git(progress_worktree, "add", PROGRESS_DIR)
+    _git(progress_worktree, "commit", "-m", "remove remote-required receipt")
+    receipt = journal.transition_receipt(transition_id)
+    assert receipt["local"] and not receipt["branch"]
+
+    state = driver._load_state()
+    restarted_journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="mirror-only-restart",
+        enable_push=False,
+    )
+    restarted = _driver(repo, journal=restarted_journal, git_runner=None)
+    assert restarted._reconcile_orphan_promotion_attempts(state) is False
+    assert state["units"]["unit-a"]["status"] != "green"
+    assert attempt.is_dir()
+    assert unit_artifact_sha256(attempt / "artifact.preimage") == old_digest
+    assert unit_artifact_sha256(destination) == marker["candidate_sha256"]
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-progress"
+    ).stdout.strip() == ""
+
+
+def test_product_push_then_progress_push_failure_stays_pending_and_restart_recovers(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    remote, _baseline = _init_bare_origin(repo, tmp_path)
+    run_root = repo / "research/decomp/generated/finish-game-port"
+    progress_worktree = tmp_path / "progress-worktree"
+    journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="progress-push-failure",
+        enable_push=True,
+    )
+    real_flush = journal.flush_pending_push
+
+    def fail_green_push():
+        events_path = progress_worktree / PROGRESS_DIR / "events.jsonl"
+        if events_path.is_file() and "promotion_transaction_id" in events_path.read_text(
+            encoding="utf-8"
+        ):
+            journal._write_pending(True, "injected progress push failure", 1)
+            return {
+                "pushed": False,
+                "push_pending": True,
+                "push_detail": "injected progress push failure",
+            }
+        return real_flush()
+
+    journal.flush_pending_push = fail_green_push
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    assert driver.run() == EXIT_STOPPED
+    attempt = next(driver.promotion_attempt_root.iterdir())
+    marker = json.loads((attempt / ".promotion-attempt.json").read_text())
+    transition_id = marker["transition_id"]
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging"
+    ).stdout.split()[0] == marker["prepared_commit"]
+    assert _git(
+        repo, "ls-remote", "origin", "refs/heads/port-progress"
+    ).stdout.strip() == ""
+    assert journal.push_is_pending()
+    assert driver._load_state()["units"]["unit-a"]["status"] != "green"
+    assert attempt.is_dir()
+    assert unit_artifact_sha256(attempt / "artifact.preimage") == old_digest
+
+    state = driver._load_state()
+    restarted_journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="progress-push-restart",
+        enable_push=True,
+    )
+    restarted = _driver(repo, journal=restarted_journal, git_runner=None)
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert state["units"]["unit-a"]["status"] == "green"
+    assert not attempt.exists()
+    assert not restarted_journal.push_is_pending()
+    remote_events = _remote_progress_events(remote)
+    assert len([
+        record for record in remote_events
+        if record.get("extra", {}).get("transition_id") == transition_id
+    ]) == 1
+    assert unit_artifact_sha256(destination) == marker["candidate_sha256"]
+
+
+@pytest.mark.parametrize(
+    "receipt_mutation",
+    [
+        "id-only",
+        "missing-replacement-evidence",
+        "wrong-candidate",
+        "wrong-commit",
+        "wrong-replacement-evidence",
+        "exact",
+    ],
+)
+def test_real_progress_branch_requires_exact_replacement_transition_semantics(
+    tmp_path, monkeypatch, receipt_mutation
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    destination, old_digest = _seed_revoked_replacement(repo)
+    remote, _baseline = _init_bare_origin(repo, tmp_path)
+    run_root = repo / "research/decomp/generated/finish-game-port"
+    progress_worktree = tmp_path / "progress-worktree"
+    journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="replacement-original-run",
+        enable_push=True,
+    )
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm-new")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+
+    def crash_after_checkpoint(phase, _transaction):
+        if phase == "checkpoint_durable":
+            raise KeyboardInterrupt("replacement checkpoint crash")
+
+    driver._promotion_phase_boundary = crash_after_checkpoint
+    with pytest.raises(KeyboardInterrupt, match="replacement checkpoint crash"):
+        driver.run()
+    attempts = list(driver.promotion_attempt_root.glob("*"))
+    assert len(attempts) == 1
+    marker = json.loads((attempts[0] / ".promotion-attempt.json").read_text())
+    transition_id = marker["transition_id"]
+    expected_replacement = driver._replacement_green_evidence(marker)
+    assert expected_replacement["preimage_sha256"] == old_digest
+
+    if receipt_mutation != "exact":
+        events_path = progress_worktree / PROGRESS_DIR / "events.jsonl"
+        records = [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        exact_local_records = json.loads(json.dumps(records))
+        index = next(
+            i for i, record in enumerate(records)
+            if record.get("extra", {}).get("transition_id") == transition_id
+        )
+        record = records[index]
+        if receipt_mutation == "id-only":
+            records[index] = {
+                "schema": record["schema"],
+                "extra": {"transition_id": transition_id},
+            }
+        elif receipt_mutation == "missing-replacement-evidence":
+            record["extra"].pop("replacement_evidence")
+        elif receipt_mutation == "wrong-candidate":
+            record["extra"]["candidate_sha256"] = "0" * 64
+        elif receipt_mutation == "wrong-commit":
+            record["product_commit"] = "0" * 40
+        elif receipt_mutation == "wrong-replacement-evidence":
+            record["extra"]["replacement_evidence"]["preimage_sha256"] = "0" * 64
+        events_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        _git(progress_worktree, "add", PROGRESS_DIR)
+        _git(progress_worktree, "commit", "-m", f"inject {receipt_mutation}")
+        _git(
+            progress_worktree,
+            "push",
+            "origin",
+            "port-progress:port-progress",
+        )
+        # Restore both local durable copies to the exact expected event without
+        # pushing.  The only mismatch left is therefore the authoritative
+        # remote tip, which must independently block reconciliation.
+        events_path.write_text(
+            "".join(
+                json.dumps(record, sort_keys=True) + "\n"
+                for record in exact_local_records
+            ),
+            encoding="utf-8",
+        )
+        _git(progress_worktree, "add", PROGRESS_DIR)
+        _git(progress_worktree, "commit", "-m", "restore exact local receipt")
+
+    state = driver._load_state()
+    restarted_journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="replacement-restart-run",
+        enable_push=True,
+    )
+    restarted = _driver(repo, journal=restarted_journal, git_runner=None)
+    reconciled = restarted._reconcile_orphan_promotion_attempts(state)
+    if receipt_mutation == "exact":
+        assert reconciled is True
+        assert state["units"]["unit-a"]["status"] == "green"
+        assert state["units"]["unit-a"]["replacement_evidence"] == expected_replacement
+        assert not attempts[0].exists()
+    else:
+        assert reconciled is False
+        assert state["units"]["unit-a"]["status"] != "green"
+        assert attempts[0].is_dir()
+        assert unit_artifact_sha256(attempts[0] / "artifact.preimage") == old_digest
+        assert "replacement_evidence" not in state["units"]["unit-a"]
+    branch_events = _git(
+        repo,
+        "show",
+        f"refs/heads/port-progress:{PROGRESS_DIR}/events.jsonl",
+    ).stdout.splitlines()
+    assert len([
+        line for line in branch_events
+        if json.loads(line).get("extra", {}).get("transition_id") == transition_id
+    ]) == 1
+    remote_head = _git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging"
+    ).stdout.split()[0]
+    assert remote_head == marker["prepared_commit"]
+    assert unit_artifact_sha256(destination) == marker["candidate_sha256"]
 
 
 def test_assembly_failure_stops_if_required_journal_checkpoint_raises(
