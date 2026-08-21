@@ -489,3 +489,28 @@ def test_analysis_failures_never_block_and_ports_resume_when_analysis_lands(tmp_
 
     assert exit_code == EXIT_PROGRESSED
     assert workflow.port_calls == ["controller"]
+
+
+def test_batch_push_uses_an_explicit_refspec(tmp_path: Path, monkeypatch):
+    """Git side-effect audit regression: the D8 batch push must be
+    `push origin HEAD` (current branch to its same-named origin branch),
+    never a bare `git push` riding ambient upstream config."""
+    import subprocess as real_subprocess
+
+    from src import port_driver as module
+
+    root = fixture_repo(tmp_path)
+    driver = make_driver(root, StubWorkflow(root, None))
+    driver._integrations_this_run = ["unit-x"]
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(tuple(args))
+        return real_subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    driver._batch_push()
+    pushes = [args for args in calls if len(args) > 1 and args[1] == "push"]
+    assert pushes == [("git", "push", "origin", "HEAD")]

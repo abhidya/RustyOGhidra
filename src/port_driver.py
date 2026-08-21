@@ -779,9 +779,13 @@ class PortDriver:
                 timeout=300,
              creationflags=NO_WINDOW)
         try:
-            pushed = git("push")
+            # Explicit refspec (git side-effect audit): a bare `git push`
+            # rides ambient upstream config. Same designed target -- the
+            # current branch's same-named branch on origin. One retry for
+            # transient faults.
+            pushed = git("push", "origin", "HEAD")
             if pushed.returncode != 0:
-                pushed = git("push", "-u", "origin", "HEAD")
+                pushed = git("push", "origin", "HEAD")
             ok = pushed.returncode == 0
             self.events.emit(
                 "batch_push",
