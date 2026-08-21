@@ -238,6 +238,48 @@ def test_compile_fix_header_only_loop(tmp_path, monkeypatch):
     assert provenance["compile_iterations"] == 2
 
 
+def test_compile_fix_call_streams_with_phase_and_capped_tokens(tmp_path, monkeypatch):
+    """The compile-fix LLM call must stream and cap its output budget.
+
+    Non-streamed, llm-liveness.json freezes at request start for the whole
+    generation (~23 min at 2.3 tok/s) -- indistinguishable from a hang, and
+    the rig monitor's 20-minute staleness rule false-fires on every long
+    call. Streaming (even with a no-op callback) makes the client's metrics
+    wrapper advance liveness per chunk and turns the read timeout into
+    time-between-stream-bytes. The 4096 cap halves the ~59-minute worst case
+    the client-wide 8192 default permits; real replies are ~1.6-2k tokens and
+    the loop already iterates on truncation.
+    """
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    llm_calls = []
+
+    def flaky_build(workdir, exports, extra=None):
+        if not llm_calls:
+            return False, "error: use of undeclared identifier 'bool'"
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    class RecordingLLM:
+        default_model = "fake-27b"
+
+        def generate(self, **kwargs):
+            llm_calls.append(kwargs)
+            return "```c\n#include <stdbool.h>\n/* fixed */\n```"
+
+    driver = _driver(repo, build_runner=flaky_build, llm=RecordingLLM())
+    assert driver.run() == EXIT_NO_WORK
+    assert len(llm_calls) == 1
+    kwargs = llm_calls[0]
+    # phase follows the chunk-workflow naming convention: <kind>:<identifier>
+    assert kwargs["phase"] == "wasm_compile_fix:unit-a"
+    # a real (callable, no-op) stream_callback: passing it is what flips the
+    # client onto the streaming path where liveness updates mid-request
+    assert callable(kwargs["stream_callback"])
+    assert kwargs["stream_callback"]("assistant_delta", {"text": "x"}) is None
+    assert kwargs["max_tokens"] == 4096
+
+
 def test_compile_only_unit_commits_to_staging_unverified(tmp_path, monkeypatch):
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)

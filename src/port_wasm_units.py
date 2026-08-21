@@ -214,6 +214,17 @@ SAMPLING = {
     "presence_penalty": float(os.getenv("OGHIDRA_PORT_PRESENCE_PENALTY", "1.5")),
 }
 
+# Compile-fix replies are one complete gnt4_shim.h -- ~1.6-2k tokens in
+# practice (.env comment). The client-wide default of 8192 permits ~59-minute
+# worst-case generations at 2.3 tok/s on the CPU-bound fallback model; 4096
+# halves that ceiling while still leaving 2x headroom over real replies, and
+# the loop already tolerates truncation (unclosed-fence salvage in
+# _compile_fix, then the next compile names the error and iterates). Scoped to
+# this call site on purpose -- other call paths keep the client default.
+COMPILE_FIX_MAX_TOKENS = int(
+    os.getenv("OGHIDRA_PORT_COMPILE_FIX_MAX_TOKENS", "4096")
+)
+
 CODE_BLOCK = re.compile(r"```(?:c|cpp|h)?\s*\n(.*?)```", re.S)
 # An opening fence with no terminator: the model stopped before closing it.
 OPEN_FENCE = re.compile(r"```(?:c|cpp|h)?[ \t]*\n")
@@ -911,6 +922,7 @@ class WasmUnitDriver:
         header: str,
         errors: str,
         *,
+        unit_name: str = "",
         format_reminder: bool = False,
     ) -> str | None:
         """One LLM round; returns the corrected header text or None.
@@ -934,6 +946,22 @@ class WasmUnitDriver:
         reply = self._llm_client().generate(
             prompt=prompt,
             system_prompt=SYSTEM_PROMPT + (" /no_think" if DISABLE_THINKING else ""),
+            max_tokens=COMPILE_FIX_MAX_TOKENS,
+            phase=f"wasm_compile_fix:{unit_name}",
+            # Stream for two reasons, both learned the hard way (same as
+            # port_chunk_workflow's analysis call):
+            # 1. liveness telemetry (current_completion_tokens,
+            #    tokens_per_second) only updates mid-request on the streaming
+            #    path -- non-streamed, a 23-minute generation reports
+            #    "out 0 tok, 0.0 tok/s" the whole time, is indistinguishable
+            #    from a hang, and false-fires the rig monitor's 20-minute
+            #    staleness rule on every long call;
+            # 2. requests' read timeout is time-between-BYTES; with no stream
+            #    a generation longer than CUSTOM_API_TIMEOUT dies even though
+            #    the server is healthy and working.
+            # The callback itself has nothing to do -- the client's metrics
+            # wrapper does the liveness accounting.
+            stream_callback=lambda _event_type, _event: None,
             **SAMPLING,
             # Belt and braces, same as the source loop: the template kwarg is
             # honoured by llama.cpp/vLLM/SGLang and ignored elsewhere, and the
@@ -1435,6 +1463,7 @@ class WasmUnitDriver:
                 try:
                     fixed = self._compile_fix(
                         unit_c, header_text, prompt_errors,
+                        unit_name=name,
                         format_reminder=format_reminder,
                     )
                 except Exception as error:  # noqa: BLE001
