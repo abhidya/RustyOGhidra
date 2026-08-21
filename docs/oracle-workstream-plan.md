@@ -1,12 +1,23 @@
-# Oracle workstream plan — converting compile-only inventory into verified units (v1, defended design)
+# Oracle workstream plan — converting compile-only inventory into verified units (v2, defended design)
 
-Status: v1, authored against the repo state of 2026-08-20 (registry commit
-`0b84c788`, OGhidra `07d3890`). DESIGN ONLY — no harness, codec, or driver
-code ships with this document. This doc will face adversarial review before
-any tranche is implemented; v1–v3 of `compile-fix-loop-design.md` all failed
-theirs, and this plan is written expecting the same treatment. Every claim
-below marked "verified in-repo" was checked against the working tree on the
-date above; everything else is a design decision and is argued, not asserted.
+Status: v2. **v1 (`72f4b23`) failed adversarial review** on seven findings
+(S1–S7); v2 applies the verdict in full — each fix mapped to its section
+in the changelog below and re-verified against the cited files. Authored against
+the repo state of 2026-08-20 (registry commit `0b84c788`). DESIGN ONLY — no
+harness, codec, or driver code ships with this document. Every claim below
+marked "verified in-repo" was checked against the working tree on the date
+above; everything else is a design decision and is argued, not asserted.
+
+v1 → v2 changes: [S1] §1.1 rewritten — three oracle-green units, not one;
+F-5 rebased on all three baselines. [S2] Phase 1 gate redefined as
+corpus-replay (§6, I-7). [S3] success-pattern discipline: anchored total
+line + per-function patterns (§3.4, I-5). [S4] D-2 rationale facts
+corrected (queue is tracked; gitignore negation works) — conclusion kept on
+surviving grounds. [S5] field-map feasibility measured; P1.0 annotation
+pre-task added (§3.3, §6). [S6] full-region post-state byte-diff added as
+coverage mechanism 4 (§3.3, I-4, Phase 3). [S7] rollout counts corrected
+(128 pending / 3 green / 2 staged); `reverify-unit` binds to staged
+provenance, not the queue (§3.4).
 
 Companion documents:
 
@@ -55,11 +66,30 @@ hard-gated on reproducing the damage-core result), its rollout over the 133
 Everything in this section was read from the working tree; the generic
 design in §3 must remain buildable against it.
 
-### 1.1 The proven per-unit harness (`research/decomp/poc/wasm-port-poc/harness.mjs`)
+### 1.1 The proven per-unit harnesses (`research/decomp/poc/wasm-port-poc/harness*.mjs`)
 
-The only oracle-green unit, `damage-core`, was verified by a hand-written
-Node harness. Its mechanics, because the generic harness must reproduce all
-of them:
+**Three units are oracle-green** in `research/decomp/port-units/`, each
+verified by its own hand-written Node harness (all verified in-repo):
+
+| unit | harness | committed result (`oracle.log`) |
+|------|---------|--------------------------------|
+| `damage-core` | `harness.mjs` | 19,998/20,000 exact + 2 f32-rounding-explained + 0 unexplained; 232/232; 4,000/4,000; 2,000/2,000 |
+| `knockback-core` | `harness-knockback.mjs` | 16/16 table dump; 2,000/2,000 (`FUN_800452a0` atan2→BAM16); 4,000/4,000 exact + 4,000/4,000 decel-consistency (`zz_005ec20_`); `KNOCKBACK ORACLE: PASS` |
+| `collision-core` | `harness-collision.mjs` | 20,000/20,000 pair sequences exact (identity+order+contact, 24,400 pairs); active post-state **28,121/32,153 exact + 4,032 f32-rounding-explained + 0 unexplained** — a **12.5%** rounding-explained rate on post-state floats; `COLLISION ORACLE: PASS` (provenance `verified: true`, `tier: "oracle_green"`) |
+
+(`knockback-core`'s provenance predates the `verified`/`tier` fields; its
+presence in `port-units/` with a PASS log is the verdict.) Two design facts
+fall out of this table and are load-bearing below: the rounding-explained
+*rate* is a property of the function class, not a universal constant
+(collision's 12.5% vs damage's 0.01% — §5 F-5); and the exit-code
+discipline is uneven — `harness-knockback.mjs:258` and
+`harness-collision.mjs:374` both end `process.exit(green ? 0 : 1)`, while
+`harness.mjs` does not (F-2).
+
+`harness.mjs`'s mechanics in detail, because the generic harness must
+reproduce all of them (the other two harnesses follow the same pattern with
+their own arenas/shims — `arena-knockback.json`, `arena-collision.json`,
+`gnt4_shim_knockback.h`, `gnt4_shim_collision.h`):
 
 - **Wasm loading.** `WebAssembly.compile` on `unit_poc.wasm` (overridable via
   env `POC_WASM`); imports resolved from a shim object behind a `Proxy` that
@@ -107,8 +137,11 @@ of them:
   (including the lethal flag and byte-level post-state); 2,000/2,000 on
   `FUN_80031634` through the SDK shim seam (bool + out-vector bytes).
 
-**Latent trap, recorded as F-2:** `harness.mjs` never sets
-`process.exitCode`. It reports failures only as printed counts.
+**Latent trap, recorded as F-2:** `harness.mjs` (alone of the three) never
+sets `process.exitCode`. It reports failures only as printed counts; the
+committed queue spec compensates with four per-function `success_patterns`
+(§3.4), which is the pattern-discipline model the generic design makes
+mandatory.
 
 ### 1.2 The driver's oracle gate (`src/port_wasm_units.py`, verified)
 
@@ -199,10 +232,11 @@ one sufficient:
    explicit `fround`). Reimplementing that in Python (`numpy.float32`
    round-tripping) is a new class of oracle bug in the one place oracle
    bugs are unfalsifiable.
-3. **Proven path.** The 19,998/20,000 result was produced by this exact
-   stack. Phase 1's gate is "reproduce that number through the generic
-   path"; changing the runtime under the gate would make a gate failure
-   ambiguous between generalization bugs and runtime-semantics drift.
+3. **Proven path.** All three committed green results (§1.1) were produced
+   by this exact stack. Phase 1's gate is "replay the PoC corpus through
+   the generic path and match case-by-case"; changing the runtime under
+   the gate would make a gate failure ambiguous between generalization
+   bugs and runtime-semantics drift.
 
 **Rejected alternatives.** (a) Python-in-OGhidra: loses on all three counts
 above, and puts product-repo test data behind a second repo boundary.
@@ -217,16 +251,27 @@ run to `research/decomp/data/oracle-results/<unit>.json` (tracked). The
 existing human-readable `oracle.log` stays exactly as-is (the driver copies
 it into the artifact dir; provenance embeds the summary — unchanged).
 
-**Why this path.** `research/decomp/generated/finish-game-port/` is
-**driver-owned and wholesale-gitignored** — off-limits by instruction and
-useless for durable artifacts (a `!file` negation cannot rescue a path whose
-parent is excluded — the exact reason `unit-priority.json` lives in
-`data/`, verified in `build_unit_priority.py`'s location note). The tracked
-`research/decomp/data/` dir is the established sidecar home [CF-2.14]: the
-driver already reads two files there (`unit-priority.json`,
-`assembly-gate.json`), so a later driver change that *consumes* verdicts
-(e.g. surfacing them on the dashboard, or feeding priority regeneration)
-crosses no new boundary.
+**Why this path.** Two facts first, stated correctly because an earlier
+draft got both wrong: (a) `wasm-units.json` and several siblings **are
+tracked in git** (`git ls-files` shows the queue, `wasm-units-skipped.json`,
+`wasm-units-migration.json`, `gnt4_shim_seed.h`, `knowledge-registry.json`
+under the generated dir); (b) `.gitignore` **can** re-include a path under
+an excluded parent — GotYaForce's own `.gitignore` does exactly this for
+`knowledge-registry.json` with the two-line negation pattern
+(`!…/finish-game-port/` + `!…/knowledge-registry.json`), and
+`build_unit_priority.py`'s location note overstates the impossibility.
+
+So the decision does **not** rest on "gitignore can't" — it rests on
+ownership and lifecycle: `generated/finish-game-port/` is **driver-owned**
+(state, lock, journal, work dirs) and its generated members are
+**wholesale regenerated** by the Tier-0 pipeline; a harness-authored verdict
+file living there would sit inside another component's blast radius and
+grow the fragile negation list every time this workstream adds a file. The
+tracked `research/decomp/data/` dir is the established home for
+cross-component sidecars [CF-2.14]: the driver already reads two files
+there (`unit-priority.json`, `assembly-gate.json`), so a later driver
+change that *consumes* verdicts (dashboard surfacing, priority
+regeneration) crosses no new boundary.
 
 **Schema** (`result_schema: 1`; unknown fields tolerated, missing required
 fields = malformed = fail):
@@ -248,7 +293,7 @@ fields = malformed = fail):
      "rounding_explained": 0, "unexplained": 0, "verdict": "pass"}
   ],
   "coverage": {"offsets_written": 41, "offsets_read_unwritten": 0,
-                "sentinel_reads_detected": false},
+                "sentinel_reads_detected": false, "stray_writes": []},
   "unexplained_cases": [],
   "verdict": "pass"
 }
@@ -288,13 +333,28 @@ hand-written**: a Python generator
 `actor.ts`'s JSDoc offset annotations and emits
 `research/decomp/oracle-harness/actor-field-map.json` — one record per
 field: `{tsField, offset, width, kind (u8/s8/u16/s16/u32/s32/f32/vec3/
-bytes/port_side), note}`. Width/kind comes from a small annotation grammar
-in the comments where the offset alone is ambiguous; fields the extractor
-cannot fully type are emitted with `"kind": "unmapped"` — present, visible,
-and unusable (below). Regeneration is deterministic; the JSON is tracked,
-so `actor.ts` drift shows up as a reviewable diff. Fields marked port-side
-(no ROM offset, e.g. `physicsRuntime`, `hasBCharge`) are emitted as
-`port_side` and are never encoded.
+bytes/port_side), note}`, with `kind: "array"`/`"struct"` records carrying
+`{stride, count}` for composites. Fields marked port-side (no ROM offset,
+e.g. `physicsRuntime`, `hasBCharge`) are emitted as `port_side` and are
+never encoded. Regeneration is deterministic; the JSON is tracked, so
+`actor.ts` drift shows up as a reviewable diff.
+
+**Feasibility, measured (2026-08-20), not assumed.** The current
+annotations are *not* extractor-ready: of `RomActor`'s 99 fields / 86 doc
+blocks, ~82 carry a `+0xNNN` offset but only ~17–21 carry any width/kind
+token (`BAM16`, `s16`, `byte`, `vec3`, `float`, …); ~26 blocks mention
+*multiple* offsets in prose (e.g. "+0x5dc/+0x5dd", "+0x8e0/+0x8f0/+0x900
+plus part*0x30"); and composites (`partAimAnchors`, the
+`weaponAnimationBlocks` `Uint8Array` quads, the `parts` stride-0x20 blocks)
+do not fit a flat `{offset, width, kind}` record at all. **Phase 1
+therefore carries an explicit pre-task P1.0** (§6): define the annotation
+grammar (single-offset + width token; multi-offset tuples; array/struct
+`{base, stride, count}`) and land the reviewed product-code commit
+annotating the ~65 fields missing width/kind — a change to `actor.ts`
+comments only, reviewed like any product change. Until P1.0 lands, every
+un-annotated field extracts as `"kind": "unmapped"` — present, visible,
+and unusable (mechanism 3 below): specs touching them are `blocked_codec`,
+not guessed.
 
 **Why extraction beats a hand-maintained table.** The 2026-08-20 migration
 incident [CF-2.9] is the standing proof that parallel hand-maintained
@@ -302,7 +362,7 @@ copies of one truth diverge silently. `actor.ts` is reviewed product code
 with per-field citations; a second hand-written offset table would be a
 second, uncited truth.
 
-**Coverage gaps made LOUD — three independent mechanisms:**
+**Coverage gaps made LOUD — four independent mechanisms:**
 
 1. **Sentinel-poisoned arena.** Before encoding a case, every scratch
    object region is filled with `0xA5`, **not zeroed**. The PoC zero-fills;
@@ -324,6 +384,17 @@ second, uncited truth.
    nonzero with verdict `"blocked_codec"` naming the field. The fix is a
    commit to `actor.ts` annotations or the extractor — never an inline
    zero.
+4. **Full-region post-state byte-diff.** After each case (or each Phase 3
+   sequence), every scratch region is byte-diffed against its expected
+   image: the encoded input bytes ∪ the fields the spec *declares* as
+   write-back (whose new values the reference predicts) ∪ untouched
+   sentinel. **Any other differing byte is a failure** — it means the wasm
+   wrote to an offset the spec never modeled (a stray store to an unmapped
+   field), which read-set auditing alone cannot see. Sentinel poisoning is
+   what makes this diff exact: against a zero-filled arena, a stray write
+   of zero is invisible; against `0xA5`, every unmodeled store changes
+   bytes. Result field: `coverage.stray_writes` (offset list), must be
+   empty on pass.
 
 Non-RomActor structs (descriptor pages, bss globals, records like the PoC's
 `REC`) get per-unit encoders in the unit spec using the same primitives and
@@ -347,12 +418,35 @@ gap-aligned units overwhelmingly take actor pointers.
         "command": ["node", "run-unit.mjs", "--unit", "auto-c0012-004", "--n", "20000"],
         "cwd": "research/decomp/oracle-harness",
         "env": {"ORACLE_WASM": "{wasm}"},
-        "success_patterns": ["UNEXPLAINED\\s*:\\s*0", "\"verdict\": \"pass\""]
+        "success_patterns": [
+          "^ORACLE TOTAL functions=2/2 cases=40000 UNEXPLAINED: 0 VERDICT: PASS$",
+          "\\[zz_0123456_\\] .* unexplained: 0 .* verdict: pass",
+          "\\[zz_0abcdef_\\] .* unexplained: 0 .* verdict: pass"
+        ]
       }
     }
   }
 }
 ```
+
+**Pattern discipline (the S3 rule).** `_run_oracle` matches positive regexes
+only — there is no negative-pattern support (verified in
+`src/port_wasm_units.py`), so a pattern like `UNEXPLAINED\s*:\s*0` or
+`"verdict": "pass"` is satisfied by a *partially failing* multi-function log
+in which one function passes. Two requirements therefore bind every spec:
+
+1. **One anchored total line, mandatory.** The harness prints, as its last
+   log line and *only* when every function passed, a single aggregate:
+   `ORACLE TOTAL functions=<k>/<k> cases=<n> UNEXPLAINED: 0 VERDICT: PASS`.
+   The spec's first pattern anchors this exact line (with the expected
+   `<k>/<k>` literal). A partially failing run prints
+   `ORACLE TOTAL functions=<j>/<k> … VERDICT: FAIL` — which the anchored
+   pattern cannot match.
+2. **Per-function patterns, one per exported function.** The model is the
+   committed damage-core queue spec (verified), which pins each function's
+   own result line (`"type category \(zz_0066298_\): 232/232 exact"`,
+   etc.). A spec missing a per-function pattern for any exported function
+   is malformed and rejected at sidecar-validation time.
 
 The driver, at queue load, overlays `unit["oracle"]` with the sidecar entry
 **iff** the entry's `exports_sha256` matches the queue unit's current export
@@ -383,15 +477,34 @@ sidecar (a sibling of `_unit_priority`), called where `_process_unit` reads
 `unit.get("oracle")`. No state-file schema change: `tier` already
 distinguishes `compile_only` from `oracle_green`.
 
-**Already-settled staged units.** The 133 `differential_vs_ts` units that
-are *already* green at `compile_only` tier are settled — the queue loop will
-not revisit them. Promotion is a **re-verification pass**, not a hand edit:
-a sanctioned CLI subcommand (design: `reverify-unit --unit <name>`, sibling
-of `settle-unit`, same driver lock) rebuilds nothing, runs the sidecar
-oracle against the *committed* staged `unit.wasm`, and on pass emits the
-journal checkpoint + verdict event, updates the record's tier to
-`oracle_green`, moves the artifact from `port-units-staging/` to
-`port-units/`, and commits — all through the journal [CF-2.9]. Hand-editing
+**Who takes which path — measured against live state (2026-08-20,
+`wasm-units-state.json`: 1,374 pending / 18 green / 3 structural_ineligible
+/ 1 red_retryable = 1,396).** Of the 133 `differential_vs_ts` units:
+
+- **128 are PENDING** — the normal path. The sidecar overlay simply takes
+  effect on each unit's next driver attempt; no promotion machinery is
+  involved for them at all.
+- **3 are already `oracle_green`** (`damage-core`, `knockback-core`,
+  `collision-core`, §1.1) — nothing to do.
+- **Exactly 2 are settled staged `compile_only` greens**
+  (`auto-c0034-018`, `auto-c0035-002`) — the *only* units the promotion
+  path below applies to. Re-verification is a real but small mechanism,
+  not the rollout's main road.
+
+Promotion of those staged greens is a **re-verification pass**, not a hand
+edit: a sanctioned CLI subcommand (design: `reverify-unit --unit <name>`,
+sibling of `settle-unit`, same driver lock) rebuilds nothing and runs the
+sidecar oracle against the **committed staged artifact** — its
+`port-units-staging/<name>/unit.wasm`. Binding rule: the sidecar entry's
+`exports_sha256` is checked against **the staged artifact's
+`provenance.json` `exported_functions`**, not the current queue's export
+set — the wasm being verified is the one the provenance describes, and a
+queue regenerated since staging can list a different export set for the
+same unit name, which would bind a fresh spec to a stale wasm (or vice
+versa) if the queue were the reference. On pass it emits the journal
+checkpoint + verdict event, updates the record's tier to `oracle_green`,
+moves the artifact from `port-units-staging/` to `port-units/`, and
+commits — all through the journal [CF-2.9]. Hand-editing
 `wasm-units-state.json` remains forbidden; the 2026-08-20 migration is the
 standing proof of why.
 
@@ -418,21 +531,28 @@ the damage-core result before any second unit gets a spec.**
   Byte-order conversion happens at generation time (the `gen_arena.py`
   rule). Scratch regions are the only harness-authored memory, and they are
   sentinel-poisoned (§3.3).
-- **I-4 (loud gaps).** No input byte the unit reads may be an accident:
-  sentinel poisoning + write/read-set audit + `unmapped`-refusal (§3.3).
-  Zero-fill of scratch regions is forbidden in the generic harness.
+- **I-4 (loud gaps).** No input byte the unit reads — and no output byte it
+  writes — may be an accident: sentinel poisoning + write/read-set audit +
+  `unmapped`-refusal + full-region post-state byte-diff (§3.3, mechanisms
+  1–4). Zero-fill of scratch regions is forbidden in the generic harness.
 - **I-5 (exit-code + pattern double gate).** A unit passes only if the
   harness exits 0 **and** every `success_patterns` regex matches. Specs MUST
-  include at least the two patterns shown in §3.4 — a pattern that pins
-  `UNEXPLAINED: 0` and one that pins the machine verdict.
+  include the anchored `ORACLE TOTAL … functions=<k>/<k> … VERDICT: PASS`
+  line plus one per-function pattern per exported function (§3.4 pattern
+  discipline). Naked substring patterns that a partially failing log can
+  satisfy are forbidden — `_run_oracle` has no negative-pattern support, so
+  the totals line is the only pattern shape that composes safely.
 - **I-6 (no epsilon).** The only permitted non-exact agreement is
   f32-rounding-explained, defined as `wasm === oracle32(case)` where
   `oracle32` mirrors the ROM's op-level float structure. No relative/absolute
   tolerance, no ULP windows, no percentage thresholds on correctness.
-- **I-7 (frozen measuring stick).** `poc/wasm-port-poc/` is not modified by
-  this workstream. Phase 1 is measured as agreement with its committed
-  output (`port-units/damage-core/oracle.log`), which only means something
-  if the stick doesn't move.
+- **I-7 (frozen measuring stick, one audited exception).** `poc/wasm-port-poc/`
+  is not modified by this workstream, with exactly one exception: the
+  additive `POC_DUMP_CORPUS` dump hook (§6 Phase 1), whose
+  non-interference is proven by the instrumented run reproducing the
+  committed `oracle.log` byte-for-byte before its dump is trusted. Phase 1
+  is measured as case-by-case agreement with the PoC's replayed corpus,
+  which only means something if the stick doesn't otherwise move.
 - **I-8 (sidecar, never state).** All new persistent data lives in tracked
   sidecars under `research/decomp/data/` or in
   `research/decomp/oracle-harness/`. Nothing under
@@ -455,13 +575,18 @@ the damage-core result before any second unit gets a spec.**
 
 - **F-1: Silent-zero agreement (both sides read a default).** The classic
   differential-testing false pass: codec forgets a field, wasm reads 0, TS
-  reference also defaults 0, corpus passes. Killed three ways by I-4. The
+  reference also defaults 0, corpus passes. Killed four ways by I-4 —
+  including its write-side twin (stray stores to unmodeled offsets), which
+  the post-state byte-diff catches. The
   residual risk — TS reference *and* sentinel-garbage wasm agreeing — is
   negligible for value-bearing fields and caught by the read-set audit for
   flag fields.
 - **F-2: Harness exits 0 on failure.** Present in `harness.mjs` today
   (§1.1); it never sets `process.exitCode`, so under the driver's gate a
   fully-diffing run would pass unless `success_patterns` were authored.
+  (`harness-knockback.mjs` and `harness-collision.mjs` already do this
+  right — `process.exit(green ? 0 : 1)` — proof the fix is one line, and
+  that the discipline must be structural, not per-author.)
   The generic harness closes this structurally (§3.2 exit contract), and
   I-5 makes the pattern half mandatory so neither factor is a single point
   of failure. This finding is also why Phase 1's gate includes a
@@ -483,11 +608,24 @@ the damage-core result before any second unit gets a spec.**
   is committed and diffable; and the rounding-explained bound (F-5) stops
   the other lever.
 - **F-5: `rounding_explained` becomes a dumping ground.** The tier exists
-  for genuine f32-vs-f64 divergence (damage-core: 2 in 20,000). Bound: a
-  function's verdict is `pass` only if `rounding_explained / cases ≤ 0.1%`
-  **and** every such case satisfies the `oracle32` equality (I-6). A unit
-  genuinely exceeding the bound is a spec/oracle32 design question for a
-  human, surfaced as `verdict: "fail_rounding_bound"` — never auto-passed.
+  for genuine f32-vs-f64 divergence, and the repo's own baselines prove its
+  *rate* is a function-class property, not a constant (§1.1): damage-core
+  2/20,000 (0.01% — one truncating integer formula), knockback-core 0,
+  collision-core **4,032/32,153 (12.5%)** on post-state floats (chained
+  single-precision geometry, where f64 references drift constantly). Any
+  flat global bound is therefore wrong in one direction or the other — a
+  0.1% cap would have failed the committed collision-core green. The bound
+  is **per-spec, declared and reviewed**: each function entry in the spec
+  carries `rounding_bound` (max explained fraction) with a one-line
+  justification tied to its float structure (integer-formula ≈ 0.1%;
+  chained-f32 post-state ≈ 15%; default when absent: **0** — a spec that
+  expects no rounding divergence gets none for free). Two hard rules
+  survive at any bound: every explained case must satisfy the `oracle32`
+  witness equality (I-6) — the bound caps *how many*, the witness decides
+  *whether* — and exceeding the declared bound is
+  `verdict: "fail_rounding_bound"`, a human design question, never
+  auto-passed or silently re-declared upward in the same commit as the
+  failing run.
 - **F-6: Spec/queue drift.** Queue regeneration renames units or reshuffles
   export sets. I-9's `exports_sha256` pin + journaled fallback makes this
   fail safe (unit degrades to compile_only visibly) rather than fail wrong
@@ -520,27 +658,64 @@ phase starts before its predecessor's gate is green.
 deterministically over all 10,954 queue functions with bucket counts
 published. Verified: 133 / 319 / 58 / 886, 1,007 fully gap-aligned units.
 
-**Phase 1 — Generic harness + RomActor codec, hard-gated on damage-core.**
-Build `oracle-harness/` (runner, codec, field-map extractor, arena
-generalization) and a `damage-core` unit spec, then reproduce the committed
-result **through the generic path** — the PoC harness untouched (I-7).
+**Phase 1 — Generic harness + RomActor codec, hard-gated on damage-core
+CORPUS REPLAY.**
 
-*Gate (all seven, exact):*
-1. `zz_003cd5c_`: ≥ 19,998/20,000 exact, ≤ 2 rounding-explained,
-   **0 unexplained** at seed `0x6f42`, N=20,000;
-2. `zz_0066298_`: 232/232 exact (exhaustive);
-3. `zz_003d344_`: 4,000/4,000 exact incl. lethal flag + post-state bytes;
-4. `FUN_80031634`: 2,000/2,000 exact through the SDK shim seam;
-5. coverage clean: `offsets_read_unwritten == 0`, zero sentinel-reads;
+*Pre-task P1.0 (annotation grammar, §3.3):* define the `actor.ts`
+annotation grammar and land the reviewed product-code commit annotating the
+~65 fields whose offsets lack width/kind tokens; the extractor emits zero
+`unmapped` records for fields damage-core touches. Until P1.0 lands, those
+fields are `blocked_codec` by construction.
+
+*Why replay, not re-generation:* the committed 19,998 + 2 split is a
+property of the PoC's **exact PRNG draw order** — `mulberry32(0x6f42)` is
+consumed by `randCase`'s specific call sequence (`harness.mjs:96,110-155`),
+and the hp/unit-B loops draw from the *same* stream after the main corpus.
+A generic spec-driven generator consuming draws in any other order produces
+a different — incomparable — corpus from the same seed, and "≥ 19,998" over
+a different corpus proves nothing about the codec. The gate is therefore
+defined over the **PoC's own cases, replayed**: a one-time audited dump
+hook in `harness.mjs` (env `POC_DUMP_CORPUS=<path>`; append-only
+serialization of each generated case object at the point of use, touching
+no generation logic) writes
+`research/decomp/oracle-harness/corpora/damage-core-poc.jsonl` (tracked) —
+all 20,000 main cases, the 232 exhaustive category inputs, the 4,000 hp
+triples, and the 2,000 unit-B memory images. Non-interference proof: the
+instrumented run must still print the committed `oracle.log` numbers
+byte-for-byte. This is the sole amendment to the PoC freeze (I-7).
+
+Then build `oracle-harness/` (runner, codec, field-map extractor, arena
+generalization) and a `damage-core` spec, and replay the dumped corpus
+through the generic codec + harness.
+
+*Gate (all seven, exact — equality, not thresholds):*
+1. `zz_003cd5c_` on the replayed 20,000: **exactly** 19,998 exact,
+   2 rounding-explained, 0 unexplained — the same 2 case indices;
+2. `zz_0066298_`: 232/232 exact (exhaustive, replay and re-generation
+   coincide);
+3. `zz_003d344_` on the replayed 4,000: 4,000/4,000 exact incl. lethal
+   flag + post-state bytes;
+4. `FUN_80031634` on the replayed 2,000: 2,000/2,000 exact through the SDK
+   shim seam;
+5. coverage clean: `offsets_read_unwritten == 0`, zero sentinel-reads,
+   post-state byte-diff clean (§3.3 mechanism 4);
 6. deliberate-red rehearsal: one flipped arena byte produces nonzero exit,
    `verdict: "fail"`, and (in a driver dry-run) an `oracle red` record;
-7. determinism: two consecutive runs byte-identical result JSON
+7. determinism: two consecutive replays byte-identical result JSON
    (modulo `generated_at`).
+
+Fresh-generation corpora (spec-DSL-drawn, any draw order) are how Phase 2
+units run; Phase 1 proves the *codec and comparison machinery* against a
+corpus whose expected outcome is pinned case-by-case.
 
 **Phase 2 — Differential rollout over the 133 `differential_vs_ts` units.**
 Author specs in priority-sidecar order; land the driver overlay +
-`reverify-unit` (the only driver code in the workstream); promote settled
-staged units through re-verification.
+`reverify-unit` (the only driver code in the workstream). 128 units flow
+through the normal overlay path on their next attempt; `reverify-unit`
+promotes exactly the 2 staged greens (§3.4); 3 are already green. Early
+Phase 2 also ports the knockback-core and collision-core specs onto the
+generic harness as non-gating regression anchors — they are the two
+committed baselines whose float profiles bracket the F-5 bound.
 
 *Gate:* **≥ 100 of 133** units carry a terminal differential verdict —
 `pass` (promoted to `oracle_green`) or a diagnosed `fail` with replayable
@@ -554,7 +729,10 @@ gap) — none merely unattempted.
 TS citations but no port-grade single function: the oracle compares
 **post-state snapshots** (actor structs + named bss) after driving both
 sides through the same scripted sequence, using the §3.3 decode direction
-for read-back. Pilot first (F-7): 5 units chosen from gap-partial families,
+for read-back. The full-region post-state byte-diff (§3.3 mechanism 4) is
+**mandatory** in this phase — with multi-frame sequences, unmodeled stray
+writes are the dominant false-pass channel, and field-wise snapshot
+comparison alone cannot see them. Pilot first (F-7): 5 units chosen from gap-partial families,
 measuring wall-time and codec pressure; the pilot report sets Phase 3's
 corpus floor.
 
