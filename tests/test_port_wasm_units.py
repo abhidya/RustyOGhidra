@@ -1058,3 +1058,151 @@ def test_priority_ties_fall_back_to_attempts_then_queue_order(tmp_path, monkeypa
     }
     # equal priority: the less-attempted unit still wins
     assert driver._next_unit(queue, state, set())["name"] == "unit-b"
+
+
+# ---------------------------------------------------------------------------
+# Continuous assembly gate integration (design section 2.13 [V4-11], T2b)
+
+
+def _seed_green_artifact(repo: Path, name: str, generated_at: str) -> None:
+    """A pre-existing green artifact so the post-green gate has >= 2 units."""
+    directory = repo / "research/decomp/port-units" / name
+    directory.mkdir(parents=True)
+    (directory / "unit.c").write_text(
+        "int zz_prior_(int a)\n{\n  return a;\n}\n", encoding="utf-8"
+    )
+    (directory / "gnt4_shim.h").write_text("/* seed header */\n", encoding="utf-8")
+    (directory / "provenance.json").write_text(
+        json.dumps(
+            {
+                "unit": name,
+                "generated_at": generated_at,
+                "exported_functions": ["zz_prior_"],
+                "allowed_extra_imports": [],
+                "tier": "oracle_green",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    gate_calls = []
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        gate_calls.append((sorted(c_files), exports))
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK exports=2"),
+    )
+    assert driver.run() == EXIT_NO_WORK
+    # The gate linked the fresh green together with the pre-existing one.
+    assert gate_calls, "assembly gate never ran after a green"
+    c_files, exports = gate_calls[0]
+    assert c_files == ["prior-unit.c", "unit-a.c"]
+    assert exports == ["zz_prior_", "zz_test_"]
+    ledger = json.loads(
+        (repo / "research/decomp/data/assembly-gate.json").read_text()
+    )
+    assert ledger["largest_n_passed"] == 2
+    assert ledger["last_run"]["passed"] is True
+    events = (
+        repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    ).read_text()
+    assert '"assembly_gate"' in events
+    assert '"assembly_gate_failed"' not in events
+
+
+def test_assembly_gate_failure_pages_but_never_costs_the_green(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        build_runner=fake_build,
+        assembly_link_runner=lambda *a: (
+            False, "wasm-ld: error: duplicate symbol: zz_prior_"
+        ),
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    assert driver.run() == EXIT_NO_WORK
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    # The unit's verdict is untouched by the gate failure.
+    assert state["units"]["unit-a"]["status"] == "green"
+    events = (
+        repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    ).read_text()
+    assert '"assembly_gate_failed"' in events
+    ledger = json.loads(
+        (repo / "research/decomp/data/assembly-gate.json").read_text()
+    )
+    assert ledger["largest_n_passed"] == 0
+    keys = list(ledger["conflicts"])
+    assert any("zz_prior_" in key for key in keys)
+
+
+def test_assembly_gate_internal_fault_degrades_to_an_event(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def exploding_link(*args):
+        raise RuntimeError("emsdk on fire")
+
+    driver = _driver(
+        repo, build_runner=fake_build, assembly_link_runner=exploding_link
+    )
+    assert driver.run() == EXIT_NO_WORK
+    state = json.loads(
+        (repo / "research/decomp/generated/finish-game-port/wasm-units-state.json").read_text()
+    )
+    assert state["units"]["unit-a"]["status"] == "green"
+    events = (
+        repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    ).read_text()
+    assert '"assembly_gate_error"' in events
+
+
+def test_single_green_unit_skips_the_gate_quietly(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    gate_calls = []
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        build_runner=fake_build,
+        assembly_link_runner=lambda *a: gate_calls.append(a) or (True, ""),
+    )
+    assert driver.run() == EXIT_NO_WORK
+    assert gate_calls == []  # one unit is not a composition claim
+    events = (
+        repo / "research/decomp/generated/finish-game-port/events.jsonl"
+    ).read_text()
+    assert '"assembly_gate"' not in events

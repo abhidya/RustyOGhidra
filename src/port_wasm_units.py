@@ -49,6 +49,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from src.port_assembly_gate import (
+    ASSEMBLY_WASM,
+    SMOKE_JS,
+    assembly_window_size,
+    record_gate_result,
+    run_assembly_gate,
+    select_recent_green_units,
+)
 from src.port_chunk_workflow import TRANSIENT_MARKERS, atomic_write_json, utc_now
 from src.port_driver import (
     EXIT_NO_WORK,
@@ -639,6 +647,8 @@ class WasmUnitDriver:
         oracle_runner: Any | None = None,
         git_runner: Any | None = None,
         journal: Any | None = None,
+        assembly_link_runner: Any | None = None,
+        assembly_smoke_runner: Any | None = None,
     ):
         self.repo_root = (
             Path(repo_root).resolve() if repo_root is not None else find_gotyaforce_root()
@@ -678,6 +688,15 @@ class WasmUnitDriver:
         # every unit priority 0 => ordering unchanged.
         self.priority_path = self.repo_root / "research/decomp/data/unit-priority.json"
         self._unit_priorities: dict[str, int] | None = None
+        # Continuous assembly gate (section 2.13 [V4-11], T2b): after every
+        # green, the last N green/staged units are linked in one invocation
+        # and instantiation-smoked. The ledger (largest-N-passed + conflict
+        # records) lives in the tracked data dir, like the priority sidecar.
+        self.assembly_ledger_path = (
+            self.repo_root / "research/decomp/data/assembly-gate.json"
+        )
+        self._assembly_link_runner = assembly_link_runner or self._emcc_link_many
+        self._assembly_smoke_runner = assembly_smoke_runner or self._node_smoke
 
     # ------------------------------------------------------------------- state
 
@@ -1027,6 +1046,172 @@ class WasmUnitDriver:
                 "as the original PPC code did.)"
             )
         return True, ""
+
+    # ---------------------------------------------------------- assembly gate
+
+    def _emcc_link_many(
+        self,
+        workdir: Path,
+        c_files: list[str],
+        exports: list[str],
+        allowed_extra: list[str],
+    ) -> tuple[bool, str]:
+        """One emcc invocation over N units' .c files together (section 2.13):
+        merged header, the same shared flat arena every unit already assumes,
+        externs deduplicated at the language level. Mirrors _emcc_build's
+        flags exactly -- the gate must not pass under laxer settings than the
+        per-unit build."""
+        bash = resolve_bash()
+        emsdk = self.repo_root / "research/tools/emsdk"
+        valid = [name for name in exports if EXPORT_NAME.fullmatch(name)]
+        exports_flag = ",".join("_" + name for name in valid)
+        sources = " ".join(shlex.quote(name) for name in c_files)
+        script = (
+            f"source \"{to_posix_path(emsdk)}/emsdk_env.sh\" >/dev/null || "
+            "{ echo 'emsdk_env.sh failed to load' >&2; exit 127; }; "
+            "command -v emcc >/dev/null || "
+            "{ echo 'emcc not on PATH after sourcing emsdk_env.sh' >&2; exit 127; }; "
+            f"cd \"{to_posix_path(workdir)}\" && "
+            f"emcc {sources} -O1 -fno-strict-aliasing --no-entry "
+            "-Wno-implicit-function-declaration -Wno-int-conversion "
+            "-Wno-deprecated-non-prototype "
+            "-Wno-incompatible-pointer-types -Wno-pointer-sign "
+            "-ferror-limit=0 "
+            "-sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=2155479040 "
+            "-sALLOW_MEMORY_GROWTH=0 "
+            f"-sEXPORTED_FUNCTIONS={shlex.quote(exports_flag)} "
+            f"-o {ASSEMBLY_WASM}"
+        )
+        completed = subprocess.run(
+            [bash, "-lc", script],
+            capture_output=True,
+            text=True,
+            timeout=BUILD_TIMEOUT_SECONDS,
+            env=build_environment(),
+            creationflags=NO_WINDOW,
+        )
+        if completed.returncode != 0:
+            return False, (completed.stderr + completed.stdout)[-8000:]
+        bad = scan_disallowed_imports(workdir / ASSEMBLY_WASM)
+        bad = [name for name in bad if name not in set(allowed_extra)]
+        if bad:
+            return False, (
+                "link gate: these symbols are UNDEFINED across the assembled "
+                "units and became wasm imports, but they are neither gnt4_* SDK "
+                "functions nor whitelisted external callees: " + ", ".join(bad)
+            )
+        return True, ""
+
+    def _node_smoke(self, wasm_path: Path) -> tuple[bool, str]:
+        """Instantiation smoke under node: the gate passes iff the linked
+        module LOADS. No behaviour asserted (that stays the oracle tier)."""
+        # .cjs, not .js: the repo's package.json declares "type": "module",
+        # which makes node treat any .js under it as ESM and reject require().
+        script_path = wasm_path.parent / "assembly-smoke.cjs"
+        script_path.write_text(SMOKE_JS, encoding="utf-8", newline="\n")
+        completed = subprocess.run(
+            [resolve_node_exe(), str(script_path), str(wasm_path)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=NO_WINDOW,
+        )
+        log = completed.stdout + (
+            "\n--- stderr ---\n" + completed.stderr if completed.stderr else ""
+        )
+        return completed.returncode == 0 and "ASSEMBLY_SMOKE_OK" in completed.stdout, log
+
+    def run_assembly_gate_now(
+        self,
+        n: int | None = None,
+        *,
+        workdir_name: str = "_assembly",
+    ) -> dict[str, Any]:
+        """One assembly-gate pass over the last n green/staged units (n=None
+        sweeps everything -- the backfill form). Emits NO events and takes no
+        lock: safe from the maintenance CLI while a driver is alive (it reads
+        only committed artifacts and writes only its own workdir + ledger)."""
+        units = select_recent_green_units(
+            [self.artifact_root, self.staging_root], n
+        )
+        if len(units) < 2:
+            return {
+                "passed": None,
+                "n": len(units),
+                "units": [unit.name for unit in units],
+                "stage": "skipped",
+                "conflicts": [],
+                "detail": "fewer than 2 green/staged units; nothing to compose",
+            }
+        result = run_assembly_gate(
+            units,
+            self.work_root / workdir_name,
+            link_runner=self._assembly_link_runner,
+            smoke_runner=self._assembly_smoke_runner,
+        )
+        record_gate_result(self.assembly_ledger_path, result)
+        return result
+
+    def _maybe_run_assembly_gate(self, unit_name: str) -> None:
+        """Driver-side gate hook, called after every green/staged unit.
+
+        Telemetry-with-teeth: the gate NEVER changes the unit's verdict (the
+        unit already earned green), but a failure pages (assembly_gate_failed
+        event, the section 4 [V4-11] invariant row) and files conflict
+        records in the tracked ledger. Any internal fault degrades to an
+        event, never to a lost unit."""
+        try:
+            result = self.run_assembly_gate_now(assembly_window_size())
+            if result.get("passed") is None:
+                return  # fewer than 2 units: composition is not yet a claim
+            self.events.emit(
+                "assembly_gate",
+                unit=unit_name,
+                n=result.get("n"),
+                units=result.get("units"),
+                passed=result.get("passed"),
+                stage=result.get("stage"),
+                conflict_count=len(result.get("conflicts") or []),
+            )
+            if not result.get("passed"):
+                self.events.emit(
+                    "assembly_gate_failed",
+                    unit=unit_name,
+                    stage=result.get("stage"),
+                    conflicts=[
+                        {
+                            "symbol": c.get("symbol"),
+                            "class": c.get("class"),
+                            "units": c.get("units"),
+                        }
+                        for c in (result.get("conflicts") or [])[:20]
+                    ],
+                    detail=(result.get("detail") or "")[:600],
+                )
+            # Best-effort ledger commit: the conflict records are the
+            # cross-unit reconciliation report (section 3) and belong in
+            # history next to the unit that surfaced them. Never fatal, and
+            # an unchanged ledger simply fails the commit quietly.
+            rel = "research/decomp/data/assembly-gate.json"
+            added = self._git_runner("add", rel)
+            if added.returncode == 0:
+                self._git_runner(
+                    "commit",
+                    "-m",
+                    (
+                        f"port-assembly: gate N={result.get('n')} "
+                        f"{'pass' if result.get('passed') else 'FAIL'} "
+                        f"({len(result.get('conflicts') or [])} conflict(s)) "
+                        f"after {unit_name}"
+                    ),
+                    "--",
+                    rel,
+                )
+                self._git_runner("push")
+        except Exception as error:  # noqa: BLE001 - the gate never fails a unit
+            self.events.emit(
+                "assembly_gate_error", unit=unit_name, error=str(error)[:400]
+            )
 
     # ------------------------------------------------------------------ oracle
 
@@ -1456,6 +1641,10 @@ class WasmUnitDriver:
             pushed=pushed,
             push_detail=push_detail,
         )
+        # Continuous assembly gate (section 2.13 [V4-11]): every green feeds
+        # the rolling N-unit link. Runs after the unit's own commit so a gate
+        # fault can never cost a green; failures page + file conflicts.
+        self._maybe_run_assembly_gate(name)
         return "green"
 
     @staticmethod
@@ -1931,11 +2120,33 @@ def main(argv: list[str] | None = None) -> int:
         help="why this verdict is being settled by hand (journaled verbatim)",
     )
     settle.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    gate = sub.add_parser(
+        "assembly-gate",
+        help="run the continuous assembly gate (section 2.13) over the last N "
+        "green/staged units (--all sweeps every unit: the composability "
+        "backfill). Lock-free: reads committed artifacts only, writes its own "
+        "workdir + the tracked ledger; emits no driver events.",
+    )
+    gate.add_argument(
+        "--n", type=int, default=None,
+        help="window size (default: OGHIDRA_PORT_ASSEMBLY_N or 5)",
+    )
+    gate.add_argument(
+        "--all", action="store_true",
+        help="assemble every green/staged unit instead of the last N",
+    )
+    gate.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
     args = parser.parse_args(argv)
     if args.command == "settle-unit":
         driver = WasmUnitDriver(repo_root=args.repo_root)
         print(json.dumps(driver.settle_unit(args.unit, args.status, args.reason), indent=2))
         return 0
+    if args.command == "assembly-gate":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        window = None if args.all else (args.n or assembly_window_size())
+        result = driver.run_assembly_gate_now(window, workdir_name="_assembly-manual")
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("passed") in (True, None) else 1
     return 2
 
 
