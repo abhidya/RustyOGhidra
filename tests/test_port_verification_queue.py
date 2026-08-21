@@ -344,6 +344,158 @@ def test_reverify_unit_cli_rejects_non_staged_units(tmp_path):
         driver.reverify_unit("unit-b")
 
 
+# -------------------------------------------- crash-safety (T3 review F1/F2)
+
+
+def test_promotion_commits_before_staging_removal(tmp_path, monkeypatch):
+    """F1 ordering: the staged copy must still exist when the promoted commit
+    is made (a tree-kill at any point before that commit loses nothing), and
+    the staging removal is its own later commit."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    staged_wasm = repo / "research/decomp/port-units-staging/unit-b/unit.wasm"
+    commits: list[dict] = []
+
+    def fake_git(*args):
+        if args[0] == "commit":
+            commits.append(
+                {"message": args[2], "staged_exists": staged_wasm.is_file()}
+            )
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
+
+    driver = _driver(repo, git_runner=fake_git)
+    driver.run()
+    assert len(commits) == 2
+    assert "promoted" in commits[0]["message"]
+    assert commits[0]["staged_exists"] is True, (
+        "the staged artifact must survive until the promoted commit lands"
+    )
+    assert "remove staged copy" in commits[1]["message"]
+    assert commits[1]["staged_exists"] is False
+
+
+def test_commit_failure_keeps_staged_copy_and_unit_retryable(tmp_path, monkeypatch):
+    """F1 + F2: a failed promote commit leaves the staged artifact intact and
+    the unit still a verification candidate; a later pass with working git
+    finishes the promotion idempotently."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+
+    def broken_git(*args):
+        if args[0] == "commit":
+            return _completed(1, "fatal: could not commit")
+        if args[0] == "rev-parse":
+            return _completed(0, "deadbeef\n")
+        return _completed(0)
+
+    driver = _driver(repo, git_runner=broken_git)
+    driver.run()
+    record = _state(repo)["units"]["unit-b"]
+    assert record["tier"] == "compile_only"  # promotion NOT recorded
+    assert record["verify"]["status"] == "commit_failed"
+    assert (repo / "research/decomp/port-units-staging/unit-b/unit.wasm").is_file()
+    # F2: commit_failed is transient -- the unit stays a candidate
+    driver2 = _driver(repo, git_runner=broken_git)
+    assert driver2._verification_candidates(driver2._load_state()) == ["unit-b"]
+    # working git now: the promotion completes idempotently
+    driver3 = _driver(repo)
+    driver3.run()
+    record = _state(repo)["units"]["unit-b"]
+    assert record["tier"] == "oracle_green"
+    assert record["verify"]["status"] == "pass"
+    assert not (repo / "research/decomp/port-units-staging/unit-b").exists()
+
+
+def test_transient_verify_error_leaves_candidate_oracle_red_does_not(tmp_path):
+    """F2: only a COMPLETED oracle run under the same spec is unrepeatable."""
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo)
+    state = driver._load_state()
+    sidecar = json.loads(
+        (repo / "research/decomp/data/oracle-commands.json").read_text()
+    )
+    spec_sha = oracle_entry_sha(sidecar["units"]["unit-b"])
+    state["units"]["unit-b"]["verify"] = {"status": "error", "spec_sha256": spec_sha}
+    assert driver._verification_candidates(state) == ["unit-b"]
+    state["units"]["unit-b"]["verify"] = {
+        "status": "oracle_red",
+        "spec_sha256": spec_sha,
+    }
+    assert driver._verification_candidates(state) == []
+
+
+def test_reconcile_finishes_interrupted_promotion(tmp_path, monkeypatch):
+    """F1 reconcile: promotion recorded (commit + state) but the driver died
+    before the staging removal -- the next start finishes the cleanup."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    promoted = repo / "research/decomp/port-units/unit-b"
+    promoted.mkdir(parents=True)
+    (promoted / "provenance.json").write_text(
+        json.dumps({"unit": "unit-b", "verified": True, "tier": "oracle_green"})
+    )
+    (promoted / "unit.wasm").write_bytes(b"\x00asm")
+    state = {
+        "state_schema": 1,
+        "units": {
+            "unit-b": {
+                "status": "green",
+                "attempts": 1,
+                "tier": "oracle_green",
+                "verify": {"status": "pass", "spec_sha256": "0" * 64},
+            }
+        },
+    }
+    (repo / RUN_ROOT / "wasm-units-state.json").write_text(json.dumps(state))
+    driver = _driver(repo)
+    driver.run()
+    assert not (repo / "research/decomp/port-units-staging/unit-b").exists()
+    assert (promoted / "unit.wasm").is_file()
+    assert any(event["kind"] == "reverify_reconciled" for event in _events(repo))
+
+
+def test_promotion_restores_entries_revoked_by_own_failed_reverify(tmp_path, monkeypatch):
+    """F3: an entry revoked BY this unit's failed re-run is un-revoked (with a
+    restored trail record) when the unit later promotes."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    registry = empty_registry()
+    registry["entries"]["fn:zz_b_"] = {
+        "kind": "prototype",
+        "symbol": "zz_b_",
+        "declaration": "int zz_b_(void);",
+        "tier": "compile_only",
+        "source_units": [],
+        "revoked": True,
+        "conflicts": [
+            {
+                "tombstone": True,
+                "unit": "unit-b",
+                "tier": "compile_only",
+                "reason": "sole source failed its oracle re-run; entry revoked",
+                "recorded_at": "2026-08-20T00:00:00Z",
+            }
+        ],
+    }
+    registry["version"] = 2
+    registry_path = repo / REGISTRY_RELPATH
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    save_registry(registry_path, registry)
+    driver = _driver(repo)
+    result = driver.reverify_unit("unit-b")
+    assert result["promoted"] is True
+    after = json.loads(registry_path.read_text(encoding="utf-8"))
+    entry = after["entries"]["fn:zz_b_"]
+    assert entry["revoked"] is False
+    assert entry["tier"] == "oracle_green"
+    assert "unit-b" in entry["source_units"]
+    assert any(conflict.get("restored") for conflict in entry["conflicts"])
+    assert any(conflict.get("tombstone") for conflict in entry["conflicts"])
+    assert any(event["kind"] == "registry_restored" for event in _events(repo))
+
+
 def test_unverified_inventory_buildup_pages_on_falling_fraction(tmp_path):
     repo = _write_repo(tmp_path)
     driver = _driver(repo)

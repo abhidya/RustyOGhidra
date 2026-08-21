@@ -16,8 +16,8 @@ from pathlib import Path
 
 from src.port_driver import EXIT_NO_WORK
 from src.port_wasm_units import (
+    DIAGNOSIS_MALFORMED_LIMIT,
     MAX_COMPILE_ITERS,
-    STRUCTURAL_DEPRIORITY,
     WasmUnitDriver,
     assemble_post_mortem,
     merge_targeted_declarations,
@@ -334,8 +334,16 @@ def test_second_failure_triggers_one_structural_diagnosis(tmp_path, monkeypatch)
     ]
 
 
-def test_structural_diagnosis_deprioritises_in_the_selector(tmp_path):
+def test_structural_diagnosis_sinks_across_priority_bands(tmp_path):
+    """T3 review F4: a STRUCTURAL-diagnosed red in the HIGHEST product
+    priority band must still serve after every non-structural unit in
+    lower bands -- structural is the leading sort component, not a cost."""
     repo = _write_repo(tmp_path, units=["unit-a", "unit-b"])
+    (repo / "research/decomp/data").mkdir(parents=True, exist_ok=True)
+    (repo / "research/decomp/data/unit-priority.json").write_text(
+        json.dumps({"priorities": {"unit-a": 1000, "unit-b": 0}}),
+        encoding="utf-8",
+    )
     driver = _driver(repo)
     state = {
         "state_schema": 1,
@@ -345,15 +353,44 @@ def test_structural_diagnosis_deprioritises_in_the_selector(tmp_path):
                 "attempts": 0,
                 "diagnosis": {"verdict": "STRUCTURAL", "reason": "r"},
             },
-            "unit-b": {
-                "status": "red_retryable",
-                "attempts": STRUCTURAL_DEPRIORITY - 1,
-            },
+            "unit-b": {"status": "red_retryable", "attempts": 50},
         },
     }
     queue = driver._load_queue()
     chosen = driver._next_unit(queue, state, set())
     assert chosen["name"] == "unit-b"
+    # ...but it still runs when it is the only work left
+    chosen2 = driver._next_unit(queue, state, {"unit-b"})
+    assert chosen2["name"] == "unit-a"
+
+
+def test_malformed_diagnosis_is_metered_and_retired(tmp_path, monkeypatch):
+    """T3 review F5: a malformed diagnosis reply is counted (model_requests)
+    and after DIAGNOSIS_MALFORMED_LIMIT malformed replies the question is
+    recorded terminally UNPARSEABLE and never re-asked."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    llm = RecordingLLM({"wasm_diagnosis": "I cannot decide, sorry."})
+    driver = _driver(repo, llm=llm)
+    queue_unit = driver._load_queue()[0]
+    state = driver._load_state()
+    record = state.setdefault("units", {}).setdefault(
+        "unit-a", {"status": "red_retryable", "attempts": 2}
+    )
+    for expected_malformed in range(1, DIAGNOSIS_MALFORMED_LIMIT + 1):
+        result = driver._diagnose_unit(queue_unit, record, state)
+        assert record["diagnosis_malformed"] == expected_malformed
+        assert record["model_requests"] == expected_malformed
+    assert result["verdict"] == "UNPARSEABLE"
+    assert record["diagnosis"]["verdict"] == "UNPARSEABLE"
+    assert not record.get("f4_nominated")  # nothing was learned
+    calls_so_far = len(llm.calls)
+    # retired: never re-asked
+    assert driver._diagnose_unit(queue_unit, record, state)["verdict"] == "UNPARSEABLE"
+    assert len(llm.calls) == calls_so_far
+    assert any(
+        event["kind"] == "diagnosis_unparseable" for event in _events(repo)
+    )
 
 
 def test_terminal_waiting_page_carries_diagnoses(tmp_path, monkeypatch):

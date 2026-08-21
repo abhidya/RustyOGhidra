@@ -927,6 +927,7 @@ class RetierResult:
     revoked: list[str] = field(default_factory=list)
     green_green: list[str] = field(default_factory=list)
     reopened: list[str] = field(default_factory=list)
+    restored: list[str] = field(default_factory=list)
     changed: bool = False
     version: int = 0
 
@@ -1015,6 +1016,57 @@ def revoke_unit_entries(registry: dict[str, Any], unit_name: str) -> RetierResul
                 }
             )
             result.revoked.append(key)
+        touched.append(key)
+    if touched:
+        version = _bump_version(registry)
+        for key in set(touched):
+            entries[key]["updated_version"] = version
+        result.changed = True
+        result.version = version
+    return result
+
+
+def restore_unit_entries(registry: dict[str, Any], unit_name: str) -> RetierResult:
+    """T3 review F3: un-revoke entries that were revoked BY a failed oracle
+    re-run of THIS unit, when the unit later promotes after all (e.g. the
+    owner fixed a spec typo and the re-run now passes).
+
+    Only entries carrying this unit's re-run tombstone qualify -- a revoke
+    from any other cause stays revoked. The tombstone is kept and a
+    ``restored`` trail record is appended next to it, so the event trail
+    explains both the disappearance and the return; the unit re-enters
+    ``source_units`` at ``oracle_green`` (the tier its passing re-run just
+    earned)."""
+    result = RetierResult(version=registry_version(registry))
+    entries = registry.get("entries") or {}
+    touched: list[str] = []
+    for key, entry in entries.items():
+        if not entry.get("revoked"):
+            continue
+        tombstones = [
+            conflict
+            for conflict in entry.get("conflicts") or []
+            if conflict.get("tombstone")
+            and conflict.get("unit") == unit_name
+            and "oracle re-run" in (conflict.get("reason") or "")
+        ]
+        if not tombstones:
+            continue
+        entry["revoked"] = False
+        sources = entry.get("source_units") or []
+        if unit_name not in sources:
+            entry["source_units"] = sources + [unit_name]
+        entry.setdefault("source_tiers", {})[unit_name] = TIER_ORACLE_GREEN
+        entry["tier"] = TIER_ORACLE_GREEN
+        entry.setdefault("conflicts", []).append(
+            {
+                "restored": True,
+                "unit": unit_name,
+                "reason": "revoking re-run later passed; entry restored",
+                "recorded_at": utc_now(),
+            }
+        )
+        result.restored.append(key)
         touched.append(key)
     if touched:
         version = _bump_version(registry)

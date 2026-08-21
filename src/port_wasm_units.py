@@ -72,6 +72,7 @@ from src.port_knowledge_registry import (
     record_surviving_deviations,
     registry_version,
     relevant_delta,
+    restore_unit_entries,
     revoke_unit_entries,
     save_registry,
     unit_symbol_set,
@@ -762,11 +763,14 @@ def concrete_type_contradictions(
 # state, no LLM writes it).
 
 TARGETED_MAX_SYMBOLS = 5
-# Section 2.12(b): an LLM STRUCTURAL verdict never settles -- it deprioritises
-# (a large attempts-equivalent penalty in the selector, so the unit sinks
-# behind all other schedulable work but still runs when it is the only work)
-# and nominates the unit for the F4 replay sample.
-STRUCTURAL_DEPRIORITY = 100
+# Section 2.12(b): after this many MALFORMED diagnosis replies (no
+# STRUCTURAL/FIXABLE verdict extractable) the question is recorded terminally
+# UNPARSEABLE and never re-asked -- re-asking with near-identical inputs is
+# the section 0.1 forbidden retry (T3 review F5). The STRUCTURAL
+# deprioritisation itself is the LEADING _next_unit sort component (T3 review
+# F4), not a cost constant: a structural-diagnosed red sinks behind ALL
+# schedulable non-structural work across product_priority bands.
+DIAGNOSIS_MALFORMED_LIMIT = 2
 
 _SYMBOL_DIAG_PATTERNS = [
     re.compile(r"use of undeclared identifier '([A-Za-z_]\w*)'"),
@@ -2805,14 +2809,39 @@ class WasmUnitDriver:
                 ),
             )
         except Exception as error:  # noqa: BLE001 - diagnosis is best-effort
+            # A call that never completed (provider fault, extraction error)
+            # consumed nothing and is section-2.10 transient: unmetered, and
+            # the question stays askable.
             self.events.emit("diagnosis_error", unit=name, error=str(error)[:400])
             return None
+        # The call COMPLETED: meter it (T3 review F5), whatever the reply shape.
+        record["model_requests"] = record.get("model_requests", 0) + 1
         match = _DIAGNOSIS_VERDICT.search(reply or "")
         if not match:
+            # Malformed reply: bounded re-asks only. Re-asking the same
+            # near-identical question forever is the section 0.1 forbidden
+            # retry, so after DIAGNOSIS_MALFORMED_LIMIT malformed replies the
+            # diagnosis is recorded terminally UNPARSEABLE and never re-asked
+            # (still never settles; no F4 nomination -- nothing was learned).
+            malformed = int(record.get("diagnosis_malformed", 0)) + 1
+            record["diagnosis_malformed"] = malformed
             self.events.emit(
                 "diagnosis_error", unit=name,
                 error=f"no STRUCTURAL/FIXABLE verdict in reply: {(reply or '')[:200]!r}",
             )
+            if malformed >= DIAGNOSIS_MALFORMED_LIMIT:
+                record["diagnosis"] = {
+                    "verdict": "UNPARSEABLE",
+                    "reason": f"{malformed} malformed replies; question retired",
+                    "attempts_at": record.get("attempts", 0),
+                    "at": utc_now(),
+                }
+                self.events.emit(
+                    "diagnosis_unparseable", unit=name, malformed=malformed
+                )
+                self._save_state(state)
+                return record["diagnosis"]
+            self._save_state(state)
             return None
         verdict = match.group(1)
         reason = (reply or "")[match.end():].lstrip(" :-—").strip()[:400]
@@ -2823,7 +2852,6 @@ class WasmUnitDriver:
             "at": utc_now(),
         }
         record["diagnosis"] = diagnosis
-        record["model_requests"] = record.get("model_requests", 0) + 1
         if verdict == "STRUCTURAL":
             # Never settles: deprioritise + nominate for the F4 replay sample.
             record["f4_nominated"] = True
@@ -2880,8 +2908,15 @@ class WasmUnitDriver:
                 )
                 continue
             previous = record.get("verify") or {}
-            if previous and previous.get("spec_sha256") == oracle_entry_sha(entry):
-                continue  # same spec already ran; nothing new to learn
+            # T3 review F2: only a COMPLETED oracle run under this spec is
+            # unrepeatable (section 0.1) -- oracle_red (and pass, defensively)
+            # skip; transient faults (error, commit_failed) are section-2.10
+            # territory and leave the unit a candidate.
+            if (
+                previous.get("status") in ("oracle_red", "pass")
+                and previous.get("spec_sha256") == oracle_entry_sha(entry)
+            ):
+                continue  # same spec already decided; nothing new to learn
             candidates.append(name)
         return sorted(candidates)
 
@@ -2894,7 +2929,13 @@ class WasmUnitDriver:
             return None, False, (added.stdout + added.stderr)[-400:]
         committed = self._git_runner("commit", "-m", message, "--", *paths)
         if committed.returncode != 0:
-            return None, False, (committed.stdout + committed.stderr)[-400:]
+            output = committed.stdout + committed.stderr
+            # Idempotent resume (T3 review F1): a re-run after a crash between
+            # the artifact commit and the state update re-copies byte-identical
+            # files; "nothing to commit" then means the commit already exists,
+            # not a failure.
+            if "nothing to commit" not in output and "no changes added" not in output:
+                return None, False, output[-400:]
         sha = ""
         rev = self._git_runner("rev-parse", "HEAD")
         if rev.returncode == 0:
@@ -2995,7 +3036,14 @@ class WasmUnitDriver:
                 ),
             )
             return {"unit": name, "promoted": False, "summary": summary}
-        # PASS: provenance rewrite + artifact move + registry promotion + commit.
+        # PASS: crash-safe ordering (T3 review F1). The staged artifact is the
+        # only durable copy until the promoted commit lands, and the
+        # supervisor's NORMAL stop path is a tree-kill -- so the staging dir
+        # is not touched until commit + checkpoint + state update have all
+        # succeeded. Order: copy -> provenance rewrite -> registry
+        # restore/promote -> COMMIT promoted copy -> journal + state -> only
+        # then remove staging (its own commit; a kill in between is finished
+        # by _reconcile_promoted on the next start).
         promoted_dir = self.artifact_root / name
         promoted_dir.mkdir(parents=True, exist_ok=True)
         for file_path in staged_dir.iterdir():
@@ -3021,15 +3069,25 @@ class WasmUnitDriver:
             },
         )
         atomic_write_json(promoted_dir / "provenance.json", provenance)
-        shutil.rmtree(staged_dir)
         registry_rel = None
-        retier = None
         try:
             registry = self._registry()
+            # T3 review F3: a revoke caused by THIS unit's own failed re-run
+            # is undone by its passing re-run (spec-typo scenario) -- with a
+            # restored trail record, never a silent reappearance.
+            restore = restore_unit_entries(registry, name)
             retier = promote_unit_entries(registry, name)
-            if retier.changed:
+            if restore.changed or retier.changed:
                 self._save_registry(registry)
                 registry_rel = REGISTRY_RELPATH
+            if restore.changed:
+                self.events.emit(
+                    "registry_restored",
+                    unit=name,
+                    restored=restore.restored[:20],
+                    registry_version=registry_version(registry),
+                )
+            if retier.changed:
                 self.events.emit(
                     "registry_promoted",
                     unit=name,
@@ -3048,11 +3106,13 @@ class WasmUnitDriver:
             self.events.emit(
                 "registry_promote_error", unit=name, error=str(error)[:400]
             )
+        # Commit the PROMOTED copy first; staging is untouched on any failure,
+        # so the unit simply remains a verification candidate (F2) and the
+        # next pass retries idempotently.
         sha, pushed, push_detail = self._commit_paths(
             f"port: {name} wasm unit promoted (oracle {summary})",
             [
                 f"research/decomp/port-units/{name}",
-                f"research/decomp/port-units-staging/{name}",
                 *([registry_rel] if registry_rel else []),
             ],
         )
@@ -3116,6 +3176,11 @@ class WasmUnitDriver:
             previous_tier="compile_only",
         )
         self._flag_unverified_inventory(state)
+        # Only now, with the promotion durable (commit + journal + state), is
+        # the staged copy redundant. Removal failure is safe: the promoted
+        # tree is authoritative and _reconcile_promoted finishes the cleanup
+        # on the next driver start.
+        self._remove_staged_copy(name)
         return {
             "unit": name,
             "promoted": True,
@@ -3123,6 +3188,49 @@ class WasmUnitDriver:
             "commit": sha,
             "pushed": pushed,
         }
+
+    def _remove_staged_copy(self, name: str) -> bool:
+        """Delete the (now redundant) staged copy and commit the deletion.
+        Best-effort: any fault emits an event and leaves the reconcile path
+        to finish the job -- it never un-promotes anything."""
+        staged_dir = self.staging_root / name
+        try:
+            if staged_dir.exists():
+                shutil.rmtree(staged_dir)
+            sha, _pushed, detail = self._commit_paths(
+                f"port: remove staged copy of promoted unit {name}",
+                [f"research/decomp/port-units-staging/{name}"],
+            )
+            if sha is None:
+                self.events.emit(
+                    "staging_cleanup_failed", unit=name, detail=detail[:400]
+                )
+                return False
+            return True
+        except (OSError, subprocess.SubprocessError) as error:
+            self.events.emit(
+                "staging_cleanup_failed", unit=name, detail=str(error)[:400]
+            )
+            return False
+
+    def _reconcile_promoted(self, state: dict[str, Any]) -> None:
+        """T3 review F1: idempotent resume for a promotion interrupted after
+        its commit -- the promoted artifact exists AND the staged copy is
+        still present. The promotion already happened (commit + journal +
+        state record all say oracle_green with a passed verify); only the
+        staged-copy removal is owed. A record still compile_only with both
+        dirs present needs NO branch here: staging is intact, so the unit
+        simply remains a verification candidate and re-runs idempotently."""
+        for name, record in state.get("units", {}).items():
+            if (
+                record.get("status") == "green"
+                and record.get("tier") == "oracle_green"
+                and (record.get("verify") or {}).get("status") == "pass"
+                and (self.staging_root / name).exists()
+                and (self.artifact_root / name / "provenance.json").is_file()
+            ):
+                if self._remove_staged_copy(name):
+                    self.events.emit("reverify_reconciled", unit=name)
 
     def reverify_unit(self, unit_name: str) -> dict[str, Any]:
         """CLI entry (oracle plan section 3.4): promote one staged unit by
@@ -3385,20 +3493,25 @@ class WasmUnitDriver:
             # unit its place in line, so neither a failing unit nor a
             # driver-killing one can monopolise the selector.
             cost = int(record.get("attempts", 0)) + int(record.get("interruptions", 0))
-            # Section 2.12(b): an LLM STRUCTURAL diagnosis never settles --
-            # it deprioritises: the unit sinks behind all other schedulable
-            # work, but still runs when it is the only work left.
-            if (record.get("diagnosis") or {}).get("verdict") == "STRUCTURAL":
-                cost += STRUCTURAL_DEPRIORITY
+            # Section 2.12(b) / T3 review F4: an LLM STRUCTURAL diagnosis
+            # never settles -- it deprioritises as the LEADING sort component,
+            # so the unit sinks behind ALL schedulable non-structural work
+            # across every product_priority band, and still runs when it is
+            # the only work left.
+            structural = int(
+                (record.get("diagnosis") or {}).get("verdict") == "STRUCTURAL"
+            )
             # Section 2.14 [V4-2]: product_priority leads the key (higher
             # serves first, hence negated); chunk/queue order stays the tail
             # tie-break. An absent sidecar makes every priority 0 and the
             # ordering collapses to the previous (cost, index) behaviour.
-            candidates.append((-self._unit_priority(name), cost, index, unit))
+            candidates.append(
+                (structural, -self._unit_priority(name), cost, index, unit)
+            )
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-        return candidates[0][3]
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        return candidates[0][4]
 
     def _only_zero_delta_reds(self, state: dict[str, Any]) -> bool:
         """True when every unsettled unit is a zero-delta red: nothing is
@@ -3427,6 +3540,7 @@ class WasmUnitDriver:
             for unit in queue:  # make every queued unit visible in state/progress
                 self._unit_state(state, unit["name"])
             self._reconcile_interrupted(state)
+            self._reconcile_promoted(state)
             self._save_state(state)
             self.events.emit(
                 "driver_started", mode="wasm_units", units_budget=self.units_budget

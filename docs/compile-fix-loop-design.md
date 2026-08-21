@@ -772,6 +772,36 @@ implemented, two minors recorded:
   unit START; the git audit trail catches up at the next green's co-commit,
   so between those points the working tree is ahead of history.
 
+**T3 review advisories (2026-08-20 adversarial review; recorded, not
+implemented).** The review's required findings (crash-safe reverify
+ordering + reconcile, transient-fault candidate filter, revoke-restore
+path, cross-band structural deprioritisation, bounded diagnosis re-asks)
+are fixed in code; three advisories are parked here so they are not lost:
+
+- **F6 (advisory): sidecar per-function pattern validation is
+  substring-presence only.** `validate_oracle_entry` checks that each
+  exported function's name APPEARS somewhere in the joined patterns —
+  weaker than the oracle plan §3.4 rule (one pattern that pins each
+  function's own result line). A spec author could satisfy it with one
+  pattern naming every function. Accepted while specs are owner-authored
+  and reviewed; tighten if spec authoring is ever delegated.
+- **F7 (advisory): the concrete-type classifier can settle on a rounds set
+  in which no header was ever applied** (a one-round attempt), making the
+  "survived every applied header" condition vacuous — the proof then rests
+  on the static conditions alone (concrete built-in types, unit-declared
+  identifiers). And the F4 recheck's classifier-freeze signal is
+  report-only by design: the CLI exits 1 and pages, the owner freezes the
+  classifier. Both are deliberate conservatism boundaries, recorded so F4
+  audits know where to look.
+- **F8 (T2a completion gap, for the owner): the §2.3 [V4-4] post-mortem
+  block in `_compile_fix` never landed.** T2a shipped the rounds data
+  capture (normalized diagnostic sets, fingerprints, attempt-scoped
+  snapshots) but ordinary world-changed retries still carry no post-mortem
+  in the prompt — only the T3 escalation questions (§2.12 a/b) do. FIXABLE
+  diagnosis reasons are therefore dead data except via the targeted
+  question, and falsifier F7 (post-mortem A/B) cannot run until the block
+  lands.
+
 ### 2.14 Queue ordering toward product gaps — G1, G2 [V4-2, new]
 
 The Tier-0 fixes (status header) corrected what the queue *contains*; this
