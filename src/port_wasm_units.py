@@ -1986,17 +1986,23 @@ class WasmUnitDriver:
         )
 
     def _push_product(self) -> subprocess.CompletedProcess[str]:
-        """The ONE sanctioned product push: current branch to its same-named
-        branch on origin, explicit refspec (a bare `git push` depends on
-        ambient upstream config -- the gate-ledger bug rode exactly that).
-        This lands greens on GotYaForce main per the runbook invariant
-        ("main should receive a push whenever a unit goes green"); the
-        port-progress branch is journal-owned (port_progress.py pushes it
-        with its own explicit refspec from its own worktree) and product
-        history must never be pushed there. One retry for transient faults."""
-        pushed = self._git_runner("push", "origin", "HEAD")
+        """The ONE sanctioned product push, explicit refspec (a bare
+        `git push` depends on ambient upstream config -- the gate-ledger
+        bug rode exactly that).
+
+        INTERIM (owner-ordered, 2026-08-20, pending docs/
+        git-topology-design.md): artifact commits stop reaching origin/main.
+        The local lineage is unchanged -- greens/promotions commit exactly
+        as before on the current branch -- but the push lands it on the
+        origin `port-staging` branch (created on first push, fast-forward
+        thereafter since it only ever receives this same lineage). The
+        port-progress branch stays journal-owned (port_progress.py pushes
+        it with its own explicit refspec from its own worktree); origin
+        main receives nothing. One retry for transient faults."""
+        refspec = "HEAD:refs/heads/port-staging"
+        pushed = self._git_runner("push", "origin", refspec)
         if pushed.returncode != 0:
-            pushed = self._git_runner("push", "origin", "HEAD")
+            pushed = self._git_runner("push", "origin", refspec)
         return pushed
 
     # -------------------------------------------------------------------- unit

@@ -1385,8 +1385,10 @@ def test_assembly_gate_repeat_conflict_is_immaterial(tmp_path, monkeypatch):
 
 
 def test_product_push_uses_an_explicit_refspec(tmp_path, monkeypatch):
-    """The green unit's product push must be `push origin HEAD` (current
-    branch to its same-named origin branch), never a bare `git push`."""
+    """The green unit's product push must be the explicit interim refspec
+    `push origin HEAD:refs/heads/port-staging` (owner-ordered, pending the
+    topology design): local lineage unchanged, origin/main receives
+    nothing, never a bare `git push`."""
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     git_calls = []
@@ -1404,7 +1406,7 @@ def test_product_push_uses_an_explicit_refspec(tmp_path, monkeypatch):
     driver = _driver(repo, git_runner=fake_git, build_runner=fake_build)
     assert driver.run() == EXIT_NO_WORK
     pushes = [args for args in git_calls if args[0] == "push"]
-    assert pushes == [("push", "origin", "HEAD")]
+    assert pushes == [("push", "origin", "HEAD:refs/heads/port-staging")]
     # And every add/commit in the run is pathspec'd.
     for args in git_calls:
         if args[0] in ("add", "commit"):
@@ -1430,7 +1432,7 @@ def test_commit_paths_is_pathspecd_and_pushes_explicitly(tmp_path, monkeypatch):
     )
     assert sha == "deadbeef" and pushed and detail == ""
     assert [args for args in git_calls if args[0] == "push"] == [
-        ("push", "origin", "HEAD")
+        ("push", "origin", "HEAD:refs/heads/port-staging")
     ]
     for args in git_calls:
         if args[0] in ("add", "commit"):
