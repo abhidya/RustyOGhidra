@@ -47,6 +47,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +122,17 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 QUEUE_SCHEMA = 1
 STATE_SCHEMA = 1
 PROMOTION_ATTEMPT_SCHEMA = 1
+
+
+@dataclass(frozen=True)
+class PromotionTransaction:
+    """One durable post-gate promotion intent and its owned workspace."""
+
+    attempt_dir: Path
+    candidate: UnitArtifact
+    destination: Path
+
+
 # Compile-fix depth cap (design section 2.1): across the n=7 clean repair-greens
 # the link iterations were 2,2,2,2,3,3,5 -- one needed 5, so a hard cap of 3
 # would strand that class while no recovery path exists. Cap 4 for T1; the cap
@@ -1865,7 +1877,7 @@ class WasmUnitDriver:
         workdir: Path,
         provenance: dict[str, Any],
         destination: Path,
-    ) -> tuple[Path, UnitArtifact]:
+    ) -> PromotionTransaction:
         """Copy a publish candidate into a private, ownership-marked attempt.
 
         Nothing under the authoritative artifact roots exists until T2b binds
@@ -1876,6 +1888,12 @@ class WasmUnitDriver:
         attempt_id = f"{safe_name}-a{attempt}-{uuid.uuid4().hex}"
         attempt_dir = self.promotion_attempt_root / attempt_id
         attempt_dir.mkdir(exist_ok=False)
+        artifact_preimage_exists = destination.exists()
+        artifact_preimage_sha256 = (
+            unit_artifact_sha256(destination)
+            if artifact_preimage_exists and destination.is_dir()
+            else None
+        )
         atomic_write_json(
             attempt_dir / ".promotion-attempt.json",
             {
@@ -1887,6 +1905,11 @@ class WasmUnitDriver:
                 "created_at": utc_now(),
                 "phase": "creating",
                 "destination": destination.relative_to(self.repo_root).as_posix(),
+                "transaction_id": uuid.uuid4().hex,
+                "artifact_preimage": {
+                    "exists": artifact_preimage_exists,
+                    "sha256": artifact_preimage_sha256,
+                },
             },
         )
         candidate_dir = attempt_dir / "candidate"
@@ -1902,7 +1925,7 @@ class WasmUnitDriver:
             phase="candidate-private",
             candidate_sha256=candidate.sha256,
         )
-        return attempt_dir, candidate
+        return PromotionTransaction(attempt_dir, candidate, destination)
 
     def _update_promotion_marker(self, attempt_dir: Path, **updates: Any) -> None:
         marker = self._promotion_marker(attempt_dir)
@@ -1927,6 +1950,395 @@ class WasmUnitDriver:
             return None
         return destination if destination in allowed else None
 
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _capture_registry_preimage(self, transaction: PromotionTransaction) -> None:
+        marker = self._promotion_marker(transaction.attempt_dir)
+        if marker is None:
+            raise RuntimeError("promotion marker unavailable before registry mutation")
+        if marker.get("registry_preimage") is not None:
+            return
+        exists = self.registry_path.is_file()
+        sha256 = self._file_sha256(self.registry_path) if exists else None
+        backup = transaction.attempt_dir / "registry.preimage"
+        if exists:
+            shutil.copyfile(self.registry_path, backup)
+            if self._file_sha256(backup) != sha256:
+                raise RuntimeError("registry preimage backup verification failed")
+        self._update_promotion_marker(
+            transaction.attempt_dir,
+            registry_preimage={
+                "exists": exists,
+                "sha256": sha256,
+                "backup": backup.name if exists else None,
+            },
+        )
+
+    def _record_registry_postimage(self, transaction: PromotionTransaction) -> None:
+        self._update_promotion_marker(
+            transaction.attempt_dir,
+            registry_postimage={
+                "exists": self.registry_path.is_file(),
+                "sha256": (
+                    self._file_sha256(self.registry_path)
+                    if self.registry_path.is_file()
+                    else None
+                ),
+            },
+            phase="registry-saved",
+        )
+
+    def _restore_registry_preimage(self, marker: dict[str, Any], attempt_dir: Path) -> None:
+        preimage = marker.get("registry_preimage")
+        if not isinstance(preimage, dict):
+            return
+        postimage = marker.get("registry_postimage")
+        current_exists = self.registry_path.is_file()
+        current_sha = self._file_sha256(self.registry_path) if current_exists else None
+        if isinstance(postimage, dict):
+            if (
+                current_exists != bool(postimage.get("exists"))
+                or current_sha != postimage.get("sha256")
+            ):
+                raise RuntimeError("registry changed outside promotion transaction")
+        elif (
+            current_exists != bool(preimage.get("exists"))
+            or current_sha != preimage.get("sha256")
+        ):
+            raise RuntimeError(
+                "registry mutation lacks a durable postimage; refusing blind rollback"
+            )
+        if preimage.get("exists"):
+            backup = attempt_dir / str(preimage.get("backup") or "")
+            if (
+                not backup.is_file()
+                or self._file_sha256(backup) != preimage.get("sha256")
+            ):
+                raise RuntimeError("registry preimage backup is missing or corrupt")
+            self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.registry_path.with_name(
+                f".{self.registry_path.name}.promotion-restore-{uuid.uuid4().hex}"
+            )
+            shutil.copyfile(backup, temporary)
+            os.replace(temporary, self.registry_path)
+        elif self.registry_path.exists():
+            self.registry_path.unlink()
+        self._registry_cache = None
+
+    def _rollback_artifact_precommit(
+        self, marker: dict[str, Any], attempt_dir: Path
+    ) -> None:
+        destination = self._promotion_destination(marker)
+        if destination is None:
+            raise RuntimeError("promotion marker has invalid artifact destination")
+        candidate_dir = attempt_dir / "candidate"
+        preimage = marker.get("artifact_preimage") or {}
+        if preimage.get("exists"):
+            if not destination.is_dir():
+                raise RuntimeError("artifact preimage disappeared during transaction")
+            if unit_artifact_sha256(destination) != preimage.get("sha256"):
+                raise RuntimeError("artifact preimage changed during transaction")
+            return
+        if candidate_dir.is_dir() and not destination.exists():
+            return
+        if not candidate_dir.exists() and destination.is_dir():
+            if unit_artifact_sha256(destination) != marker.get("candidate_sha256"):
+                raise RuntimeError("installed artifact changed before rollback")
+            destination.rename(candidate_dir)
+            if destination.exists() or not candidate_dir.is_dir():
+                raise RuntimeError("artifact rollback did not complete")
+            return
+        raise RuntimeError("artifact rollback found an ambiguous preimage state")
+
+    def _quarantine_transaction(
+        self, attempt_dir: Path, marker: dict[str, Any], *, phase: str
+    ) -> Path:
+        self._update_promotion_marker(attempt_dir, phase=phase)
+        marker = self._promotion_marker(attempt_dir) or marker
+        self.promotion_quarantine_root.mkdir(parents=True, exist_ok=True)
+        destination = self.promotion_quarantine_root / (
+            f"{attempt_dir.name}-{phase}-{uuid.uuid4().hex}"
+        )
+        os.replace(attempt_dir, destination)
+        if attempt_dir.exists() or not destination.is_dir():
+            raise RuntimeError("promotion quarantine move did not complete")
+        self.events.emit(
+            "promotion_transaction_quarantined",
+            unit=marker.get("unit"),
+            transaction_id=marker.get("transaction_id"),
+            phase=phase,
+            quarantine=str(destination)[:400],
+        )
+        return destination
+
+    def _promotion_phase_boundary(
+        self, phase: str, transaction: PromotionTransaction
+    ) -> None:
+        """Fault-injection seam; production intentionally does nothing."""
+        _ = (phase, transaction)
+
+    def _rollback_uncommitted_transaction(
+        self, transaction: PromotionTransaction, *, reason: str
+    ) -> None:
+        marker = self._promotion_marker(transaction.attempt_dir)
+        if marker is None:
+            raise RuntimeError("cannot roll back promotion without ownership marker")
+        head_preimage = marker.get("head_preimage")
+        if head_preimage:
+            current = self._git_runner("rev-parse", "HEAD")
+            if current.returncode != 0 or current.stdout.strip() != head_preimage:
+                raise RuntimeError(
+                    "local HEAD moved after commit intent; transaction must finalize"
+                )
+        self._restore_registry_preimage(marker, transaction.attempt_dir)
+        self._rollback_artifact_precommit(marker, transaction.attempt_dir)
+        paths = marker.get("commit_paths") or []
+        if paths:
+            reset = self._git_runner("reset", "-q", "HEAD", "--", *paths)
+            if reset.returncode != 0:
+                raise RuntimeError("promotion index rollback failed")
+            cached = self._git_runner("diff", "--cached", "--quiet", "--", *paths)
+            if cached.returncode != 0:
+                raise RuntimeError("promotion paths remain staged after rollback")
+        self._quarantine_transaction(
+            transaction.attempt_dir,
+            marker,
+            phase=f"rolled-back-{re.sub(r'[^a-z0-9-]+', '-', reason.lower())}",
+        )
+
+    def _validate_or_adopt_prepared_commit(
+        self,
+        attempt_dir: Path,
+        marker: dict[str, Any],
+        *,
+        prepared_in_process: bool = False,
+    ) -> str:
+        """Bind a crash-surviving local commit to the recorded preimages.
+
+        ``git commit`` and the following marker write cannot be one filesystem
+        transaction.  In that narrow gap, adoption is allowed only when HEAD
+        is the sole child of the recorded preimage and changes only the exact
+        recorded promotion paths.
+        """
+        head = self._git_runner("rev-parse", "HEAD")
+        if head.returncode != 0 or not head.stdout.strip():
+            raise RuntimeError("cannot read product HEAD during promotion recovery")
+        current = head.stdout.strip()
+        prepared = str(marker.get("prepared_commit") or "")
+        if prepared and current != prepared:
+            raise RuntimeError("product HEAD moved beyond the prepared promotion commit")
+        if not prepared:
+            preimage = str(marker.get("head_preimage") or "")
+            if not preimage or current == preimage:
+                raise RuntimeError("promotion has no prepared product commit")
+            parent = self._git_runner("rev-parse", f"{current}^")
+            if parent.returncode != 0 or parent.stdout.strip() != preimage:
+                raise RuntimeError("unrecorded HEAD is not based on promotion preimage")
+
+        expected_paths = {str(path) for path in marker.get("commit_paths") or []}
+        destination = self._promotion_destination(marker)
+        if destination is None:
+            raise RuntimeError("promotion destination is invalid")
+        artifact_path = destination.relative_to(self.repo_root).as_posix()
+        if not prepared_in_process:
+            subject = self._git_runner("show", "-s", "--format=%s", current)
+            if (
+                subject.returncode != 0
+                or subject.stdout.rstrip("\r\n")
+                != str(marker.get("commit_message") or "")
+            ):
+                raise RuntimeError("prepared commit message does not match promotion intent")
+            changed = self._git_runner(
+                "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", current
+            )
+            if changed.returncode != 0:
+                raise RuntimeError("cannot inspect prepared promotion commit")
+            actual_paths = {
+                line.strip() for line in changed.stdout.splitlines() if line.strip()
+            }
+            artifact_changed = any(
+                path == artifact_path or path.startswith(f"{artifact_path}/")
+                for path in actual_paths
+            )
+            paths_within_intent = all(
+                any(
+                    path == expected or path.startswith(f"{expected}/")
+                    for expected in expected_paths
+                )
+                for path in actual_paths
+            )
+            if not artifact_changed or not paths_within_intent:
+                raise RuntimeError("prepared commit changed paths outside promotion intent")
+        elif artifact_path not in expected_paths:
+            raise RuntimeError("prepared commit intent omits artifact path")
+        if (
+            not destination.is_dir()
+            or unit_artifact_sha256(destination) != marker.get("candidate_sha256")
+        ):
+            raise RuntimeError("prepared commit artifact no longer matches candidate digest")
+        postimage = marker.get("registry_postimage")
+        if isinstance(postimage, dict):
+            exists = self.registry_path.is_file()
+            digest = self._file_sha256(self.registry_path) if exists else None
+            if (
+                exists != bool(postimage.get("exists"))
+                or digest != postimage.get("sha256")
+            ):
+                raise RuntimeError("registry no longer matches prepared promotion commit")
+        if not prepared:
+            prepared = current
+            self._update_promotion_marker(
+                attempt_dir,
+                phase="commit-prepared",
+                prepared_commit=prepared,
+            )
+        return prepared
+
+    @staticmethod
+    def _promotion_green_update(marker: dict[str, Any]) -> dict[str, Any]:
+        outcome = marker.get("outcome") or {}
+        return {
+            "status": "green",
+            "error": None,
+            "oracle_summary": outcome.get("summary"),
+            "commit": marker.get("prepared_commit"),
+            "pushed": True,
+            "tier": outcome.get("tier"),
+            "last_stage": "commit",
+            "promotion_transaction_id": marker.get("transaction_id"),
+            "promotion_transition_id": marker.get("transition_id"),
+            "candidate_sha256": marker.get("candidate_sha256"),
+        }
+
+    @staticmethod
+    def _promotion_transition(marker: dict[str, Any]) -> UnitTransition:
+        outcome = marker.get("outcome") or {}
+        transition_id = str(marker.get("transition_id") or "")
+        return UnitTransition(
+            unit=str(marker.get("unit") or ""),
+            result=str(outcome.get("result") or RESULT_GREEN),
+            stage="commit",
+            attempt=int(outcome.get("attempt") or marker.get("attempt") or 0),
+            detail=str(outcome.get("detail") or "promotion recovered"),
+            product_commit=str(marker.get("prepared_commit") or "") or None,
+            product_pushed=True,
+            oracle_summary=outcome.get("summary"),
+            model=outcome.get("model"),
+            tier=outcome.get("tier"),
+            extra={
+                "transition_id": transition_id,
+                "promotion_transaction_id": marker.get("transaction_id"),
+                "candidate_sha256": marker.get("candidate_sha256"),
+            },
+        )
+
+    def _journal_has_transition(self, transition_id: str) -> bool:
+        if not transition_id:
+            return False
+        reader = getattr(self._journal, "_local_events", None)
+        if callable(reader):
+            try:
+                records = reader()
+            except Exception:  # noqa: BLE001 - recovery remains fail closed
+                records = []
+            for record in records:
+                extra = record.get("extra") if isinstance(record, dict) else None
+                if (
+                    isinstance(extra, dict)
+                    and extra.get("transition_id") == transition_id
+                ):
+                    return True
+        checkpoints = getattr(self._journal, "checkpoints", None)
+        if isinstance(checkpoints, list):
+            for checkpoint in checkpoints:
+                transition = (
+                    checkpoint.get("transition")
+                    if isinstance(checkpoint, dict)
+                    else None
+                )
+                extra = getattr(transition, "extra", None)
+                if (
+                    isinstance(extra, dict)
+                    and extra.get("transition_id") == transition_id
+                ):
+                    return True
+        return False
+
+    def _finalize_promotion_transaction(
+        self,
+        state: dict[str, Any],
+        attempt_dir: Path,
+        marker: dict[str, Any],
+        *,
+        prepared_in_process: bool = False,
+    ) -> bool:
+        """Idempotently publish and durably settle one prepared transaction."""
+        prepared = self._validate_or_adopt_prepared_commit(
+            attempt_dir, marker, prepared_in_process=prepared_in_process
+        )
+        marker = self._promotion_marker(attempt_dir) or marker
+        destination = self._promotion_destination(marker)
+        candidate = load_unit_artifact(destination) if destination is not None else None
+        if candidate is None or candidate.sha256 != marker.get("candidate_sha256"):
+            raise RuntimeError("installed candidate unavailable during finalization")
+        transaction = PromotionTransaction(attempt_dir, candidate, destination)
+        transition_id = str(marker.get("transition_id") or uuid.uuid4().hex)
+        remote_preimage = marker.get("remote_preimage")
+        if "remote_preimage" not in marker:
+            remote_preimage = self._remote_port_staging_sha()
+        self._update_promotion_marker(
+            attempt_dir,
+            phase="publishing",
+            prepared_commit=prepared,
+            remote_preimage=remote_preimage,
+            transition_id=transition_id,
+        )
+        remote = self._remote_port_staging_sha()
+        if remote not in {remote_preimage, prepared}:
+            raise RuntimeError("port-staging moved outside promotion transaction")
+        if remote != prepared:
+            pushed = self._push_product_sha(prepared)
+            remote = self._remote_port_staging_sha()
+            if pushed.returncode != 0 or remote != prepared:
+                self._update_promotion_marker(
+                    attempt_dir,
+                    phase="publication-pending",
+                    push_result={
+                        "pushed": False,
+                        "detail": (pushed.stdout + pushed.stderr)[-400:],
+                        "remote_sha": remote,
+                    },
+                )
+                return False
+        self._update_promotion_marker(
+            attempt_dir,
+            phase="published",
+            push_result={"pushed": True, "detail": "", "remote_sha": prepared},
+        )
+        self._promotion_phase_boundary("push", transaction)
+        marker = self._promotion_marker(attempt_dir) or marker
+        green_update = self._promotion_green_update(marker)
+        projected = self._project_record_update(
+            state, str(marker.get("unit")), green_update
+        )
+        self._update_promotion_marker(
+            attempt_dir, phase="checkpointing", green_record=green_update
+        )
+        if not self._journal_has_transition(transition_id):
+            if not self._checkpoint(projected, self._promotion_transition(marker)):
+                return False
+        self._update_promotion_marker(attempt_dir, phase="checkpointed")
+        self._promotion_phase_boundary("checkpoint", transaction)
+        self._save_state(projected)
+        state.clear()
+        state.update(projected)
+        self._update_promotion_marker(attempt_dir, phase="state-saved")
+        self._promotion_phase_boundary("state_save", transaction)
+        self._cleanup_promotion_attempt(attempt_dir)
+        return True
+
     def _cleanup_promotion_attempt(self, attempt_dir: Path) -> None:
         """Delete only an ownership-marked private attempt and verify removal."""
         marker = self._promotion_marker(attempt_dir)
@@ -1944,13 +2356,17 @@ class WasmUnitDriver:
             atomic_write_json(attempt_dir / ".promotion-attempt.json", marker)
             raise RuntimeError(f"promotion attempt cleanup incomplete: {attempt_dir}")
 
-    def _reconcile_orphan_promotion_attempts(self) -> bool:
-        """Quarantine owned attempts left by a killed/crashed driver.
+    def _reconcile_orphan_promotion_attempts(
+        self, state: dict[str, Any] | None = None
+    ) -> bool:
+        """Roll back pre-commit attempts or finalize exact committed intents.
 
-        Unmarked directories are never touched. A quarantine move is atomic on
-        this volume and keeps crash evidence available without allowing the
-        orphan to participate in artifact selection.
+        An owned marker is a transaction journal, not disposable scratch.  It
+        remains beside the attempt until product publication, the green
+        transition, and canonical state all agree on the same prepared SHA.
         """
+        if state is None:
+            state = self._load_state()
         if not self.promotion_attempt_root.is_dir():
             return True
         ok = True
@@ -1966,63 +2382,63 @@ class WasmUnitDriver:
                     "promotion_attempt_unowned", path=str(attempt_dir)[:400]
                 )
                 continue
-            candidate_dir = attempt_dir / "candidate"
-            destination_path = self._promotion_destination(marker)
-            if (
-                not candidate_dir.exists()
-                and marker.get("phase") in {"installing", "installed"}
-            ):
-                try:
-                    if destination_path is None:
-                        raise RuntimeError("owned attempt has invalid destination")
-                    installed = load_unit_artifact(destination_path)
-                    if (
-                        installed is None
-                        or installed.name != marker.get("unit")
-                        or installed.sha256 != marker.get("candidate_sha256")
+            try:
+                phase = str(marker.get("phase") or "")
+                committed = bool(marker.get("prepared_commit")) or phase in {
+                    "commit-prepared",
+                    "publishing",
+                    "publication-pending",
+                    "published",
+                    "checkpointing",
+                    "checkpointed",
+                    "state-saved",
+                }
+                if phase == "commit-preparing" and not committed:
+                    head = self._git_runner("rev-parse", "HEAD")
+                    committed = (
+                        head.returncode == 0
+                        and bool(marker.get("head_preimage"))
+                        and head.stdout.strip() != marker.get("head_preimage")
+                    )
+                if committed:
+                    if not self._finalize_promotion_transaction(
+                        state, attempt_dir, marker
                     ):
-                        raise RuntimeError(
-                            "installed orphan does not match marker digest"
-                        )
-                    destination_path.rename(candidate_dir)
-                    if destination_path.exists() or not candidate_dir.is_dir():
-                        raise RuntimeError("orphan install rollback incomplete")
-                    self._update_promotion_marker(
-                        attempt_dir, phase="restart-rolled-back"
-                    )
-                    marker = self._promotion_marker(attempt_dir) or marker
+                        raise RuntimeError("promotion transaction remains pending")
                     self.events.emit(
-                        "promotion_attempt_install_rolled_back",
+                        "promotion_transaction_finalized",
                         unit=marker.get("unit"),
-                        attempt_id=marker.get("attempt_id"),
-                    )
-                except (OSError, RuntimeError) as error:
-                    ok = False
-                    self.events.emit(
-                        "promotion_attempt_reconcile_failed",
-                        unit=marker.get("unit"),
-                        attempt_id=marker.get("attempt_id"),
-                        error=str(error)[:400],
+                        transaction_id=marker.get("transaction_id"),
+                        prepared_commit=marker.get("prepared_commit"),
                     )
                     continue
-            self.promotion_quarantine_root.mkdir(parents=True, exist_ok=True)
-            destination = self.promotion_quarantine_root / (
-                f"{attempt_dir.name}-orphan-{uuid.uuid4().hex}"
-            )
-            try:
-                os.replace(attempt_dir, destination)
-                if attempt_dir.exists() or not destination.is_dir():
-                    raise OSError("quarantine move did not reach a stable state")
-                self.events.emit(
-                    "promotion_attempt_quarantined",
-                    unit=marker.get("unit"),
-                    attempt_id=marker.get("attempt_id"),
-                    quarantine=str(destination)[:400],
+
+                destination = self._promotion_destination(marker)
+                if destination is None:
+                    raise RuntimeError("owned attempt has invalid destination")
+                candidate = load_unit_artifact(attempt_dir / "candidate")
+                if candidate is None:
+                    candidate = load_unit_artifact(destination)
+                if candidate is None:
+                    if phase == "creating" and not destination.exists():
+                        self._quarantine_transaction(
+                            attempt_dir, marker, phase="rolled-back-incomplete-create"
+                        )
+                        continue
+                    raise RuntimeError("pre-commit transaction lost its candidate")
+                transaction = PromotionTransaction(attempt_dir, candidate, destination)
+                self._rollback_uncommitted_transaction(
+                    transaction, reason="restart-precommit"
                 )
-            except OSError as error:
+                self.events.emit(
+                    "promotion_transaction_rolled_back",
+                    unit=marker.get("unit"),
+                    transaction_id=marker.get("transaction_id"),
+                )
+            except Exception as error:  # noqa: BLE001 - fail closed on ambiguity
                 ok = False
                 self.events.emit(
-                    "promotion_attempt_quarantine_failed",
+                    "promotion_attempt_reconcile_failed",
                     unit=marker.get("unit"),
                     attempt_id=marker.get("attempt_id"),
                     error=str(error)[:400],
@@ -2254,45 +2670,72 @@ class WasmUnitDriver:
             timeout=300,
          creationflags=NO_WINDOW)
 
-    def _commit_unit(
+    def _unit_commit_spec(
         self,
         name: str,
         summary: str,
         *,
         staging: bool = False,
         extra_paths: list[str] | None = None,
-    ) -> tuple[str | None, bool, str]:
-        """git add + commit + push the unit's artifact dir. Returns
-        (commit_sha or None, pushed, detail). ``extra_paths`` ride the SAME
-        commit (T2c: the harvested knowledge registry lands with the unit
-        that produced it -- one push, G3-preserving)."""
+    ) -> tuple[list[str], str]:
         rel = (
             f"research/decomp/port-units-staging/{name}"
             if staging
             else f"research/decomp/port-units/{name}"
         )
         paths = [rel, *(extra_paths or [])]
-        added = self._git_runner("add", "--", *paths)
-        if added.returncode != 0:
-            return None, False, (added.stdout + added.stderr)[-400:]
         message = (
             f"port-staging: {name} wasm unit LINKED (unoracled, not for integration)"
             if staging
             else f"port: {name} wasm unit green (oracle {summary})"
         )
+        return paths, message
+
+    def _prepare_unit_commit(
+        self,
+        transaction: PromotionTransaction,
+        *,
+        paths: list[str],
+        message: str,
+    ) -> tuple[str | None, str]:
+        """Create the local commit after persisting recoverable intent."""
+        head = self._git_runner("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return None, (head.stdout + head.stderr)[-400:]
+        head_preimage = head.stdout.strip()
+        self._update_promotion_marker(
+            transaction.attempt_dir,
+            phase="commit-preparing",
+            head_preimage=head_preimage,
+            commit_paths=paths,
+            commit_message=message,
+        )
+        added = self._git_runner("add", "--", *paths)
+        if added.returncode != 0:
+            return None, (added.stdout + added.stderr)[-400:]
         committed = self._git_runner("commit", "-m", message, "--", *paths)
         if committed.returncode != 0:
-            return None, False, (committed.stdout + committed.stderr)[-400:]
-        sha = ""
+            return None, (committed.stdout + committed.stderr)[-400:]
         rev = self._git_runner("rev-parse", "HEAD")
-        if rev.returncode == 0:
-            sha = rev.stdout.strip()
-        pushed = self._push_product()
-        return sha or None, pushed.returncode == 0, (
-            "" if pushed.returncode == 0 else (pushed.stdout + pushed.stderr)[-400:]
+        if rev.returncode != 0 or not rev.stdout.strip():
+            return None, (rev.stdout + rev.stderr)[-400:]
+        sha = rev.stdout.strip()
+        self._update_promotion_marker(
+            transaction.attempt_dir,
+            phase="commit-prepared",
+            prepared_commit=sha,
         )
+        return sha, ""
 
-    def _push_product(self) -> subprocess.CompletedProcess[str]:
+    def _remote_port_staging_sha(self) -> str | None:
+        result = self._git_runner(
+            "ls-remote", "origin", "refs/heads/port-staging"
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return result.stdout.split()[0]
+
+    def _push_product_sha(self, sha: str) -> subprocess.CompletedProcess[str]:
         """The ONE sanctioned product push, explicit refspec (a bare
         `git push` depends on ambient upstream config -- the gate-ledger
         bug rode exactly that).
@@ -2306,7 +2749,7 @@ class WasmUnitDriver:
         port-progress branch stays journal-owned (port_progress.py pushes
         it with its own explicit refspec from its own worktree); origin
         main receives nothing. One retry for transient faults."""
-        refspec = "HEAD:refs/heads/port-staging"
+        refspec = f"{sha}:refs/heads/port-staging"
         pushed = self._git_runner("push", "origin", refspec)
         if pushed.returncode != 0:
             pushed = self._git_runner("push", "origin", refspec)
@@ -2876,13 +3319,15 @@ class WasmUnitDriver:
                 }
             ),
         }
-        attempt_dir, candidate = self._create_promotion_attempt(
+        transaction = self._create_promotion_attempt(
             name=name,
             attempt=record.get("attempts", 0),
             workdir=workdir,
             provenance=provenance,
             destination=artifact_dir,
         )
+        attempt_dir = transaction.attempt_dir
+        candidate = transaction.candidate
         assembly_result = self._maybe_run_assembly_gate(
             name,
             candidate=candidate,
@@ -2933,82 +3378,53 @@ class WasmUnitDriver:
                 journal_required=True,
             )
 
-        install_result: str | None = None
+        promotion_outcome = {
+            "result": RESULT_STAGED if compile_only else RESULT_GREEN,
+            "tier": "compile_only" if compile_only else "oracle_green",
+            "summary": summary,
+            "detail": (
+                "compile-only staging artifact (UNVERIFIED, not integrated)"
+                if compile_only
+                else f"oracle green: {summary}"
+            ),
+            "model": model_used or self._model_config.model,
+            "attempt": record.get("attempts", 0),
+        }
         try:
             self._update_promotion_marker(attempt_dir, phase="gate-passed")
             self._update_promotion_marker(attempt_dir, phase="installing")
             install_result = self._install_promotion_candidate(candidate, artifact_dir)
-            self._update_promotion_marker(attempt_dir, phase=install_result)
+            self._update_promotion_marker(
+                attempt_dir,
+                phase="artifact-installed",
+                install_result=install_result,
+                artifact_postimage_sha256=unit_artifact_sha256(artifact_dir),
+                outcome=promotion_outcome,
+            )
+            self._promotion_phase_boundary("install", transaction)
         except Exception as install_error:  # noqa: BLE001 - refuse any overwrite
-            rollback_error = ""
-            if install_result == "installed":
-                try:
-                    installed = load_unit_artifact(artifact_dir)
-                    if installed is None or installed.sha256 != candidate.sha256:
-                        raise RuntimeError(
-                            "installed destination changed before rollback"
-                        )
-                    artifact_dir.rename(attempt_dir / "candidate")
-                    self._update_promotion_marker(
-                        attempt_dir, phase="install-error-rolled-back"
-                    )
-                except Exception as error:  # noqa: BLE001 - report below
-                    rollback_error = f"; rollback failed: {error}"
-            cleanup_error = ""
             try:
-                self._cleanup_promotion_attempt(attempt_dir)
-            except Exception as error:  # noqa: BLE001 - reported with verdict
-                cleanup_error = f"; cleanup failed: {error}"
+                self._rollback_uncommitted_transaction(
+                    transaction, reason="artifact-install"
+                )
+                rollback_detail = ""
+            except Exception as rollback_error:  # noqa: BLE001 - stop safely
+                rollback_detail = f"; rollback failed: {rollback_error}"
+            if rollback_detail:
+                self.events.emit(
+                    "promotion_transaction_blocked",
+                    unit=name,
+                    phase="artifact-install",
+                    error=f"{install_error}{rollback_detail}"[:600],
+                )
+                return "journal_blocked"
             return self._fail(
                 state,
                 record,
                 name,
                 f"artifact install refused after assembly pass: {install_error}"
-                f"{rollback_error}{cleanup_error}",
+                f"{rollback_detail}",
                 stage="artifact-install",
-                result=RESULT_GATE_FAILED,
-                extra={
-                    "rounds": rounds,
-                    "assembly_gate": assembly_result,
-                    "candidate_sha256": candidate.sha256,
-                },
-                journal_required=True,
-            )
-        try:
-            self._cleanup_promotion_attempt(attempt_dir)
-        except Exception as cleanup_error:  # noqa: BLE001 - no publication allowed
-            rollback_detail = ""
-            if install_result == "installed":
-                try:
-                    installed = load_unit_artifact(artifact_dir)
-                    if installed is None or installed.sha256 != candidate.sha256:
-                        raise RuntimeError(
-                            "installed destination changed before rollback"
-                        )
-                    candidate_dir = attempt_dir / "candidate"
-                    if candidate_dir.exists():
-                        raise RuntimeError(
-                            "private candidate path occupied before rollback"
-                        )
-                    artifact_dir.rename(candidate_dir)
-                    if artifact_dir.exists() or not candidate_dir.is_dir():
-                        raise RuntimeError("candidate rollback did not complete")
-                    rollback_detail = "; installed candidate rolled back to attempt"
-                except Exception as rollback_error:  # noqa: BLE001 - evidence below
-                    rollback_detail = f"; rollback failed: {rollback_error}"
-            self.events.emit(
-                "promotion_attempt_cleanup_failed",
-                unit=name,
-                attempt_id=attempt_dir.name,
-                error=str(cleanup_error)[:400],
-            )
-            return self._fail(
-                state,
-                record,
-                name,
-                f"promotion attempt cleanup failed after {install_result}: "
-                f"{cleanup_error}{rollback_detail}",
-                stage="promotion-cleanup",
                 result=RESULT_GATE_FAILED,
                 extra={
                     "rounds": rounds,
@@ -3027,6 +3443,7 @@ class WasmUnitDriver:
         # The registry file rides the unit's own artifact commit (one push,
         # G3-preserving). A harvest fault never costs the green.
         registry_rel: str | None = None
+        self._capture_registry_preimage(transaction)
         try:
             final_header = (workdir / "gnt4_shim.h").read_text(encoding="utf-8")
             registry = self._registry()
@@ -3088,76 +3505,92 @@ class WasmUnitDriver:
             self.events.emit(
                 "registry_harvest_error", unit=name, error=str(error)[:400]
             )
+        self._record_registry_postimage(transaction)
+        self._promotion_phase_boundary("registry", transaction)
+
+        paths, commit_message = self._unit_commit_spec(
+            name,
+            summary,
+            staging=compile_only,
+            extra_paths=[registry_rel] if registry_rel else None,
+        )
         try:
-            sha, pushed, push_detail = self._commit_unit(
-                name, summary, staging=compile_only,
-                extra_paths=[registry_rel] if registry_rel else None,
+            sha, commit_detail = self._prepare_unit_commit(
+                transaction, paths=paths, message=commit_message
             )
         except (OSError, subprocess.SubprocessError) as error:
-            # A stalled `git push` hits the 300s timeout and raises
-            # TimeoutExpired (a SubprocessError, NOT an OSError). Unguarded, it
-            # escaped run() entirely and left the unit stuck as `porting` after
-            # the local commit had already succeeded.
-            return self._fail(
-                state, record, name, f"product commit/push: {error}", stage="commit",
-            )
+            sha, commit_detail = None, str(error)
         if sha is None:
-            # The artifact never entered git history. Marking it green would
-            # SETTLE it -- removing it from the queue forever with nothing in the
-            # product tree, and rendering on GitHub as an ordinary green.
+            marker = self._promotion_marker(attempt_dir) or {}
+            current = self._git_runner("rev-parse", "HEAD")
+            if (
+                marker.get("head_preimage")
+                and current.returncode == 0
+                and current.stdout.strip() != marker.get("head_preimage")
+            ):
+                # The commit may exist in the crash gap before its SHA reached
+                # the marker. Restart validates/adopts it; never rebuild.
+                self.events.emit(
+                    "promotion_transaction_blocked",
+                    unit=name,
+                    phase="commit-preparing",
+                    error=(commit_detail or "prepared commit SHA not recorded")[:600],
+                )
+                return "journal_blocked"
+            try:
+                self._rollback_uncommitted_transaction(
+                    transaction, reason="commit-prepare"
+                )
+            except Exception as rollback_error:  # noqa: BLE001 - stop safely
+                self.events.emit(
+                    "promotion_transaction_blocked",
+                    unit=name,
+                    phase="commit-prepare-rollback",
+                    error=str(rollback_error)[:600],
+                )
+                return "journal_blocked"
             return self._fail(
-                state, record, name,
-                f"product commit failed, unit not settled: {push_detail}",
+                state,
+                record,
+                name,
+                f"product commit preparation failed: {commit_detail}",
                 stage="commit",
+                journal_required=True,
             )
-        green_update = {
-            "status": "green",
-            "error": None,
-            "oracle_summary": summary,
-            "commit": sha,
-            "pushed": pushed,
-            "tier": "compile_only" if compile_only else "oracle_green",
-            "last_stage": "commit",
-        }
-        projected_green = self._project_record_update(state, name, green_update)
-        checkpointed = self._checkpoint(
-            projected_green,
-            UnitTransition(
+        self._promotion_phase_boundary("local_commit", transaction)
+        try:
+            finalized = self._finalize_promotion_transaction(
+                state,
+                attempt_dir,
+                self._promotion_marker(attempt_dir) or {},
+                prepared_in_process=True,
+            )
+        except Exception as error:  # noqa: BLE001 - restart owns exact recovery
+            self.events.emit(
+                "promotion_transaction_blocked",
                 unit=name,
-                result=RESULT_STAGED if compile_only else RESULT_GREEN,
-                stage="commit",
-                attempt=record.get("attempts", 0),
-                detail=(
-                    "compile-only staging artifact (UNVERIFIED, not integrated)"
-                    if compile_only
-                    else f"oracle green: {summary}"
-                ),
-                product_commit=sha,
-                product_pushed=pushed,
-                oracle_summary=summary,
-                model=model_used or self._model_config.model,
-                tier="compile_only" if compile_only else "oracle_green",
-            ),
-        )
-        if not checkpointed:
+                phase="finalize",
+                error=str(error)[:600],
+            )
+            return "journal_blocked"
+        if not finalized:
             self.events.emit(
                 "wasm_unit_journal_blocked",
                 unit=name,
                 stage="commit",
                 result=RESULT_STAGED if compile_only else RESULT_GREEN,
-                error="green projection checkpoint was not durable",
+                error="promotion publication or green checkpoint remains pending",
             )
             return "journal_blocked"
-        record.update(green_update)
-        self._save_state(state)
+        record = self._unit_state(state, name)
         self._greens_this_run += 1
         self.events.emit(
             "wasm_unit_green",
             unit=name,
             oracle_summary=summary,
             commit=sha,
-            pushed=pushed,
-            push_detail=push_detail,
+            pushed=True,
+            push_detail="",
         )
         # Section 4 T3 row: verified fraction falling while staged grows pages
         # (unverifiable-inventory build-up).
@@ -3756,7 +4189,7 @@ class WasmUnitDriver:
         rev = self._git_runner("rev-parse", "HEAD")
         if rev.returncode == 0:
             sha = rev.stdout.strip()
-        pushed = self._push_product()
+        pushed = self._push_product_sha(sha or "HEAD")
         return sha or None, pushed.returncode == 0, (
             "" if pushed.returncode == 0 else (pushed.stdout + pushed.stderr)[-400:]
         )
@@ -4361,7 +4794,7 @@ class WasmUnitDriver:
             state = self._load_state()
             for unit in queue:  # make every queued unit visible in state/progress
                 self._unit_state(state, unit["name"])
-            if not self._reconcile_orphan_promotion_attempts():
+            if not self._reconcile_orphan_promotion_attempts(state):
                 self.events.emit(
                     "driver_stopped", reason="promotion_attempt_quarantine_failed"
                 )

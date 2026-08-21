@@ -113,11 +113,16 @@ def test_green_unit_commits_artifacts_and_completes(tmp_path, monkeypatch):
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     git_calls = []
+    remote_sha = ["base0000"]
 
     def fake_git(*args):
         git_calls.append(args)
         if args[0] == "rev-parse":
             return _completed(0, "deadbeef\n")
+        if args[0] == "ls-remote":
+            return _completed(0, f"{remote_sha[0]}\trefs/heads/port-staging\n")
+        if args[0] == "push":
+            remote_sha[0] = "deadbeef"
         return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
@@ -290,11 +295,16 @@ def test_compile_only_unit_commits_to_staging_unverified(tmp_path, monkeypatch):
     queue["units"][0]["allowed_extra_imports"] = ["FUN_80001234"]
     queue_path.write_text(json.dumps(queue), encoding="utf-8")
     git_calls = []
+    remote_sha = ["base0000"]
 
     def fake_git(*args):
         git_calls.append(args)
         if args[0] == "rev-parse":
             return _completed(0, "cafe1234\n")
+        if args[0] == "ls-remote":
+            return _completed(0, f"{remote_sha[0]}\trefs/heads/port-staging\n")
+        if args[0] == "push":
+            remote_sha[0] = "cafe1234"
         return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
@@ -1135,6 +1145,7 @@ def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
     gate_calls = []
     operation_order = []
+    remote_sha = ["base0000"]
 
     def fake_link(workdir, c_files, exports, allowed_extra):
         assert not (repo / "research/decomp/port-units/unit-a").exists()
@@ -1147,6 +1158,10 @@ def test_green_unit_triggers_the_assembly_gate(tmp_path, monkeypatch):
         operation_order.append(("git", *args))
         if args[0] == "rev-parse":
             return _completed(0, "deadbeef\n")
+        if args[0] == "ls-remote":
+            return _completed(0, f"{remote_sha[0]}\trefs/heads/port-staging\n")
+        if args[0] == "push":
+            remote_sha[0] = "deadbeef"
         return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
@@ -1347,7 +1362,7 @@ def test_passing_gate_refuses_to_overwrite_same_name_artifact_preimage(
     assert not list(driver.promotion_attempt_root.glob("*"))
 
 
-def test_cleanup_failure_is_quarantined_on_restart_and_unowned_paths_survive(
+def test_post_state_cleanup_failure_is_finished_on_restart_and_unowned_paths_survive(
     tmp_path, monkeypatch
 ):
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
@@ -1358,9 +1373,10 @@ def test_cleanup_failure_is_quarantined_on_restart_and_unowned_paths_survive(
         (workdir / "unit.wasm").write_bytes(b"\x00asm")
         return True, ""
 
+    journal = FakeJournal()
     driver = _driver(
         repo,
-        journal=FakeJournal(),
+        journal=journal,
         build_runner=fake_build,
         assembly_link_runner=lambda *args: (True, ""),
         assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
@@ -1370,23 +1386,24 @@ def test_cleanup_failure_is_quarantined_on_restart_and_unowned_paths_survive(
         raise OSError("simulated locked attempt")
 
     driver._cleanup_promotion_attempt = fail_cleanup
-    assert driver.run() == EXIT_PROGRESSED
-    assert not (repo / "research/decomp/port-units/unit-a").exists()
+    assert driver.run() == EXIT_STOPPED
+    assert _state(repo)["units"]["unit-a"]["status"] == "green"
+    assert (repo / "research/decomp/port-units/unit-a").is_dir()
     owned = [path for path in driver.promotion_attempt_root.iterdir() if path.is_dir()]
     assert len(owned) == 1
     assert (owned[0] / ".promotion-attempt.json").is_file()
-    assert (owned[0] / "candidate/provenance.json").is_file()
+    marker = json.loads((owned[0] / ".promotion-attempt.json").read_text())
+    assert marker["phase"] == "state-saved"
     unowned = driver.promotion_attempt_root / "do-not-touch"
     unowned.mkdir()
     (unowned / "sentinel").write_text("keep", encoding="utf-8")
 
-    restarted = _driver(repo, journal=FakeJournal())
+    restarted = _driver(repo, journal=journal)
+    restarted._validate_or_adopt_prepared_commit = lambda *args, **kwargs: "abc123"
     assert restarted._reconcile_orphan_promotion_attempts() is True
     assert unowned.is_dir() and (unowned / "sentinel").read_text() == "keep"
     assert not owned[0].exists()
-    quarantined = list(restarted.promotion_quarantine_root.iterdir())
-    assert len(quarantined) == 1
-    assert (quarantined[0] / ".promotion-attempt.json").is_file()
+    assert not list(restarted.promotion_quarantine_root.glob("*"))
 
 
 def test_restart_rolls_back_crash_window_install_before_quarantine(
@@ -1402,7 +1419,7 @@ def test_restart_rolls_back_crash_window_install_before_quarantine(
     (workdir / "unit.wasm").write_bytes(b"\x00asm")
     (workdir / "oracle.log").write_text("PASS\n")
     destination = driver.artifact_root / "unit-a"
-    attempt_dir, candidate = driver._create_promotion_attempt(
+    transaction = driver._create_promotion_attempt(
         name="unit-a",
         attempt=1,
         workdir=workdir,
@@ -1415,6 +1432,8 @@ def test_restart_rolls_back_crash_window_install_before_quarantine(
         },
         destination=destination,
     )
+    attempt_dir = transaction.attempt_dir
+    candidate = transaction.candidate
     driver._update_promotion_marker(attempt_dir, phase="installing")
     assert driver._install_promotion_candidate(candidate, destination) == "installed"
     assert destination.is_dir() and not candidate.directory.exists()
@@ -1478,6 +1497,226 @@ def test_failed_gate_leaves_real_product_head_and_bare_remote_unchanged(
         == remote_before
     )
     assert git(repo, "ls-remote", "origin", "refs/heads/port-staging").stdout == ""
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    ["install", "registry", "local_commit", "push", "checkpoint", "state_save"],
+)
+def test_promotion_transaction_recovers_each_phase_with_real_remote(
+    tmp_path, monkeypatch, crash_phase
+):
+    """Every recorded phase converges without a rebuild or a second commit.
+
+    Before the local commit, restart restores the exact artifact/registry
+    preimages.  From the prepared commit onward, restart publishes and settles
+    that exact SHA, including crashes after a successful remote update.
+    """
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    remote = tmp_path / "origin.git"
+
+    def git(cwd, *args, check=True):
+        completed = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True
+        )
+        if check:
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+        return completed
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "init")
+    git(repo, "config", "user.email", "port-test@example.invalid")
+    git(repo, "config", "user.name", "Port Test")
+    git(repo, "branch", "-M", "main")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "baseline")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    baseline = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    journal = FakeJournal()
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    crashed = {"done": False}
+
+    def crash_once(phase, transaction):
+        if phase == crash_phase and not crashed["done"]:
+            crashed["done"] = True
+            raise KeyboardInterrupt(f"fault after {phase}")
+
+    driver._promotion_phase_boundary = crash_once
+    with pytest.raises(KeyboardInterrupt, match=f"fault after {crash_phase}"):
+        driver.run()
+
+    state = driver._load_state()
+    restarted = _driver(repo, journal=journal, git_runner=None)
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert not list(restarted.promotion_attempt_root.glob("*"))
+
+    local_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    remote_result = git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging", check=False
+    )
+    if crash_phase in {"install", "registry"}:
+        assert local_head == baseline
+        assert remote_result.stdout == ""
+        assert not (repo / "research/decomp/port-units/unit-a").exists()
+        assert not restarted.registry_path.exists()
+        assert state["units"]["unit-a"]["status"] != "green"
+        assert len(list(restarted.promotion_quarantine_root.iterdir())) == 1
+        return
+
+    remote_sha = remote_result.stdout.split()[0]
+    assert local_head != baseline
+    assert remote_sha == local_head
+    assert git(repo, "rev-list", "--count", f"{baseline}..HEAD").stdout.strip() == "1"
+    record = state["units"]["unit-a"]
+    assert record["status"] == "green"
+    assert record["commit"] == local_head
+    assert record["pushed"] is True
+    artifact = repo / "research/decomp/port-units/unit-a"
+    assert unit_artifact_sha256(artifact) == record["candidate_sha256"]
+    green_transitions = [
+        checkpoint["transition"]
+        for checkpoint in journal.checkpoints
+        if checkpoint.get("transition") is not None
+        and checkpoint["transition"].extra.get("promotion_transaction_id")
+    ]
+    assert len(green_transitions) == 1
+    assert green_transitions[0].product_commit == local_head
+    assert (
+        green_transitions[0].extra["promotion_transaction_id"]
+        == record["promotion_transaction_id"]
+    )
+    assert (
+        green_transitions[0].extra["transition_id"]
+        == record["promotion_transition_id"]
+    )
+
+
+@pytest.mark.parametrize("failure", ["push", "checkpoint", "state_save"])
+def test_promotion_operation_failure_restarts_to_exact_prepared_sha(
+    tmp_path, monkeypatch, failure
+):
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    remote = tmp_path / "origin.git"
+
+    def git(cwd, *args, check=True):
+        completed = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True
+        )
+        if check:
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+        return completed
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "init")
+    git(repo, "config", "user.email", "port-test@example.invalid")
+    git(repo, "config", "user.name", "Port Test")
+    git(repo, "branch", "-M", "main")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "baseline")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    baseline = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    class FailOnceJournal(FakeJournal):
+        failed = False
+
+        def checkpoint(self, **kwargs):
+            transition = kwargs.get("transition")
+            if (
+                failure == "checkpoint"
+                and transition is not None
+                and transition.extra.get("promotion_transaction_id")
+                and not self.failed
+            ):
+                self.failed = True
+                return {"recorded": False, "detail": "injected checkpoint failure"}
+            return super().checkpoint(**kwargs)
+
+    journal = FailOnceJournal()
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+    if failure == "push":
+        driver._push_product_sha = lambda sha: subprocess.CompletedProcess(
+            ["git", "push"], 1, "", "injected push failure"
+        )
+    if failure == "state_save":
+        real_save = driver._save_state
+        failed = {"done": False}
+
+        def fail_green_save(state):
+            record = state.get("units", {}).get("unit-a", {})
+            if record.get("status") == "green" and not failed["done"]:
+                failed["done"] = True
+                raise OSError("injected canonical state failure")
+            real_save(state)
+
+        driver._save_state = fail_green_save
+
+    assert driver.run() == EXIT_STOPPED
+    attempts = list(driver.promotion_attempt_root.glob("*"))
+    assert len(attempts) == 1
+    prepared = json.loads(
+        (attempts[0] / ".promotion-attempt.json").read_text()
+    )["prepared_commit"]
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == prepared
+
+    state = driver._load_state()
+    restarted = _driver(repo, journal=journal, git_runner=None)
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert not list(restarted.promotion_attempt_root.glob("*"))
+    remote_sha = git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging"
+    ).stdout.split()[0]
+    assert remote_sha == prepared
+    assert git(repo, "rev-list", "--count", f"{baseline}..HEAD").stdout.strip() == "1"
+    record = state["units"]["unit-a"]
+    assert record["status"] == "green"
+    assert record["commit"] == prepared
+    transitions = [
+        item["transition"]
+        for item in journal.checkpoints
+        if item.get("transition") is not None
+        and item["transition"].extra.get("promotion_transaction_id")
+    ]
+    assert len(transitions) == 1
+    assert transitions[0].product_commit == prepared
+    assert transitions[0].extra["transition_id"] == record["promotion_transition_id"]
 
 
 def test_assembly_failure_stops_if_required_journal_checkpoint_raises(
@@ -1598,11 +1837,16 @@ def test_assembly_gate_ledger_never_touches_git(tmp_path, monkeypatch):
     repo = _write_repo(tmp_path)
     _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
     git_calls = []
+    remote_sha = ["base0000"]
 
     def fake_git(*args):
         git_calls.append(args)
         if args[0] == "rev-parse":
             return _completed(0, "deadbeef\n")
+        if args[0] == "ls-remote":
+            return _completed(0, f"{remote_sha[0]}\trefs/heads/port-staging\n")
+        if args[0] == "push":
+            remote_sha[0] = "deadbeef"
         return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
@@ -1714,17 +1958,22 @@ def test_assembly_gate_repeat_conflict_is_immaterial(tmp_path, monkeypatch):
 
 def test_product_push_uses_an_explicit_refspec(tmp_path, monkeypatch):
     """The green unit's product push must be the explicit interim refspec
-    `push origin HEAD:refs/heads/port-staging` (owner-ordered, pending the
+    `push origin <sha>:refs/heads/port-staging` (owner-ordered, pending the
     topology design): local lineage unchanged, origin/main receives
     nothing, never a bare `git push`."""
     monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
     repo = _write_repo(tmp_path)
     git_calls = []
+    remote_sha = ["base0000"]
 
     def fake_git(*args):
         git_calls.append(args)
         if args[0] == "rev-parse":
             return _completed(0, "deadbeef\n")
+        if args[0] == "ls-remote":
+            return _completed(0, f"{remote_sha[0]}\trefs/heads/port-staging\n")
+        if args[0] == "push":
+            remote_sha[0] = "deadbeef"
         return _completed(0)
 
     def fake_build(workdir, exports, extra=None):
@@ -1734,7 +1983,7 @@ def test_product_push_uses_an_explicit_refspec(tmp_path, monkeypatch):
     driver = _driver(repo, git_runner=fake_git, build_runner=fake_build)
     assert driver.run() == EXIT_NO_WORK
     pushes = [args for args in git_calls if args[0] == "push"]
-    assert pushes == [("push", "origin", "HEAD:refs/heads/port-staging")]
+    assert pushes == [("push", "origin", "deadbeef:refs/heads/port-staging")]
     # And every add/commit in the run is pathspec'd.
     for args in git_calls:
         if args[0] in ("add", "commit"):
@@ -1760,7 +2009,7 @@ def test_commit_paths_is_pathspecd_and_pushes_explicitly(tmp_path, monkeypatch):
     )
     assert sha == "deadbeef" and pushed and detail == ""
     assert [args for args in git_calls if args[0] == "push"] == [
-        ("push", "origin", "HEAD:refs/heads/port-staging")
+        ("push", "origin", "deadbeef:refs/heads/port-staging")
     ]
     for args in git_calls:
         if args[0] in ("add", "commit"):
