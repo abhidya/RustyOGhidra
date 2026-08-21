@@ -476,6 +476,58 @@ class ProgressJournal:
                 records.append(parsed)
         return records
 
+    @staticmethod
+    def _transition_id(record: dict[str, Any]) -> str:
+        extra = record.get("extra")
+        if not isinstance(extra, dict):
+            return ""
+        return str(extra.get("transition_id") or "")
+
+    @classmethod
+    def _jsonl_has_transition(cls, text: str, transition_id: str) -> bool:
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(record, dict)
+                and cls._transition_id(record) == transition_id
+            ):
+                return True
+        return False
+
+    def transition_receipt(self, transition_id: str) -> dict[str, Any]:
+        """Locate one stable transition in either durable journal copy."""
+        if not transition_id:
+            return {"recorded": False, "local": False, "branch": False}
+        local = any(
+            self._transition_id(record) == transition_id
+            for record in self._local_events()
+        )
+        try:
+            shown = self._git_runner(
+                "show", f"refs/heads/{self.branch}:{PROGRESS_DIR}/events.jsonl"
+            )
+            branch = shown.returncode == 0 and self._jsonl_has_transition(
+                shown.stdout, transition_id
+            )
+        except Exception:  # noqa: BLE001 - receipt lookup is read-only fallback
+            branch = False
+        receipt: dict[str, Any] = {
+            "recorded": local or branch,
+            "local": local,
+            "branch": branch,
+        }
+        if branch:
+            try:
+                head = self._git_runner("rev-parse", f"refs/heads/{self.branch}")
+                if head.returncode == 0:
+                    receipt["commit"] = head.stdout.strip()
+            except Exception:  # noqa: BLE001 - event receipt is still durable
+                pass
+        return receipt
+
     def _write_events(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         """Append the record, replaying anything the branch missed.
 
@@ -500,6 +552,7 @@ class ProgressJournal:
         # checkpoint`) share the local mirror, so an event already on the branch
         # but not the newest line would be replayed again on every checkpoint.
         present: set[tuple[Any, Any, Any]] = set()
+        present_transition_ids: set[str] = set()
         for line in reversed(lines):
             try:
                 parsed = json.loads(line)
@@ -508,6 +561,9 @@ class ProgressJournal:
             if not isinstance(parsed, dict):
                 continue
             present.add((parsed.get("timestamp"), parsed.get("unit"), parsed.get("result")))
+            transition_id = self._transition_id(parsed)
+            if transition_id:
+                present_transition_ids.add(transition_id)
             stamp = _parse_iso(parsed.get("timestamp"))
             # MAX, not "the last line": once a replay appends an older event
             # after a newer one the file is unordered, and a last-line watermark
@@ -515,6 +571,9 @@ class ProgressJournal:
             if stamp is not None and (newest is None or stamp > newest):
                 newest = stamp
         for missed in self._local_events():
+            missed_transition_id = self._transition_id(missed)
+            if missed_transition_id and missed_transition_id in present_transition_ids:
+                continue
             stamp = _parse_iso(missed.get("timestamp"))
             if stamp is None or (newest is not None and stamp < newest):
                 continue
@@ -524,8 +583,20 @@ class ProgressJournal:
             if key == (record.get("timestamp"), record.get("unit"), record.get("result")):
                 continue  # the record being written now
             present.add(key)
+            if missed_transition_id:
+                present_transition_ids.add(missed_transition_id)
             lines.append(json.dumps(missed, ensure_ascii=False, default=str))
-        lines.append(json.dumps(record, ensure_ascii=False, default=str))
+        record_transition_id = self._transition_id(record)
+        record_key = (
+            record.get("timestamp"),
+            record.get("unit"),
+            record.get("result"),
+        )
+        if (
+            (record_transition_id and record_transition_id not in present_transition_ids)
+            or (not record_transition_id and record_key not in present)
+        ):
+            lines.append(json.dumps(record, ensure_ascii=False, default=str))
         lines = lines[-MAX_EVENT_LINES:]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
         parsed = []
@@ -645,9 +716,33 @@ class ProgressJournal:
         """Persist locally, snapshot, commit, push. Never raises for git reasons."""
         machine = machine or MachineState()
         units = units or {}
-        timestamp = utc_now()
+        transition_id = ""
+        stable_timestamp = ""
+        stable_run_id = ""
+        if transition is not None and isinstance(transition.extra, dict):
+            transition_id = str(transition.extra.get("transition_id") or "")
+            stable_timestamp = str(
+                transition.extra.get("transition_timestamp") or ""
+            )
+            stable_run_id = str(transition.extra.get("transition_run_id") or "")
+        receipt: dict[str, Any] = {
+            "recorded": False,
+            "local": False,
+            "branch": False,
+        }
+        if transition_id:
+            receipt = self.transition_receipt(transition_id)
+            if receipt["branch"]:
+                return {
+                    "recorded": True,
+                    "committed": True,
+                    "pushed": False,
+                    "idempotent": True,
+                    **({"commit": receipt["commit"]} if receipt.get("commit") else {}),
+                }
+        timestamp = stable_timestamp or utc_now()
         record = (
-            transition.to_record(timestamp, self.run_id)
+            transition.to_record(timestamp, stable_run_id or self.run_id)
             if transition is not None
             else {
                 "schema": PROGRESS_SCHEMA,
@@ -662,13 +757,14 @@ class ProgressJournal:
             }
         )
         # 1. LOCAL durability first. Everything after this is best-effort.
-        local_recorded = False
+        local_recorded = bool(receipt["local"])
         local_error = ""
-        try:
-            self._append_local_event(record)
-            local_recorded = True
-        except OSError as error:
-            local_error = str(error)
+        if not local_recorded:
+            try:
+                self._append_local_event(record)
+                local_recorded = True
+            except OSError as error:
+                local_error = str(error)
 
         try:
             result = self._checkpoint_locked(

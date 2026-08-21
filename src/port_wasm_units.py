@@ -2229,6 +2229,8 @@ class WasmUnitDriver:
             tier=outcome.get("tier"),
             extra={
                 "transition_id": transition_id,
+                "transition_timestamp": marker.get("transition_timestamp"),
+                "transition_run_id": marker.get("transition_run_id"),
                 "promotion_transaction_id": marker.get("transaction_id"),
                 "candidate_sha256": marker.get("candidate_sha256"),
             },
@@ -2237,6 +2239,14 @@ class WasmUnitDriver:
     def _journal_has_transition(self, transition_id: str) -> bool:
         if not transition_id:
             return False
+        receipt_reader = getattr(self._journal, "transition_receipt", None)
+        if callable(receipt_reader):
+            try:
+                receipt = receipt_reader(transition_id)
+            except Exception:  # noqa: BLE001 - recovery remains fail closed
+                receipt = {}
+            if isinstance(receipt, dict) and receipt.get("recorded"):
+                return True
         reader = getattr(self._journal, "_local_events", None)
         if callable(reader):
             try:
@@ -2285,6 +2295,10 @@ class WasmUnitDriver:
             raise RuntimeError("installed candidate unavailable during finalization")
         transaction = PromotionTransaction(attempt_dir, candidate, destination)
         transition_id = str(marker.get("transition_id") or uuid.uuid4().hex)
+        transition_timestamp = str(marker.get("transition_timestamp") or utc_now())
+        transition_run_id = str(
+            marker.get("transition_run_id") or marker.get("run_id") or self.run_id
+        )
         remote_preimage = marker.get("remote_preimage")
         if "remote_preimage" not in marker:
             remote_preimage = self._remote_port_staging_sha()
@@ -2294,6 +2308,8 @@ class WasmUnitDriver:
             prepared_commit=prepared,
             remote_preimage=remote_preimage,
             transition_id=transition_id,
+            transition_timestamp=transition_timestamp,
+            transition_run_id=transition_run_id,
         )
         remote = self._remote_port_staging_sha()
         if remote not in {remote_preimage, prepared}:
@@ -2329,6 +2345,7 @@ class WasmUnitDriver:
         if not self._journal_has_transition(transition_id):
             if not self._checkpoint(projected, self._promotion_transition(marker)):
                 return False
+        self._promotion_phase_boundary("checkpoint_durable", transaction)
         self._update_promotion_marker(attempt_dir, phase="checkpointed")
         self._promotion_phase_boundary("checkpoint", transaction)
         self._save_state(projected)

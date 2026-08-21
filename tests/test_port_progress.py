@@ -78,6 +78,54 @@ def test_branch_is_seeded_without_checking_out_the_product_tree(journal, repo):
     assert listed == ["workflow-progress/README.md"]
     # The product worktree is untouched.
     assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo).stdout.strip() == "main"
+
+
+def test_stable_transition_id_is_idempotent_across_local_and_branch(journal, repo):
+    transition = UnitTransition(
+        unit="damage-core",
+        result=RESULT_GREEN,
+        stage="commit",
+        product_commit="abc123",
+        product_pushed=True,
+        extra={
+            "transition_id": "stable-green-transition",
+            "transition_timestamp": "2026-08-21T12:34:56Z",
+            "transition_run_id": "stable-origin-run",
+        },
+    )
+    first = journal.checkpoint(
+        transition=transition,
+        units=UNITS,
+        machine=MachineState(workflow_state="running"),
+        driver_running=True,
+    )
+    second = journal.checkpoint(
+        transition=transition,
+        units=UNITS,
+        machine=MachineState(workflow_state="running"),
+        driver_running=True,
+    )
+    assert first["recorded"] is True
+    assert second["recorded"] is True and second["idempotent"] is True
+    records = [
+        json.loads(line)
+        for line in (
+            journal.progress_root / "events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    matching = [
+        record
+        for record in records
+        if record.get("extra", {}).get("transition_id")
+        == "stable-green-transition"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["timestamp"] == "2026-08-21T12:34:56Z"
+    assert matching[0]["run_id"] == "stable-origin-run"
+    subjects = git(
+        "log", "--format=%s", "refs/heads/port-progress", cwd=repo
+    ).stdout.splitlines()
+    assert sum(subject.startswith("progress: damage-core green") for subject in subjects) == 1
     assert git("status", "--porcelain", cwd=repo).stdout.strip() == ""
 
 

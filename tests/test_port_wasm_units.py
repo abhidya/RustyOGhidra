@@ -11,6 +11,7 @@ import pytest
 
 from src.port_assembly_gate import unit_artifact_sha256
 from src.port_driver import EXIT_NO_WORK, EXIT_PROGRESSED, EXIT_STOPPED
+from src.port_progress import PROGRESS_DIR, ProgressJournal
 from src.port_wasm_units import (
     WasmUnitDriver,
     extract_verbatim,
@@ -1717,6 +1718,128 @@ def test_promotion_operation_failure_restarts_to_exact_prepared_sha(
     assert len(transitions) == 1
     assert transitions[0].product_commit == prepared
     assert transitions[0].extra["transition_id"] == record["promotion_transition_id"]
+
+
+def test_branch_only_green_receipt_prevents_replay_after_checkpoint_crash(
+    tmp_path, monkeypatch
+):
+    """A branch commit is a durable receipt even when the local append failed."""
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    _seed_green_artifact(repo, "prior-unit", "2026-08-01T00:00:00Z")
+    remote = tmp_path / "origin.git"
+
+    def git(cwd, *args, check=True):
+        completed = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True
+        )
+        if check:
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+        return completed
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "init")
+    git(repo, "config", "user.email", "port-test@example.invalid")
+    git(repo, "config", "user.name", "Port Test")
+    git(repo, "branch", "-M", "main")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "baseline")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    baseline = git(repo, "rev-parse", "HEAD").stdout.strip()
+    run_root = repo / "research/decomp/generated/finish-game-port"
+    progress_worktree = tmp_path / "progress-worktree"
+    journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="original-journal-run",
+        enable_push=False,
+    )
+    real_append = journal._append_local_event
+
+    def fail_green_local_append(record):
+        if record.get("extra", {}).get("promotion_transaction_id"):
+            raise OSError("injected local journal append failure")
+        real_append(record)
+
+    journal._append_local_event = fail_green_local_append
+
+    def fake_build(workdir, exports, extra=None):
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    def fake_link(workdir, c_files, exports, allowed_extra):
+        (workdir / "assembly.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    driver = _driver(
+        repo,
+        journal=journal,
+        git_runner=None,
+        build_runner=fake_build,
+        assembly_link_runner=fake_link,
+        assembly_smoke_runner=lambda wasm: (True, "ASSEMBLY_SMOKE_OK"),
+    )
+
+    def crash_after_durable_checkpoint(phase, transaction):
+        if phase == "checkpoint_durable":
+            raise KeyboardInterrupt("crash after branch-only checkpoint")
+
+    driver._promotion_phase_boundary = crash_after_durable_checkpoint
+    with pytest.raises(KeyboardInterrupt, match="branch-only checkpoint"):
+        driver.run()
+
+    attempts = list(driver.promotion_attempt_root.glob("*"))
+    assert len(attempts) == 1
+    marker = json.loads((attempts[0] / ".promotion-attempt.json").read_text())
+    assert marker["phase"] == "checkpointing"
+    transition_id = marker["transition_id"]
+    assert not journal.transition_receipt(transition_id)["local"]
+    assert journal.transition_receipt(transition_id)["branch"]
+
+    state = driver._load_state()
+    restarted_journal = ProgressJournal(
+        repo,
+        run_root=run_root,
+        worktree=progress_worktree,
+        run_id="restart-journal-run",
+        enable_push=False,
+    )
+    restarted = _driver(repo, journal=restarted_journal, git_runner=None)
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert restarted._reconcile_orphan_promotion_attempts(state) is True
+    assert not list(restarted.promotion_attempt_root.glob("*"))
+
+    branch_events = git(
+        repo,
+        "show",
+        f"refs/heads/port-progress:{PROGRESS_DIR}/events.jsonl",
+    ).stdout.splitlines()
+    matching_events = [
+        json.loads(line)
+        for line in branch_events
+        if json.loads(line).get("extra", {}).get("transition_id") == transition_id
+    ]
+    assert len(matching_events) == 1
+    green_commits = [
+        subject
+        for subject in git(
+            repo, "log", "--format=%s", "refs/heads/port-progress"
+        ).stdout.splitlines()
+        if subject.startswith("progress: unit-a green")
+    ]
+    assert len(green_commits) == 1
+    product_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    remote_head = git(
+        repo, "ls-remote", "origin", "refs/heads/port-staging"
+    ).stdout.split()[0]
+    assert product_head == remote_head
+    assert git(repo, "rev-list", "--count", f"{baseline}..HEAD").stdout.strip() == "1"
+    record = state["units"]["unit-a"]
+    assert record["status"] == "green"
+    assert record["commit"] == product_head
+    assert record["promotion_transition_id"] == transition_id
 
 
 def test_assembly_failure_stops_if_required_journal_checkpoint_raises(
