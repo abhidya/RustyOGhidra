@@ -3124,13 +3124,15 @@ class WasmUnitDriver:
                 ),
                 "selection": selection_evidence,
             }
+        gate_workdir = workdir or (self.work_root / workdir_name)
         result = run_assembly_gate(
             units,
-            workdir or (self.work_root / workdir_name),
+            gate_workdir,
             link_runner=self._assembly_link_runner,
             smoke_runner=self._assembly_smoke_runner,
             candidate=candidate,
             selection_evidence=selection_evidence,
+            canonicalization=self._canonicalization_request(units, gate_workdir),
         )
         if not verify_canonical_state_snapshot(snapshot):
             result["passed"] = False
@@ -3138,6 +3140,58 @@ class WasmUnitDriver:
             result["detail"] = "canonical state changed during assembly gate"
         record_gate_result(self.assembly_ledger_path, result)
         return result
+
+    def _canonicalization_request(
+        self, units: list[Any], workdir: Path
+    ) -> Any | None:
+        """Owner-derived canonicalization for this window, or None.
+
+        Returning None keeps the registry-less merge, which is the only correct
+        behaviour while the product registry is still pre-schema-1: the gate must
+        not start failing because the owner catalog is unavailable. A refusal
+        raised *inside* the gate is a different thing entirely and always stands.
+
+        The snapshot is scoped to the symbols this window references. The pinned
+        Clang runs twice per parsed record and the registry holds 10,954
+        functions, so an unscoped load would cost hours for a handful of lookups.
+        """
+        try:
+            from src.port_assembly_abi import ClangDeclaratorParser, load_owner_snapshot
+            from src.port_assembly_gate import CanonicalizationRequest
+
+            registry_path = self.repo_root / "research/decomp/data/oracle-registry.json"
+            if not registry_path.is_file():
+                return None
+            identifier = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
+            symbols: set[str] = set()
+            for unit in units:
+                for name in ("unit.c", "gnt4_shim.h"):
+                    data = (unit.directory / name).read_bytes()
+                    symbols.update(match.group().decode("ascii") for match in identifier.finditer(data))
+            workdir.mkdir(parents=True, exist_ok=True)
+            smoke_script = workdir / "assembly-smoke.cjs"
+            smoke_script.write_text(SMOKE_JS, encoding="utf-8", newline=chr(10))
+            parser = ClangDeclaratorParser.from_product_root(self.repo_root)
+            snapshot = load_owner_snapshot(self.repo_root, registry_path, parser, symbols=symbols)
+            attempt = max(1, int(getattr(units[-1], "attempts", 1) or 1))
+            request = CanonicalizationRequest(
+                repo_root=self.repo_root,
+                owner_snapshot=snapshot,
+                attempt=attempt,
+                behavior_tier="compile_only",
+                smoke_script=smoke_script,
+            )
+            self.events.emit(
+                "assembly_canonicalization_ready",
+                owners=len(snapshot.owner_index),
+                symbols=len(symbols),
+            )
+            return request
+        except Exception as error:  # noqa: BLE001 - unavailability must not break the gate
+            self.events.emit(
+                "assembly_canonicalization_unavailable", error=str(error)[:400]
+            )
+            return None
 
     def _maybe_run_assembly_gate(
         self,

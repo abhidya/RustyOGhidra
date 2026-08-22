@@ -4534,3 +4534,47 @@ def test_commit_paths_is_pathspecd_and_pushes_explicitly(tmp_path, monkeypatch):
     for args in git_calls:
         if args[0] in ("add", "commit"):
             assert "--" in args, f"unpathspec'd git call: {args}"
+
+
+# ------------------------------------------------- canonicalization wiring
+
+
+class _RecordingEvents:
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, dict]] = []
+
+    def emit(self, kind: str, **fields) -> None:
+        self.seen.append((kind, fields))
+
+
+class _RequestProbe:
+    """Exercises the driver's request builder without standing up a driver."""
+
+    def __init__(self, repo_root: Path) -> None:
+        self.repo_root = repo_root
+        self.events = _RecordingEvents()
+
+    _canonicalization_request = WasmUnitDriver._canonicalization_request
+
+
+def test_canonicalization_falls_back_when_the_registry_is_not_schema_1(tmp_path: Path):
+    """An unavailable owner catalog must keep the registry-less merge.
+
+    The product registry is pre-schema-1 until the Task 1 merge lands, and the
+    gate must not start failing because the catalog is missing. A refusal raised
+    inside the gate is a different thing and always stands.
+    """
+    data = tmp_path / "research/decomp/data"
+    data.mkdir(parents=True)
+    (data / "oracle-registry.json").write_text('{"meta": {}}', encoding="utf-8")
+    probe = _RequestProbe(tmp_path)
+    assert probe._canonicalization_request([], tmp_path / "work") is None
+    kinds = [kind for kind, _ in probe.events.seen]
+    assert kinds == ["assembly_canonicalization_unavailable"]
+
+
+def test_canonicalization_falls_back_when_the_registry_is_absent(tmp_path: Path):
+    """No registry at all is silent -- there is nothing anomalous to report."""
+    probe = _RequestProbe(tmp_path)
+    assert probe._canonicalization_request([], tmp_path / "work") is None
+    assert probe.events.seen == []

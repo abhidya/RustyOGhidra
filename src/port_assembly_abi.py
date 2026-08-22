@@ -20,7 +20,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, Protocol, Sequence
+from typing import Any, Collection, Literal, Mapping, Protocol, Sequence
 
 
 ABI_PREAMBLE_V1 = b"""_Static_assert(__CHAR_BIT__ == 8, "ABI_PREAMBLE_V1 char");
@@ -1194,8 +1194,17 @@ def load_owner_snapshot(
     product_root: Path,
     registry_path: Path,
     declarator_parser: DeclaratorParser,
+    symbols: Collection[str] | None = None,
 ) -> OwnerSnapshot:
-    """Load and independently validate one strict schema-1 owner snapshot."""
+    """Load and independently validate one strict schema-1 owner snapshot.
+
+    `symbols` scopes which records are PARSED into owner bindings. The registry
+    is always validated whole -- scoping never weakens that -- but the pinned
+    Clang runs twice per parsed record, and the real registry holds 10,954
+    functions. A composition only ever asks about the symbols its bundle
+    references, so parsing all of them would cost hours per gate run for a
+    handful of lookups. Passing None keeps the whole registry.
+    """
 
     if not isinstance(registry_path, (str, os.PathLike)):
         _fail("product_path_invalid", "owner", "registry_path must be a path")
@@ -1221,6 +1230,9 @@ def load_owner_snapshot(
     index = _parse_index(stable_index.data)
 
     functions: list[dict[str, Any]] = registry["functions"]
+    if symbols is not None:
+        wanted = {str(item) for item in symbols}
+        functions = [record for record in functions if record["name"] in wanted]
     expected_anomalies: list[str] = []
     bindings: list[OwnerBinding] = []
     seen_chunk_casefold: dict[str, str] = {}
@@ -1321,7 +1333,10 @@ def load_owner_snapshot(
             )
         )
 
-    if registry["summary"]["anomalies"] != expected_anomalies:
+    # The anomaly list is a whole-registry fact, so it can only be cross-checked
+    # against a whole-registry parse. A scoped load still validated the summary
+    # itself above; it simply cannot re-derive this one field from a subset.
+    if symbols is None and registry["summary"]["anomalies"] != expected_anomalies:
         _fail("owner_marker_anomaly_mismatch", "owner", "summary anomalies do not exactly match marker-wins rows")
     index_map = MappingProxyType({binding.symbol: (binding,) for binding in sorted(bindings, key=lambda item: item.symbol)})
     return OwnerSnapshot(
