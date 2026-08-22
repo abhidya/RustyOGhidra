@@ -1,23 +1,27 @@
 # GotYaForce assembly ABI canonicalization
 
-Status: **review-ready after final-acceptance remediation; not approved and not PASS**.
+Status: **review-ready after implementation-discovered array-adjustment correction; prior PASS superseded**.
 This document authorizes no implementation or live mutation. Human approval
-is required before the task plan may be executed. The 2026-08-21 final-acceptance
-rereview's `CHANGES REQUIRED` verdict remains controlling until a new review
-replaces it.
+is required before the task plan may be executed. The 2026-08-21 PASS review
+predates the exact pinned-Clang adjusted-array counterexample below and is no
+longer controlling; an independent rereview of this amendment is required.
 
-`verified_against`: OGhidra `4291b24c128c598360f9dc57b46be3efd1084c61`;
-GotYaForce remote refs and data identities listed in the next section.
+`verified_against`: current OGhidra `fork/main`
+`f757a7e115327f23b061568a99c1a134a79ca118`; implementation code/interfaces/
+tests baseline `4291b24c128c598360f9dc57b46be3efd1084c61`; GotYaForce remote refs and
+data identities listed in the next section.
 
 ## Verified against
 
-Evidence snapshot: `2026-08-21T19:01:47.4986445-04:00`
+Evidence snapshot: `2026-08-21T20:55:23.2884599-04:00`
 (`America/New_York`).
 
-- OGhidra: `fork/main` and this branch's base are exactly
+- OGhidra: `fork/main` and this successor commit's parent are exactly
+  `f757a7e115327f23b061568a99c1a134a79ca118`. That commit adds only the prior
+  design document over implementation code/interfaces/tests baseline
   `4291b24c128c598360f9dc57b46be3efd1084c61`.
 - GotYaForce remote heads (read with `git ls-remote origin`): `main`
-  `7d8157fbcedac87d63c4a7e85e327432eeb4e581`, `port-staging`
+  `3fe888dc5193c1c5ea345911f771f63210fcf179`, `port-staging`
   `0901d3cd24820364d3e0649b848757eb3bccb5e0`, and `port-progress`
   `4294758ba2c49c6ab0b784ad09de8b23870d9628`.
 - The inspected product worktree is `main` at
@@ -139,13 +143,18 @@ def analyze_composition(
     plan: CanonicalizationPlan,
     objects: tuple[ObjectObservation, ...],
     outcome: ToolOutcome,
-) -> CompositionResult: ...
+    retry_history: RetryHistory,
+) -> CompositionDraft: ...
 
 def revalidate_receipt(
     receipt: CanonicalizationReceipt | CompositionReceipt,
     product_root: Path,
     observed: ReceiptObservation,
 ) -> RevalidatedReceipt | AssemblyAbiRefusal: ...
+
+def finalize_composition(
+    finalization: FinalizationInput,
+) -> CompositionResult: ...
 ```
 
 `load_owner_snapshot` is the production adapter at the product-owner seam and
@@ -158,12 +167,16 @@ ordered owner/variant `CompatibilityEvidence`, discarded variants, and
 planned object plus completed compiler/link/inspector/smoke evidence, validates
 the one-to-one translation-unit mapping, computes precise object manifests and
 diagnostic contributors, classifies blocker versus transient fault, and
-returns one complete, immutable-data-ready in-memory `CompositionResult` and
-retry material; it writes nothing. `revalidate_receipt` owns a
+returns an in-memory `CompositionDraft`, `CompositionReceipt`, and retry
+material; it writes nothing. `revalidate_receipt` owns a
 fresh stable product-registry/source re-read and compares the caller-supplied
-private bundle/object/tool digests to the receipt. Tests may construct an
-in-memory `OwnerSnapshot`, but production can obtain one only through the v1
-adapter.
+private bundle/object/tool digests to the receipt. `finalize_composition` is the
+only seam that converts any member of the closed finalization-input union into
+the exact immutable `CompositionResult`; it validates early-failure evidence,
+embeds actual revalidation check digests when a boundary was reached,
+constructs and self-validates `result_id`, and never performs I/O. Tests may
+construct an in-memory `OwnerSnapshot`, but production can
+obtain one only through the v1 adapter.
 
 Ownership outside the module is exact:
 
@@ -175,8 +188,15 @@ Ownership outside the module is exact:
   adapters. The compiler produces one named object per translation-unit plan;
   the inspector produces typed `ObjectObservation` data. Neither adapter
   chooses owners or contributors. The gate passes observations/diagnostics to
-  `analyze_composition`, then calls `revalidate_receipt` with stage
-  `pre-publication` after tool completion.
+  `analyze_composition` with the driver-supplied `RetryHistory`, receives a
+  `CompositionDraft`/`CompositionReceipt`, then calls `revalidate_receipt` on
+  that exact composition receipt with stage `pre-publication`. It finally calls
+  `finalize_composition` with exactly one union member: early owner/planning/
+  materialization evidence, a failed pre-compile check, or the draft plus the
+  actual pre-compile/pre-publication checks. Every member carries the same
+  driver-supplied durable `RetryHistory`; the draft binds its canonical digest,
+  and the finalizer alone produces the final retry projection. It invokes no tool or analyzer
+  after a failed pre-compile check.
 - `src/port_assembly_abi.py` alone normalizes prototypes, validates object
   observations, attributes symbols, classifies composition outcomes, hashes
   ABI receipts, and rechecks owner evidence. It performs no writes, Git,
@@ -188,11 +208,16 @@ Ownership outside the module is exact:
   sequencer of immutable assembly-result/blocked manifests, the private
   promotion marker, retry scheduling fields, progress-journal transition,
   canonical state, product install/commit/push, and recovery. It validates the
-  returned result, computes canonical IDs/bytes, writes manifests, and then
+  returned complete result and finalizer-owned ID projection, serializes it
+  without field mutation, writes manifests, and then
   invokes the Task 3 `record_gate_result` atomic helper to fold local
   `assembly-gate.json`. That helper owns only the exact ledger lock/read/
   idempotency/write critical section; the driver owns whether and when it
-  runs. The driver never parses an ABI.
+  runs. The driver owns durable retry history and sleeping; the module alone
+  validates that history and classifies the current outcome, and its pure
+  finalizer calculates the next count/status/backoff/fingerprints only after
+  final revalidation. The driver never parses or classifies
+  an ABI outcome.
 
 The deletion test is satisfied: deleting this module would redistribute
 schema validation, stable source reads, C-definition parsing, declaration
@@ -484,7 +509,7 @@ receipt hashing, and receipt revalidation into the gate and driver.
   bytes. These fields drive owner spelling/emission only and never ABI equality.
   AST IDs, locations, and implicit nodes are excluded from durable identity;
   source offsets are temporary emitter inputs.
-- ABI evidence uses a second pinned-Clang probe and exact `AbiTuple`, never an
+- ABI evidence uses pinned-Clang probes and exact `AbiTuple`, never an
   invented C-type parser. From the
   successful spelling-mode print, the token scanner obtains the flat return
   spelling and ordered abstract parameter spellings after identifier erasure;
@@ -495,11 +520,39 @@ receipt hashing, and receipt revalidation into the gate and driver.
   `void __oghidra_abi_probe(__oghidra_abi_param_0000, ...)` with the original
   ellipsis/prototype kind. Run the exact JSON argv filtered to
   `__oghidra_abi_probe`. Require exactly the original arity/order and require
-  every synthetic `ParmVarDecl.type.desugaredQualType` to exist as a nonempty
-  string; no `qualType` fallback is permitted. The active exact macros make
-  this recursive for nested aliases, while the top-level synthetic typedef
-  makes Clang expose the mandatory field. Clang still owns array/function
-  parameter adjustment.
+  each synthetic `ParmVarDecl.type.desugaredQualType` to exist as a nonempty
+  string except for the one bounded adjusted-parameter path below. The active
+  exact macros make alias expansion recursive. Clang alone owns array/function
+  parameter adjustment; no Python type or qualifier normalization is allowed.
+- Pinned Clang 24 can remove the synthetic typedef while adjusting an array
+  parameter and then omit `ParmVarDecl.type.desugaredQualType`. In that exact
+  case, do **not** accept `qualType` as the ABI value and do not refuse the
+  schema-supported array. Require the node's `type` object to have exactly one
+  key, a nonempty string `qualType`; call this observed adjusted spelling `Q`.
+  Reject CR, LF, NUL, non-UTF-8, an empty value, another/missing type key, or
+  any arity/order/prototype ambiguity. For each such ordinal in ascending
+  order, run one second deterministic `VarDecl` probe whose stdin is exactly
+  `ABI_PREAMBLE_V1` followed immediately by these two UTF-8/LF lines, with the
+  zero-padded four-digit ordinal and `Q` inserted only at `{Q}`:
+
+  ```c
+  typedef __typeof__({Q}) __oghidra_abi_adjusted_param_type_0000;
+  __oghidra_abi_adjusted_param_type_0000 __oghidra_abi_adjusted_param_probe_0000;
+  ```
+
+  Its no-shell argv is the exact bound JSON argv with only the filter value
+  changed from `__oghidra_abi_probe` to the matching
+  `__oghidra_abi_adjusted_param_probe_0000`. Require exit zero, empty stderr,
+  strict-UTF-8 stdout containing exactly one JSON value, root
+  `kind='VarDecl'`, exact sentinel `name`, and `root.type.qualType` equal to the
+  matching `__oghidra_abi_adjusted_param_type_0000`. Only the nonempty string
+  `root.type.desugaredQualType` becomes the `AbiTuple` parameter. AST IDs and
+  `typeAliasDeclId` are ignored; missing/multiple/wrong nodes or fields,
+  diagnostics, decode/JSON failure, nonzero exit, a remaining forbidden alias
+  token under the rule below, or a result inconsistent with arity/order is typed
+  `abi_adjusted_parameter_probe_invalid`. Thus observed `Q` is merely
+  digest-bound Clang input to a second Clang-owned desugaring, never an unbound
+  fallback or durable ABI answer.
 - Return identity uses a separate JSON invocation. For a non-void flat return,
   append the LF-terminated synthetic typedef named
   `__oghidra_abi_return_type` with exact source form `typedef
@@ -512,8 +565,25 @@ receipt hashing, and receipt revalidation into the gate and driver.
   Closed aliases `void` and `code` are the sole object-inexpressible return
   case: both must parse as a function return under the active mapping and map
   to exact canonical string `void`; no other missing VarDecl field is allowed.
-  Unknown/multiple nodes, warnings/stderr, alias text remaining in a desugared
-  value, or an arity/variadic/prototype mismatch refuses.
+  Unknown/multiple nodes, warnings/stderr, forbidden alias text remaining in a
+  desugared value, or an arity/variadic/prototype mismatch refuses.
+- The closed source-alias-token set is exactly `FILE`, `__FILE`,
+  `__compar_fn_t`, `bool`, `byte`, `code`, `longlong`, `size_t`, `uint`,
+  `ulong`, `ulonglong`, `undefined`, `undefined1`, `undefined2`, `undefined4`,
+  `undefined8`, `ushort`, and `wchar_t`. The forbidden-remnant set is that
+  exact set minus `bool`. Tokenize every primary, adjusted-secondary, and
+  return `desugaredQualType` as C identifier tokens and refuse
+  `abi_probe_alias_not_desugared` if any forbidden-remnant member remains.
+  Pinned Clang 24 under the exact 1,870-byte preamble reports builtin `_Bool`
+  with the complete identifier token `bool` in these mandatory
+  `desugaredQualType` fields because the preamble's spelling-mode typedef is
+  visible. That exact compiler-owned token is the sole exception and remains
+  verbatim in `AbiTuple`; Python must not replace it with `_Bool` or perform
+  any contextual/string normalization. The exception applies only to a
+  mandatory `desugaredQualType` obtained from a successful bound primary,
+  adjusted-secondary, or return probe. It never permits a `qualType` fallback,
+  fabricated/fake production evidence, another alias, or a changed
+  preamble/tool identity.
 - `AbiTuple` is exactly `{abi_tuple_schema: 1, return_type: string,
   parameter_types: list[string], arity: nonnegative-int, variadic: bool,
   prototype_kind: 'unspecified'|'void'|'prototype',
@@ -527,8 +597,21 @@ receipt hashing, and receipt revalidation into the gate and driver.
   one LF. `abi_tuple_sha256` hashes exactly ASCII
   `OGHIDRA_ABI_TUPLE_V1`, one NUL byte, the payload length as unsigned 8-byte
   big-endian, then the payload. The tuple payload/digest, preamble/undef
-  digests, both probe source SHA-256 values, exact argv, and Clang identities
-  enter `owner_binding_sha256` and the assembly world.
+  digests, all probe evidence below, exact argv, and Clang identities enter
+  `owner_binding_sha256` and the assembly world.
+- `AbiProbeEvidence` is exact canonical schema-1 data:
+  `{abi_probe_schema: 1, parameter_source_size: positive-int,
+  parameter_source_sha256: sha256, adjusted_parameters: list[exact {ordinal:
+  nonnegative-int, observed_adjusted_qual_type: nonempty string,
+  source_size: positive-int, source_sha256: sha256,
+  desugared_qual_type: nonempty string}], return_source_size: positive-int,
+  return_source_sha256: sha256}`. Adjusted entries are unique and ordinal-
+  sorted; absence is `[]`, never null. Every source hash covers exact stdin;
+  executable/binary/version/target/dialect/filter argv remain in parser
+  identity. The complete evidence enters the owner-only binding, relevant
+  catalog, canonicalization receipt, assembly world, and retry fingerprint.
+  Any primary/secondary source, AST projection, or tool identity change opens a
+  different world; no adjusted string is normalized before hashing.
 - Pinned Clang alone decides owner-versus-variant ABI compatibility after both
   declarations pass schema/refusal checks. There is no qualifier stripping and
   no tuple/string equality gate. Starting from each exact canonical no-LF
@@ -585,13 +668,19 @@ receipt hashing, and receipt revalidation into the gate and driver.
   no-shell argv:
   `clang.exe --target=wasm32-unknown-emscripten -std=gnu11 -x c -Xclang
   -ast-print -fsyntax-only -`. The executable, target, dialect, preamble,
-  binary/version digests, both argv arrays, and projection schema are one
+  binary/version digests, all exact argv arrays, and projection schema are one
   bound parser/emitter identity.
 - Decode printer stdout as strict UTF-8, normalize CRLF and bare CR to LF, and
-  use the same comment/string-aware top-level token scanner to select exactly
-  one semicolon-terminated declaration containing the sentinel identifier as
-  a complete token. Other complete top-level declarations are the bound
-  preamble and are not output; reject any incomplete top-level bytes,
+  use the same comment/string-aware top-level token scanner over the **entire**
+  stdout, never a line-based search. It must partition every non-whitespace byte
+  into complete balanced top-level declarations before selecting exactly one
+  semicolon-terminated declaration containing the sentinel identifier as a
+  complete token. At adapter initialization, print exact `ABI_PREAMBLE_V1 +
+  ABI_SPELLING_UNDEF_V1` alone with the same argv and bind its normalized
+  complete-declaration sequence and stdout digest into parser identity. Every
+  non-sentinel declaration in a real print must byte-match that sequence in
+  order. Reject garbage or an incomplete declaration anywhere before or after
+  the sentinel, any extra/missing/reordered preamble declaration,
   zero/two sentinel matches, diagnostics, a body/directive in the selected
   declaration, or trailing tokens after its one `;`. Trim only
   leading/trailing horizontal whitespace, replace the sentinel token with the
@@ -616,6 +705,86 @@ receipt hashing, and receipt revalidation into the gate and driver.
   | unspecified `()` | pass: `void synthetic();`; hex `766f69642073796e74686574696328293b`; kind `unspecified` |
   | explicit `(void)` | pass: `void synthetic(void);`; hex `766f69642073796e74686574696328766f6964293b`; kind `void` |
   | function `__attribute__((used))` | refuse `registry_shape_unrepresentable_attribute`; no emitted bytes |
+
+  Adjusted-array extraction vectors are normative and use the exact primary
+  JSON argv. For parameter spelling `unsigned int[4]`, stdin is the 1,870-byte
+  preamble followed by this exact 114-byte ASCII suffix (`\n` denotes one LF):
+
+  ```text
+  typedef __typeof__(unsigned int[4]) __oghidra_abi_param_0000;\nvoid __oghidra_abi_probe(__oghidra_abi_param_0000);\n
+  ```
+
+  The complete stdin is 1,984 bytes, SHA-256
+  `50073f94f5ea6a2db084c0d3061af01fe373a08d065f70a143abbdd95711ef0c`.
+  Pinned Clang exits zero with empty stderr; the sole filtered
+  `FunctionDecl.type` is exactly `{"qualType":"void (unsigned int *)"}` and
+  its ordinal-zero `ParmVarDecl.type` is exactly
+  `{"qualType":"unsigned int *"}` with no `desugaredQualType`. This absence
+  triggers the bounded secondary path; it is not itself a pass or ABI value.
+
+  Here `Q` is exact observed `unsigned int *`. The secondary source defined
+  above is 2,025 bytes, SHA-256
+  `af0eed3c64a8436bddeba4b67642910ec7af0a18c2e074dab43901338f4e7b08`.
+  The exact adjusted-sentinel argv exits zero with empty stderr and one root
+  `VarDecl` named `__oghidra_abi_adjusted_param_probe_0000`; its projected type
+  is `qualType='__oghidra_abi_adjusted_param_type_0000'` and mandatory
+  `desugaredQualType='unsigned int *'`. The final tuple parameter is therefore
+  `unsigned int *` and the adjusted-array row passes.
+
+  The typedef-array spelling `uint[4]` relies only on the embedded preamble.
+  Its exact primary source is 1,976 bytes, SHA-256
+  `1ab534677857681dae3650ac3058eadf16376eb9475711f3b3116b218a03cf28`;
+  it produces the same primary `FunctionDecl`/missing-field observation and
+  therefore the byte-identical 2,025-byte secondary source/result. Tests
+  reconstruct all three sources, assert both primary AST paths and the
+  secondary `VarDecl` path, and typed-refuse every malformed/missing/ambiguous
+  variant. A direct use of either primary `qualType` is a test failure.
+
+  The pinned `_Bool` representation vectors are independently normative. The
+  parameter stdin is the 1,870-byte preamble followed by this exact 104-byte
+  ASCII suffix (`\n` denotes one LF):
+
+  ```text
+  typedef __typeof__(_Bool) __oghidra_abi_param_0000;\nvoid __oghidra_abi_probe(__oghidra_abi_param_0000);\n
+  ```
+
+  The complete stdin is 1,974 bytes, SHA-256
+  `979dcb0e8c3b7f16df0f079eb32dc88ec29edd8aee45e6f6869bc88ffca645ee`.
+  The exact parameter JSON argv exits zero with empty stderr; the sole
+  ordinal-zero node projects
+  `{"desugaredQualType":"bool","qualType":"__oghidra_abi_param_0000"}`
+  after ignored `typeAliasDeclId`. The return stdin is the same preamble plus
+  this exact 107-byte suffix:
+
+  ```text
+  typedef __typeof__(_Bool) __oghidra_abi_return_type;\n__oghidra_abi_return_type __oghidra_abi_return_probe;\n
+  ```
+
+  The complete stdin is 1,977 bytes, SHA-256
+  `d1ab6f90f9fd697bbab8be406c2277bea262d73f95856af612b46db5c6dab503`.
+  The exact return JSON argv exits zero with empty stderr; the sole `VarDecl`
+  projects
+  `{"desugaredQualType":"bool","qualType":"__oghidra_abi_return_type"}`
+  after ignored `typeAliasDeclId`. Replacing `_Bool` with source spelling
+  `bool` produces the same two projected type objects: parameter source
+  `1,973 / c9a06c3b229b3212f3416aebc9e945f0373ce68708bb6f1ee31a13514ab94369`
+  and return source
+  `1,976 / 971b34604b31d95f4d04d44df8bd15ecf40817df70c541c5553d6954b62fdb4c`.
+  Thus `void synthetic(_Bool);` and `void synthetic(bool);` both produce exact
+  payload
+  `{"abi_tuple_schema":1,"arity":1,"calling_convention":"c","parameter_types":["bool"],"prototype_kind":"prototype","return_type":"void","variadic":false}\n`
+  (152 bytes) and framed digest
+  `1d4fc56beae25b544724f2105c503133143ef8f12b6e65598abdc1ed4ae14bd4`.
+  `_Bool synthetic(void);` and `bool synthetic(void);` both produce exact
+  payload
+  `{"abi_tuple_schema":1,"arity":0,"calling_convention":"c","parameter_types":[],"prototype_kind":"void","return_type":"bool","variadic":false}\n`
+  (141 bytes) and framed digest
+  `d53e301357f4fd5f53d2c51e68c0dd88b3dc8c61917c35752947f785fff1d85b`.
+  Crossed refusals cover missing `desugaredQualType` with `qualType='bool'`,
+  caller substitution of `_Bool` for the observed durable `bool`, `bool` from
+  an unbound tool/preamble or non-production fake, and every remaining source
+  alias token in a mandatory field. A complete token such as `boolish` is not
+  this exception and is handled by ordinary C type/name validation.
 
   Typedef-insensitive ABI vectors are normative. Each pair produces byte-equal
   tuple payloads even though owner spelling emission remains different:
@@ -692,7 +861,7 @@ receipt hashing, and receipt revalidation into the gate and driver.
 - `owner_binding_sha256` hashes canonical JSON containing schema, symbol,
   record fields, spelling-preserving canonical prototype, exact `AbiTuple`
   payload and framed digest, both embedded preamble constant digests/lengths,
-  the owner-only parameter/return probe-source digests, parser identity,
+  the complete owner-only `AbiProbeEvidence`, parser identity,
   path/range, whole-file digest, and range digest. It never includes a caller
   variant or pairwise compatibility result. `relevant_catalog_sha256` hashes
   only sorted bindings for symbols relevant to the bundle; `registry_sha256`
@@ -740,41 +909,390 @@ receipt hashing, and receipt revalidation into the gate and driver.
   visibility, and role. `analyze_composition` requires exactly one observation
   for every plan, no unplanned object, matching object digest/path, and a
   successful inspector receipt before it creates an object manifest.
-- `ToolOutcome` is a closed union of completed compile, link, instantiate,
-  and smoke results or typed execution faults. Completed diagnostic records
-  retain stage, exit status, stdout/stderr digests, parsed symbol, named input
-  object, and parser version. The module correlates a symbol only to manifests
-  that define or import it; it never copies the whole window into
+- `InspectorReceipt` is exactly `{execution_completed: bool, success: bool,
+  exit_status: int|null, stdout_sha256: sha256|null, stderr_sha256:
+  sha256|null, parser_version: nonempty string, fault_class:
+  null|'spawn'|'timeout'|'crash'|'io', diagnostic_sha256: sha256|null}`.
+  Success requires `execution_completed=true`, `exit_status=0`, both stream
+  digests, `fault_class=null`, and `diagnostic_sha256=null`. A completed
+  failure requires integer exit status, both stream digests, null fault, and a
+  diagnostic digest. An execution fault requires completed/success false,
+  null exit status, a named fault and diagnostic digest; stream digests hash
+  captured partial bytes when present. Every other combination refuses.
+- `StageChildReceipt` is the exact closed object `{stage_child_receipt_schema:
+  1, child_ordinal: nonnegative-int, object_ordinal: nonnegative-int, unit:
+  nonempty string, stage: 'compile'|'inspect', terminal: bool, argv:
+  nonempty list[string], object_relpath: owned relative string, input_sha256:
+  sha256, object_sha256: sha256|null, state:
+  'passed'|'failed'|'faulted', execution_completed: bool, exit_status:
+  int|null, stdout_size: nonnegative-int, stdout_sha256: sha256,
+  stderr_size: nonnegative-int, stderr_sha256: sha256, parser_version:
+  nonempty string, diagnostic_sha256: sha256|null, symbol: C identifier|null,
+  fault_class: null|'spawn'|'timeout'|'crash'|'io'|'lock'|'stable_read'}`.
+  `input_sha256` is the derived-source digest for compile and the stable input-
+  object digest for inspect. Compile pass requires `object_sha256`; compile
+  failure/fault permits it only when a stable ordinary output was actually
+  observed. Inspect always requires `object_sha256=input_sha256`. Pass requires
+  completed true, exit zero, null diagnostic/symbol/fault; failed requires
+  completed true, integer exit, nonnull diagnostic, null fault; faulted requires
+  completed false, null exit, nonnull diagnostic/fault. Stream size/digest bind
+  the exact raw bytes captured even for a fault; zero bytes use SHA-256 of empty
+  bytes, never null. A diagnostic parser may set one symbol only on failed/
+  faulted children.
+- A compile/inspect child list is nonempty, `child_ordinal` is exactly its
+  zero-based position, `object_ordinal`/path/unit are unique and follow the
+  plan order, and exactly its last child has `terminal=true`. All children
+  before the terminal are `passed`; the terminal is `passed` iff the aggregate
+  stage passed, otherwise it alone is `failed|faulted`. Execution stops there.
+  The closed transcript is exact `{stage_child_transcript_schema: 1, stage:
+  'compile'|'inspect', children: list[StageChildReceipt]}` serialized as
+  canonical compact sorted-key UTF-8 JSON plus LF; its SHA-256 is
+  `child_transcript_sha256`.
+- Aggregate stream preimages are independently exact canonical JSON plus LF:
+  `{stage_stream_schema: 1, stage, stream: 'stdout'|'stderr', children:
+  list[{child_ordinal, size, sha256}]}` in child order. The StageReceipt stream
+  digest is the SHA-256 of that preimage, not concatenated raw bytes. Its exit,
+  completed, parser, diagnostic, symbol, and fault fields equal the terminal
+  child's fields; `named_object_relpaths` is every child path in order. Thus
+  result/retry IDs bind both raw-child digests and transcript structure without
+  depending on process buffering.
+- `StageReceipt` is exact `{stage_receipt_schema: 1, stage:
+  'compile'|'inspect'|'link'|'instantiate'|'smoke', state:
+  'not_run'|'passed'|'failed'|'faulted', execution_completed: bool,
+  exit_status: int|null, stdout_sha256: sha256|null, stderr_sha256: sha256|null,
+  parser_version: nonempty string|null, diagnostic_sha256: sha256|null,
+  symbol: C identifier|null, named_object_relpaths: list[owned relative string],
+  fault_class: null|'spawn'|'timeout'|'crash'|'io'|'lock'|'stable_read',
+  child_receipts: list[StageChildReceipt], child_transcript_sha256:
+  sha256|null}`.
+  Object paths are unique in plan order. A compile receipt names exactly the
+  attempted translation-unit objects through its terminal child; inspect names
+  exactly the inspected objects through its terminal child; link names every
+  ordered link input; instantiate/smoke name `[]`. `not_run` always has `[]`.
+  `symbol` is null on pass/not-run and for instantiate/smoke; on a failed or
+  faulted compile/inspect/link receipt it is either the single identifier
+  parsed from that stage's diagnostic or null. Compile/inspect require the
+  exact nonempty child list/transcript and aggregates above whenever attempted;
+  all other stages and every `not_run` receipt require `child_receipts=[]` and
+  null transcript. `exit_status` is zero on aggregate pass or the terminal
+  child status on completed failure.
+- The per-receipt truth matrix is closed: `not_run` means completed false and
+  every evidence field null/empty; `passed` means completed true, exit zero,
+  both stream digests and parser version present, diagnostic/fault null;
+  `failed` means completed true, integer exit (zero is allowed for a semantic
+  parser/smoke failure), both stream digests/parser/diagnostic present and fault
+  null; `faulted` means completed false, exit null, parser/diagnostic/fault
+  present, with nullable stream digests only for captured partial bytes. No
+  other null/value combination is valid.
+- `ToolOutcome` is exactly `{tool_outcome_schema: 1, receipts:
+  [StageReceipt,StageReceipt,StageReceipt,StageReceipt,StageReceipt]}` in fixed
+  stage order compile, inspect, link, instantiate, smoke. A pass has all five
+  receipts `passed`. A non-pass has zero or more prior `passed` receipts, then
+  exactly one first `failed|faulted` attempted stage, then only `not_run`.
+  Skips, a passed stage after a non-pass, two attempted failures, wrong order,
+  unknown keys/enums, or bool-as-int refuses. Outcome classification/stage/code
+  are derived from this tuple and normalized diagnostic parsing; no lossy
+  linked/instantiated/smoke booleans exist. The module correlates a symbol only
+  to manifests that define or import it; it never copies the whole window into
   `conflict.units`.
+
+  Normative state vectors use `P=passed`, `F=failed`, `X=faulted`, `N=not_run`:
+
+  | result / terminal stage | compile | inspect | link | instantiate | smoke |
+  |---|---|---|---|---|---|
+  | pass | P | P | P | P | P |
+  | compile completed/fault | F/X | N | N | N | N |
+  | inspect completed/fault | P | F/X | N | N | N |
+  | link completed/fault | P | P | F/X | N | N |
+  | instantiate completed/fault | P | P | P | F/X | N |
+  | smoke completed/fault | P | P | P | P | F/X |
+
+  Tests instantiate both `F` and `X` for every terminal row and the exact field
+  matrix for every cell. The exhaustive refusal set is the complement of these
+  eleven vectors: any reordered/short/long tuple, `N` before `P`, `P` after
+  `F|X`, two `F|X`, or field/state violation must refuse before hashing.
+  The assembly retry fingerprint includes every nonnull
+  `child_transcript_sha256` in stage order in addition to the aggregate stage
+  fields, so changing argv/object/raw-stream evidence changes result ID and
+  retry identity.
+
+  Normative child vectors use this exact generator contract, not host process
+  output. For child `i`, unit is `synthetic-u<i>`, path is `obj/<i>.o`, input
+  digest is SHA-256 of ASCII `<stage>:input:<i>`, and compile object digest on
+  pass is SHA-256 of ASCII `compile:object:<i>`; inspect object digest equals
+  its input digest. Compile argv is exactly `['emcc','-c','u<i>.c','-o',path]`;
+  inspect argv is `['llvm-nm',path]`. Raw stream bytes are UTF-8 ASCII
+  `<stage>:<stream>:<i>:<state>\n`. Parser version is
+  `synthetic-<stage>-parser-v1`. Failed/faulted diagnostic digest is SHA-256 of
+  ASCII `<stage>:diagnostic:<i>:<state>`, symbol is `bad_symbol`; completed
+  failure exit is 2, and fault is `timeout`. The following 12 rows give
+  transcript byte count/digest and aggregate stdout/stderr digests:
+
+  | stage | children/states | transcript bytes / SHA-256 | stdout SHA-256 | stderr SHA-256 |
+  |---|---|---|---|---|
+  | compile | 1 / P | `793 / 79c076271b1b98f935eaa39743cb853295d3b785d91b7dfe90d345f6f7479e4f` | `d33a223670cffdc68f5f51af4d3b821abe3fa1fa703a485b7b7a5959c35ac27f` | `b116c438f4bcea2ac63b2ebfddaa247a3e1d72eeb3564ffc5262a9072c82d970` |
+  | compile | 1 / F | `801 / 3af9ef3f51f1a70c2550c1a5b6f48b3c2e82f3aacf81ff42b3add58f2ac225b2` | `2ef81149897af5e05ba6bf4f1a697e68a07f26eb2d7dc86430583b0d3c7d576a` | `f9383afa6d133c9e2c30a3d453510857fb6c0f587ab1094bb3a75dc2925cd2d6` |
+  | compile | 1 / X | `811 / 7b8afc5d68acf223f4ed13075a538e12853263b047800a4a5793a766217b4bd7` | `48d2eca464c3b455ab6eaa0841a1e5e06883866df0928e10615429d279a3d021` | `86a2506daa0b66a6c44105ff9cae49e6a7bf1594bf22639cbc2b8c09d2dd2b3f` |
+  | compile | 2 / PP | `1520 / 13c20432c56b218755e17b2e57cf1dad1df16177e50afb8abd3849e412d6f80c` | `387b91409407d15b6eb8425ad050fcdddd4489b665b30a760e88c2972790e15b` | `6704730c1fc47c1c1b716767500a880bae53f228313af769228d2e50e52dcd38` |
+  | compile | 2 / PF | `1528 / 8da406382d8272ba2a8b50367baa72977141ed365e5e8d61b7b810accbed313c` | `7e3f04cb5c417c16e04458cf643be87d6c006d0b505f9e5cade8f6d4127fd111` | `9aa670d5a0a5efe680d8905cc8934166c349edda99674d96513b3f10aff13e5e` |
+  | compile | 2 / PX | `1538 / 660f97017cfbf93fd805ceac8d2f0a32aaa5fe4d510bbf7d00d96aa1795d2ad8` | `2c07c78ecbb1d7315d040bd5f251df6e115805d9c57dcf73e1735ca598c97808` | `f6185a8b985f964e4befb06740509d581ee2173e4ef204cde557b9c7cb5fa163` |
+  | inspect | 1 / P | `779 / 0e306c34ee6daf6b7c031d4f94b26db064e41836a22cfa022d24c3252e144ed4` | `f046343904baef900e5b5279edfe4b4b0b823489a76d4c772cb43f8fe2bf6489` | `8a3a35e24d043e63dec034f478051c5cae3784c838fac7cc05d4a5b64cdd1c57` |
+  | inspect | 1 / F | `849 / ff6ef02cf81a1c0b04b1ff65c5258c73c3df390f13797468a7c41a7ed03b300d` | `f43dc2f2bbb805194e45dcf50947dd3d36fde9c7d4af3da897627b333e88c872` | `f91dd727681720968f654926d7056963c7e21055e53f3c5e9994aad5fd5cd7bd` |
+  | inspect | 1 / X | `859 / b1a469e9c67b44b286cabcfa78d1d7d47fdf98a9580889b912221e0bdc03abfb` | `5f0939e61fb6b572e395fd18c936877f62f62fe11507195b36338bd09edfb54d` | `6e25aea57e357d374b4016e5fab61b9b639dda3ad851f5e458f7b349b52c7e27` |
+  | inspect | 2 / PP | `1492 / 41210c875d75be710ef3974f31083c50b1a197131f70a25e7ae3282026cb47e1` | `21830a6728634ebfc130a3095fccdf463f388584fa2d48835b292bb3122ec00f` | `19da7f3fb33a901ad9d4595fb9e3c8c4268479321cb4bacf2dc16c85194633ed` |
+  | inspect | 2 / PF | `1562 / 26bda588a97ad331232122b4efc00502f1ec6fc456373be581dabcb64a867e19` | `fb6fbf8f81ab217033a5cdaa87d5d33aac763912647f57aa64533d02c9f618de` | `61481a06e7c22b650ede1dbecc148fb379e1b2ae8daacc7a26b3173677ecf91e` |
+  | inspect | 2 / PX | `1572 / 95e8fe238d044bd3da26b8b1573a1f9e117e4d529cbed356d6407e1c4f74108b` | `05e648cd2fa28862a6ca4aac9d423aa4262536571917bafa2cd5f24d2c3e924e` | `6026580853f11064c37617771fdfd791e1dfd4dc1aeea90486e5d938e4697bbf` |
+
+  For example, the exact 1,528-byte compile/PF transcript is this JSON plus LF:
+
+  ```json
+  {"children":[{"argv":["emcc","-c","u0.c","-o","obj/0.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_ordinal":0,"object_relpath":"obj/0.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"489c910c843de67b128b684c849067771b91af854bab5e5599c34cf58a75b8bb","stderr_size":24,"stdout_sha256":"85e982a9556993ee56418312a4e626c3ba1e0fa5605d724c95fc593b7ddf67f7","stdout_size":24,"symbol":null,"terminal":false,"unit":"synthetic-u0"},{"argv":["emcc","-c","u1.c","-o","obj/1.o"],"child_ordinal":1,"diagnostic_sha256":"aa4913c93bd2fda45cb32a01e43406e1f3448f9cd09aa2f7143dcb2bbb1f7794","execution_completed":true,"exit_status":2,"fault_class":null,"input_sha256":"92a7e969bf98307740452ebf1e0209cea684ec1e6837ce498a5796efcb2937ef","object_ordinal":1,"object_relpath":"obj/1.o","object_sha256":null,"parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_child_receipt_schema":1,"state":"failed","stderr_sha256":"3bb7b40b4308616b587f3a8f96278d884269a7aaba76c885ef7a8d28a6b17644","stderr_size":24,"stdout_sha256":"c742ef1c667bb7f941cd4e1f0e69fa883567258984f29de2ec26596e87670a11","stdout_size":24,"symbol":"bad_symbol","terminal":true,"unit":"synthetic-u1"}],"stage":"compile","stage_child_transcript_schema":1}
+  ```
+
+  Tests reconstruct all twelve byte streams and refuse an extra/missing child,
+  duplicate/out-of-order ordinal/path, nonterminal stop, multiple terminals,
+  child after terminal, prior non-pass, stage/argv/path/digest mismatch, raw
+  size/digest mismatch, aggregate mismatch, or transcript mismatch.
 - A symbol contributor records unit/object identity and digest, role
   (`definition` or `import`), and canonical ABI shape. A symbol-less
   diagnostic remains `unattributed` with the full object inventory. A
   completed but unparseable diagnostic or completed inspection lacking the
   required symbol/type data is deterministic
   `object-attribution-unavailable`; an inspector execution/I/O fault is the
-  transient class defined below. Neither may fabricate contributors.
+  transient class defined below. `SymbolObservation.visibility` is exactly
+  `default|hidden`; no other spelling is accepted. If any object needed for a
+  symbol correlation has null/missing ABI evidence, the result is globally
+  unattributed with **zero** contributors, never a partial contributor list.
+  Neither case may fabricate contributors.
 
 ### 5. Composition retry identity and retained candidate
 
 On any composition outcome, retain the owned promotion attempt and candidate.
-`assembly_world_sha256` hashes canonical JSON containing candidate artifact,
-source and header digests; ordered window artifact identities; relevant owner
-bindings; ordered `CompatibilityEvidence` including exact compatibility-source
-digests/results; canonicalization/result schema versions; ordered per-stage
-argv and environment allowlist; driver assembly implementation revision; and
-every tool identity. A tool identity is its resolved absolute ordinary-file path,
-stable file SHA-256, version output digest, and role. The compiler identity
-binds `emcc` plus resolved Clang and `wasm-ld`; the inspector binds the exact
-`llvm-nm`-compatible executable and parser version; the runtime binds Node's
-executable/version/file digest; and smoke binds the exact script bytes/digest.
-PATH-only names, implicit flags, an unrecorded environment option, or a
-different compile/link/instantiate/smoke argv are refusals.
+`ToolWorldPreimage` is the exact closed object `{tool_world_schema: 1,
+identities: list[exact {role:
+'clang'|'emcc'|'node'|'object-inspector'|'smoke-script'|'wasm-ld',
+resolved_path: absolute ordinary-file string, file_sha256: sha256,
+version_sha256: sha256}], argv: exact {compile: list[list[string]], inspect:
+list[list[string]], link: list[string], instantiate: list[string], smoke:
+list[string]}, environment: list[exact {name: string, value_sha256: sha256}]}`.
+Identities sort by role, environment by name, compile/inspect remain exact plan
+order, and the other argv lists are semantic order. `tool_world_sha256` is the
+SHA-256 of this canonical JSON plus LF. The result's `tool_world` is exactly the
+preimage plus that digest; it has no assembly/candidate fields.
 
-`assembly_retry_fingerprint` hashes the world digest plus normalized decision,
-conflict symbols/classes/variants, contributor object digests, and completed
-diagnostic digests. Only relevant bindings enter the world: unrelated owner
-records and the advisory registry do not. A full-registry digest change alone
-does not reopen a blocker.
+`AssemblyWorldPreimage` is the exact closed object `{assembly_world_schema: 1,
+candidate: Candidate, window: list[WindowItem], relevant_owner_bindings:
+list[exact {symbol: C identifier, owner_binding_sha256: sha256}],
+compatibility_checks: list[CompatibilityEvidence],
+abi_probe_evidence_sha256s: list[exact {symbol: C identifier,
+abi_probe_evidence_sha256: sha256}], schema_versions: exact
+{assembly_result_schema: 1, canonicalization_schema: 1,
+compatibility_schema: 1, oracle_registry_schema: 1}, implementation: exact
+{assembly_module_revision: nonempty string, driver_revision: nonempty string},
+tool_world_sha256: sha256}`. The candidate/window use their reusable exact
+shapes; the three evidence lists use their previously defined sort orders and
+reject duplicate symbols/variants. `assembly_world_sha256` is the SHA-256 of
+this canonical JSON plus LF. It is broad and never recomputed from `tool_world`
+alone. Unknown/missing keys, wrong schema/types/order, implicit PATH names,
+unrecorded environment, or a changed argv/ref/evidence/implementation refuses.
+The compiler identity binds `emcc`, Clang and `wasm-ld`; inspector binds its
+executable/parser; runtime binds Node; smoke binds exact script bytes.
+
+Normative world vectors use canonical UTF-8 bytes exactly as shown plus one LF.
+The 1,771-byte `ToolWorldPreimage` is:
+
+```json
+{"argv":{"compile":[["emcc","-c","candidate.c","-o","candidate.o"]],"inspect":[["llvm-nm","candidate.o"]],"instantiate":["node","instantiate.js","candidate.wasm"],"link":["emcc","candidate.o","-o","candidate.wasm"],"smoke":["node","smoke.js","candidate.wasm"]},"environment":[{"name":"EMSDK","value_sha256":"3131313131313131313131313131313131313131313131313131313131313131"}],"identities":[{"file_sha256":"1111111111111111111111111111111111111111111111111111111111111111","resolved_path":"D:/synthetic/clang.exe","role":"clang","version_sha256":"2121212121212121212121212121212121212121212121212121212121212121"},{"file_sha256":"1212121212121212121212121212121212121212121212121212121212121212","resolved_path":"D:/synthetic/emcc.bat","role":"emcc","version_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},{"file_sha256":"1313131313131313131313131313131313131313131313131313131313131313","resolved_path":"D:/synthetic/node.exe","role":"node","version_sha256":"2323232323232323232323232323232323232323232323232323232323232323"},{"file_sha256":"1414141414141414141414141414141414141414141414141414141414141414","resolved_path":"D:/synthetic/llvm-nm.exe","role":"object-inspector","version_sha256":"2424242424242424242424242424242424242424242424242424242424242424"},{"file_sha256":"1515151515151515151515151515151515151515151515151515151515151515","resolved_path":"D:/synthetic/smoke.js","role":"smoke-script","version_sha256":"2525252525252525252525252525252525252525252525252525252525252525"},{"file_sha256":"1616161616161616161616161616161616161616161616161616161616161616","resolved_path":"D:/synthetic/wasm-ld.exe","role":"wasm-ld","version_sha256":"2626262626262626262626262626262626262626262626262626262626262626"}],"tool_world_schema":1}
+```
+
+Its digest is `1ce523c15a3d30aafba7e59d93848de812cb5225495175e3554fba3b8f89b5d7`.
+The corresponding 776-byte `AssemblyWorldPreimage` is:
+
+```json
+{"abi_probe_evidence_sha256s":[],"assembly_world_schema":1,"candidate":{"artifact_relpath":"candidate/candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"header_sha256":"4343434343434343434343434343434343434343434343434343434343434343","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"compatibility_checks":[],"implementation":{"assembly_module_revision":"synthetic-module-v1","driver_revision":"synthetic-driver-v1"},"relevant_owner_bindings":[],"schema_versions":{"assembly_result_schema":1,"canonicalization_schema":1,"compatibility_schema":1,"oracle_registry_schema":1},"tool_world_sha256":"1ce523c15a3d30aafba7e59d93848de812cb5225495175e3554fba3b8f89b5d7","window":[]}
+```
+
+Its digest is `496bc357be857357f7377a63a012fc91491def0c3740460af6c7188792f130bc`.
+Changing only Node `version_sha256` from repeated `23` to repeated `27` keeps
+both payload lengths 1,771/776, changes the tool digest to
+`f8731b73c66514bf126ec2880e4ff3e4fb487d3d8314332332d1c514a0b897bf`
+and, after substituting only that digest, changes assembly to
+`376296a0c2a54cfef787f7e9fabd5866aad97dcbbade954a87a306e3b93e27b6`.
+Changing only candidate `artifact_sha256` from repeated `41` to repeated `44`
+leaves tool digest `1ce523c1...b5d7` unchanged and changes only assembly to
+`c4ccdfaeda65f828060bb2acb693c8dc16478d85ce45018dd77a7b7f3366e059`.
+Tests reconstruct full bytes before hashes and refuse every unknown/missing/
+wrong-type field or noncanonical collection order.
+
+`StageTranscriptRef` is exact `{stage: 'compile'|'inspect',
+child_transcript_sha256: sha256}`. It lists only nonnull child transcripts in
+stage order. `AssemblyRetryFingerprintPreimage` is the exact closed object
+`{assembly_retry_fingerprint_schema: 1, assembly_world_sha256: sha256,
+classification: 'pass'|'deterministic_blocker'|'transient_fault', stage:
+'owner'|'canonicalize'|'materialize'|'compile'|'inspect'|'link'|'instantiate'|
+'smoke'|'revalidate'|'internal', code: nonempty string, evidence_sha256:
+sha256|null, contributors: list[Contributor], unattributed: bool,
+stage_transcripts: list[StageTranscriptRef]}`. Contributors and transcript refs
+use their existing unique canonical orders. `evidence_sha256` is null only for
+pass, the final normalized diagnostic digest for a deterministic blocker, and
+the exact `transient_fault_fingerprint` for a transient fault.
+`assembly_retry_fingerprint` is SHA-256 of canonical compact sorted-key UTF-8
+JSON plus LF for that object. Unknown/missing keys, wrong enums/order, duplicate
+contributors/transcripts, or an outcome/preimage mismatch refuses.
+
+`TransientFaultFingerprintPreimage` is exact
+`{transient_fault_fingerprint_schema: 1, assembly_world_sha256: sha256,
+candidate_sha256: sha256, stage: 'owner'|'canonicalize'|'materialize'|'compile'|
+'inspect'|'link'|'instantiate'|'smoke'|'revalidate'|'internal', code: nonempty
+string, fault_class: 'spawn'|'timeout'|'crash'|'io'|'lock'|'stable_read',
+tool_role: null|'emcc'|'object-inspector'|'node'}`.
+`candidate_sha256` is exactly `scaffold.candidate.artifact_sha256`; source and
+header digests remain separately bound through the assembly world and may not
+substitute here. Tool role is a total finalizer-owned projection of the
+attempted stage:
+
+| stage | exact `tool_role` |
+|---|---|
+| `owner`, `canonicalize`, `materialize`, `revalidate`, `internal` | null |
+| `compile` | `emcc` |
+| `inspect` | `object-inspector` |
+| `link` | `emcc` |
+| `instantiate` | `node` |
+| `smoke` | `node` |
+
+The launched adapter owns the role: `wasm-ld` and `smoke-script` remain bound
+tool-world identities but are never transient adapter roles. A link fault is
+therefore `emcc`, not `wasm-ld`; a smoke fault is `node`, not `smoke-script`.
+The gate reports typed attempted stage/fault evidence; the pure finalizer
+derives this table and refuses any caller-supplied or observed crossed role.
+It deliberately excludes raw diagnostic text,
+clock, attempt/count/backoff and check/observation digests, so the same
+normalized fault advances rather than resetting. Its canonical JSON plus LF
+hash is `transient_fault_fingerprint`. Only relevant bindings enter the world:
+unrelated owner records and the advisory registry do not. A full-registry
+digest change alone does not reopen a blocker.
+
+`RetryHistory` is exact `{history_schema: 1, prior_transient_fingerprint:
+sha256|null, completed_transient_attempts: 0|1|2|3}`. Its canonical JSON plus
+LF SHA-256 is `retry_history_sha256`; a positive count requires a nonnull prior
+fingerprint. It comes only from the
+driver's validated durable prior results. The driver owns storage and sleeping;
+it cannot choose classification or hashes. The module validates history and,
+for the same current transient fingerprint, maps prior count `0 ->
+(1,30,'transient_retry')`, `1 -> (2,120,'transient_retry')`, `2 ->
+(3,600,'transient_retry')`, and `3 ->
+(3,null,'assembly_transient_exhausted')`. A different/null fingerprint resets
+the effective prior count to zero. Malformed, future-schema, negative, or
+count/fingerprint-inconsistent history refuses. Pass/deterministic outcomes
+emit their fixed null/zero retry fields independent of stale transient history.
+
+#### Normative retry fingerprint and history vectors
+
+#### Pass assembly retry
+
+```json
+{"assembly_retry_fingerprint_schema":1,"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","classification":"pass","code":"pass","contributors":[],"evidence_sha256":null,"stage":"smoke","stage_transcripts":[{"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","stage":"compile"},{"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","stage":"inspect"}],"unattributed":false}
+```
+
+Bytes/hash: `495 / b37031144deaa31b131447f2938b2293caec39f5e9f3dcca0617422b9ec93164`.
+
+#### Tool non-pass assembly retry
+
+```json
+{"assembly_retry_fingerprint_schema":1,"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","classification":"deterministic_blocker","code":"link_failed","contributors":[],"evidence_sha256":"851f979c3701c10cee340cfa30875d5995909faee390513106fab27d26b8fdd6","stage":"link","stage_transcripts":[{"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","stage":"compile"},{"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","stage":"inspect"}],"unattributed":true}
+```
+
+Bytes/hash: `579 / 6292936147b9211849c805a7bd6cc01f13bd006ff0f60ae69628992020417a9e`.
+
+#### Deterministic pre-publication retry
+
+```json
+{"assembly_retry_fingerprint_schema":1,"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","classification":"deterministic_blocker","code":"owner_changed","contributors":[],"evidence_sha256":"636ec1a7f9396e105e53491352f30f91426bf6b3dfb079ea7688e407ba389aba","stage":"revalidate","stage_transcripts":[{"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","stage":"compile"},{"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","stage":"inspect"}],"unattributed":true}
+```
+
+Bytes/hash: `587 / b898e560c2dacb3d5221649b1d64a7cb123a0e84c112e073988ffe72c7064846`.
+
+#### Transient fault identity
+
+```json
+{"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","candidate_sha256":"4141414141414141414141414141414141414141414141414141414141414141","code":"stable_read_fault","fault_class":"stable_read","stage":"revalidate","tool_role":null,"transient_fault_fingerprint_schema":1}
+```
+
+Bytes/hash: `311 / 5200c61f3b31b5b0a561bfd616c9628c0a03430f4c0a0f82826c18a755457f2a`.
+
+The following ambiguous-stage vectors use the same exact world and Candidate
+artifact digest. They prove the total adapter-role projection:
+
+#### compile transient adapter role
+
+```json
+{"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","candidate_sha256":"4141414141414141414141414141414141414141414141414141414141414141","code":"compile_timeout","fault_class":"timeout","stage":"compile","tool_role":"emcc","transient_fault_fingerprint_schema":1}
+```
+
+Bytes/hash: `304 / e160a4cdf08620333f62dbe127e89e7004b39401046340cc2e3f4a6dbcf66d1d`.
+
+#### link transient adapter role
+
+```json
+{"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","candidate_sha256":"4141414141414141414141414141414141414141414141414141414141414141","code":"link_timeout","fault_class":"timeout","stage":"link","tool_role":"emcc","transient_fault_fingerprint_schema":1}
+```
+
+Bytes/hash: `298 / 4a1d5a6a7c2caf1847ed6e1bd1bf66058ec766c3f4a29e4ed6cce8672243374f`.
+
+#### instantiate transient adapter role
+
+```json
+{"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","candidate_sha256":"4141414141414141414141414141414141414141414141414141414141414141","code":"instantiate_timeout","fault_class":"timeout","stage":"instantiate","tool_role":"node","transient_fault_fingerprint_schema":1}
+```
+
+Bytes/hash: `312 / b7ec8759bd43168f719ee347bda230df312b1b6b54453ac35eb9d3ded18590b4`.
+
+#### smoke transient adapter role
+
+```json
+{"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","candidate_sha256":"4141414141414141414141414141414141414141414141414141414141414141","code":"smoke_timeout","fault_class":"timeout","stage":"smoke","tool_role":"node","transient_fault_fingerprint_schema":1}
+```
+
+Bytes/hash: `300 / 8c883f29210350f9773917ff34e33c2f07c9061effb297e6981d8137cb05fa2f`.
+
+Crossed-role refusals cover every non-table pair, including compile/node,
+inspect/emcc, link/wasm-ld, link/node, instantiate/emcc, smoke/smoke-script,
+smoke/emcc, and every nonnull role on an early/revalidate/internal stage.
+Substituting Candidate source/header digest for artifact digest also refuses.
+
+#### Transient assembly retry
+
+```json
+{"assembly_retry_fingerprint_schema":1,"assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","classification":"transient_fault","code":"stable_read_fault","contributors":[],"evidence_sha256":"5200c61f3b31b5b0a561bfd616c9628c0a03430f4c0a0f82826c18a755457f2a","stage":"revalidate","stage_transcripts":[{"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","stage":"compile"},{"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","stage":"inspect"}],"unattributed":true}
+```
+
+Bytes/hash: `585 / 0d5e000eb991471ed939846165d13d0616275c86ca36df485d1bdd941b97c81c`.
+
+The identical transient refusal advances only from durable history:
+
+| prior history bytes / SHA-256 | emitted count / backoff / status | emitted result_id |
+|---|---|---|
+| `89 / 53baf513a523c322f7ddae9ac2645f8960908cc16e3e2ba808baf2754c52b7dd` | `1 / 30 / transient_retry` | `32f2f5c141bfbd75e387e70b9e0db776c0dcd93cea0f22797da34e799b816056` |
+| `151 / afa81cd0efc31f94c70d0929836a412f0ebf7375b13f1f8b8c9348880f58351d` | `2 / 120 / transient_retry` | `c26d66010b1990a4d36ef00434c69434c946f9bfb9b5e5c70e8b31379419dd3f` |
+| `151 / a851fbc456f8fc7bcd91ff2bf9c424addd5f4bbe6396dd5a311790e4268f7774` | `3 / 600 / transient_retry` | `1d8fd0422404bd67aa8e98ef213c5232e66e360d9543ba037ba906020b154170` |
+| `151 / 785c9881b21e62cb0400fed221d1d1f19552ff46c457e6ea1d4a8afc1347c0ae` | `3 / null / assembly_transient_exhausted` | `e75ac59c25a4d1695cae5be22e20d3b2d273297ecaa333aa115f42b70b0d6897` |
+
+The deterministic vector always emits `waiting_assembly_world_change`, count 0 and null transient/backoff fields for every valid history; its assembly retry fingerprint is `b898e560c2dacb3d5221649b1d64a7cb123a0e84c112e073988ffe72c7064846`. The transient fingerprint is `5200c61f3b31b5b0a561bfd616c9628c0a03430f4c0a0f82826c18a755457f2a`, and repeated transient assembly fingerprint remains `0d5e000eb991471ed939846165d13d0616275c86ca36df485d1bdd941b97c81c` across all four rows.
+
+Changing only the compile transcript ref from
+`5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87`
+to repeated `aa` leaves the transient fault fingerprint unchanged, changes
+the transient assembly preimage digest to
+`5524da65b3fed9def49091168cdfbc3891e0a51b4f4c489c2b145429cd306111`,
+and therefore changes the result ID. Tests reconstruct the literal preimages,
+all history hashes/rows and this mutation. Exact changed-fingerprint history
+`{"completed_transient_attempts":1,"history_schema":1,
+"prior_transient_fingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}`
+plus LF is 151 bytes / SHA-256
+`628186e9735fcefb168eab2f5cd1b508c91b21cebc0c8d94a234d07a2b3ce4a8`;
+it resets to count 1/backoff 30 and result ID
+`32f2f5c141bfbd75e387e70b9e0db776c0dcd93cea0f22797da34e799b816056`,
+while a same fingerprint advances.
 
 Outcomes have two disjoint recovery classes:
 
@@ -806,6 +1324,193 @@ enforced by a driver state-machine branch that has no model/diagnosis
 dependency.
 
 ### 6. Journal, promotion, and behavior tiers
+
+Receipt stages are a closed matrix. `pre-compile` accepts only the plan's
+`CanonicalizationReceipt` and requires empty object bindings because no tool
+has run. `pre-publication` accepts only the draft's `CompositionReceipt` and
+requires the exact ordinal/path/digest `ObjectObservation` set plus bound tool
+world; a bare canonicalization receipt or empty/partial object bindings refuses
+`composition_receipt_required`. The receipts are not interchangeable even when
+their owner/catalog fields match.
+
+Every revalidation attempt canonically hashes exact `{stage, receipt_sha256,
+observation_sha256, passed, refusal_code}` as `check_sha256`; `refusal_code` is
+null only on pass. `RevalidationCheck` is exactly those five fields plus
+`check_sha256`. A successful `RevalidatedReceipt` contains a passing check; a
+revalidation `AssemblyAbiRefusal` contains a non-passing check. Both bind the
+same receipt/observation/stage fields.
+
+`ResultScaffold` is the exact nine-key projection of the final 13-key result
+excluding `result_id`, `outcome`, `revalidation`, and `retry`: it contains
+`assembly_result_schema=1`, unit, attempt, candidate, window, behavior tier,
+canonicalization, objects, and tool_world in their exact shapes below.
+`OutcomeProjection` is the exact seven-key result `outcome` object defined below.
+`CompositionDraft` is exact `{composition_draft_schema: 1, scaffold:
+ResultScaffold, analyzed_outcome: OutcomeProjection, composition_receipt:
+CompositionReceipt, retry_history_sha256: sha256}`. `FailureEvidence` is exact
+`{stage: 'owner'|'canonicalize'|'materialize', classification:
+'deterministic_blocker'|'transient_fault', code: nonempty string,
+diagnostic_sha256: sha256, fault_class:
+null|'spawn'|'timeout'|'crash'|'io'|'lock'|'stable_read'}`. Deterministic
+requires null fault and transient requires nonnull fault.
+
+`RevalidationFailure` is exact `{stage: 'revalidate', classification:
+'deterministic_blocker'|'transient_fault', code: nonempty string,
+diagnostic_sha256: sha256, check_sha256: sha256, fault_class:
+null|'io'|'lock'|'stable_read'}`. Deterministic requires null fault; transient
+requires a nonnull fault. Its code and check digest
+must equal the attached failed `RevalidationCheck`; it is not a second source
+of truth. All inputs carry a valid exact `tool_world` and `RetryHistory` even
+when tools were not invoked; only the finalizer binds the final retry output.
+
+`PrePublicationDecision` is a closed tagged union:
+
+- `{status: 'not_reached', check: null, failure: null}`;
+- `{status: 'passed', check: RevalidationCheck(passed=true), failure: null}`;
+- `{status: 'refused', check: RevalidationCheck(passed=false), failure:
+  RevalidationFailure}`.
+
+The refused member requires identical `check_sha256` and refusal code in both
+nested objects and a real nonnull diagnostic digest in the failure. No-check or
+passing decisions require failure null. Unknown keys/statuses and every crossed
+combination refuse before the result projection is hashed.
+For `not_reached`, the finalizer retains the draft's non-pass outcome. For
+`passed`, it requires the draft outcome to pass and retains it. For `refused`,
+it requires the draft tool tuple to pass, replaces classification/code/
+diagnostic from the `RevalidationFailure`, fixes stage to `revalidate`, retains
+the complete stage-receipt tuple, and emits `contributors=[]` and
+`unattributed=true`; no object is falsely blamed for a product re-read failure.
+
+`FinalizationInput` is one closed tagged union; unknown keys are refused:
+
+- `PreDraftFailureInput` = `{finalization_input_schema: 1, kind:
+  'pre_draft_failure', scaffold: ResultScaffold, failure: FailureEvidence,
+  retry_history: RetryHistory, pre_compile: null, pre_publication: null}`.
+  Objects and all tool receipts are empty/not-run. Owner failure requires canonicalization `not_started`,
+  canonicalize failure requires `failed`, and materialize failure requires
+  `planned`; any other stage/status pair refuses.
+- `PrecompileFailureInput` = `{finalization_input_schema: 1, kind:
+  'precompile_refusal', scaffold: ResultScaffold, failure: RevalidationFailure,
+  retry_history: RetryHistory, pre_compile:
+  RevalidationCheck(passed=false), pre_publication: null}`. The refusal and
+  check must have the same code/check digest and bind the scaffold's canonical
+  receipt; canonicalization is `planned`, objects are empty, and every tool
+  receipt is `not_run`.
+- `PostAnalysisInput` = `{finalization_input_schema: 1, kind:
+  'post_analysis', draft: CompositionDraft, pre_compile:
+  RevalidationCheck(passed=true), pre_publication:
+  PrePublicationDecision, retry_history: RetryHistory}`. Its history digest must
+  equal `draft.retry_history_sha256`. A passed/refused check must bind the draft's
+  `CompositionReceipt`/objects/tool world. Tool/analyze non-pass requires
+  `not_reached`; a tool-pass requires exactly `passed|refused`.
+
+The pure finalizer is the sole constructor of `outcome`, `revalidation`,
+`retry`, and `result_id`. It checks all scaffold/draft/receipt/history
+identities, derives the two exact retry fingerprints and count/status/backoff
+from final outcome plus durable history, and returns the complete immutable
+13-key `CompositionResult`. The canonical ID preimage is the complete result
+projection with only `result_id` absent, canonical JSON plus LF;
+`result_id=SHA256(preimage)`. The finalizer inserts it before returning and
+self-recomputes it without mutation. The driver only validates the received
+object and ID projection and atomically writes the final canonical bytes; it
+never adds, removes, or changes a field.
+
+The stage/receipt/null cross-product is exhaustive:
+
+| failure/pass point | finalization kind | pre-compile | pre-publication | tool/analyze calls | result revalidation hashes |
+|---|---|---|---|---|---|
+| owner/canonicalize/materialize refusal | `pre_draft_failure` | null | null | zero | null / null |
+| pre-compile refusal | `precompile_refusal` | failed real check | null | **zero** | check / null |
+| compile/inspect/link/instantiate/smoke/analyze non-pass | `post_analysis` | passed check | `not_reached`, null failure | only through terminal stage | check / null |
+| pre-publication refusal | `post_analysis` | passed check | `refused`, failed real check + matching failure | completed tuple | check / check |
+| pass | `post_analysis` | passed check | `passed`, null failure | all five passed | check / check |
+
+Every other combination refuses: in particular pre-draft with a check,
+precompile-refusal without its real digest, post-analysis without precompile
+success, pass without two checks, prepublication on a canonical receipt, or a
+tool receipt after precompile refusal. Tests use compiler/inspector/link/Node/
+analyze spies and assert exactly zero calls in the precompile-refusal vector.
+
+#### Normative complete finalization vectors
+
+Every JSON block below is canonical compact sorted-key UTF-8 plus its shown
+final LF. Check hashes are SHA-256 of the exact five-key check projection
+defined above; result IDs are SHA-256 of the complete result projection with
+only `result_id` absent. These are full objects, not partial fixtures. Each
+shown first-attempt input carries the exact empty history
+`{"completed_transient_attempts":0,"history_schema":1,
+"prior_transient_fingerprint":null}` plus LF, 89 bytes / SHA-256
+`53baf513a523c322f7ddae9ac2645f8960908cc16e3e2ba808baf2754c52b7dd`;
+post-analysis drafts carry that exact `retry_history_sha256`.
+
+#### pass
+
+Pre-compile check is `7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6`. The exact pre-publication decision is:
+
+```json
+{"check":{"check_sha256":"82f64bf9d672102074e0172b663ffbe6c9dafa33c3ba56ca1a8b3742581d0dbb","observation_sha256":"1872befdd387ff1422631d080eca9ead263db313a88d0c0dae71b4dfba21eab4","passed":true,"receipt_sha256":"c9b5d457928ea8cc69fb3f4f53b6d51ca0b02893fa63020f0ece097c53f38d9f","refusal_code":null,"stage":"pre-publication"},"failure":null,"status":"passed"}
+```
+
+The ID preimage is 8,009 bytes; `result_id` is `07a540545f0b0db883e906d7e6c456352789bc2fbfc5d9a18005af54fb04ced9`. The complete 8,088-byte result is:
+
+```json
+{"assembly_result_schema":1,"attempt":1,"behavior_tier":"compile_only","candidate":{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"header_sha256":"4343434343434343434343434343434343434343434343434343434343434343","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"canonicalization":{"bundle_sha256":"5151515151515151515151515151515151515151515151515151515151515151","canonicalization_schema":1,"compatibility_checks":[],"discarded_variants":[],"owner_bindings":[],"relevant_catalog_sha256":"5252525252525252525252525252525252525252525252525252525252525252","status":"planned","translation_units":[{"compile_argv_sha256":"e42d3646adf2a7bd60ceb87af84ae391a2e8723006a9eb940a36d3995effa0d1","derived_source_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_relpath":"candidate.o","ordinal":0,"role":"candidate","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242","unit":"synthetic-u"}]},"objects":[{"defined_symbols":[],"imported_symbols":[],"inspector_receipt_sha256":"87d84ca58cbd08b5cb4659c52fabcc87000e0eb6ea9a49b4673ae4e9e84ee702","object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_size":32,"ordinal":0,"unit":"synthetic-u"}],"outcome":{"classification":"pass","code":"pass","contributors":[],"diagnostic_sha256":null,"stage":"smoke","stage_receipts":[{"child_receipts":[{"argv":["emcc","-c","candidate.c","-o","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"489c910c843de67b128b684c849067771b91af854bab5e5599c34cf58a75b8bb","stderr_size":24,"stdout_sha256":"85e982a9556993ee56418312a4e626c3ba1e0fa5605d724c95fc593b7ddf67f7","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_receipt_schema":1,"state":"passed","stderr_sha256":"b116c438f4bcea2ac63b2ebfddaa247a3e1d72eeb3564ffc5262a9072c82d970","stdout_sha256":"d33a223670cffdc68f5f51af4d3b821abe3fa1fa703a485b7b7a5959c35ac27f","symbol":null},{"child_receipts":[{"argv":["llvm-nm","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"0e998d65f40fdc0f1ec0aff8bd5b5bd661ab9cf9973d359b228f484acd5f1ed9","stderr_size":24,"stdout_sha256":"d7dc7b2e512ea4543cecbe07911be308568a139ad1a8a14dd4d46f4690d6636a","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_receipt_schema":1,"state":"passed","stderr_sha256":"8a3a35e24d043e63dec034f478051c5cae3784c838fac7cc05d4a5b64cdd1c57","stdout_sha256":"f046343904baef900e5b5279edfe4b4b0b823489a76d4c772cb43f8fe2bf6489","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-link-parser-v1","stage":"link","stage_receipt_schema":1,"state":"passed","stderr_sha256":"117a72cb8592f535a1a7fe408c2c7fda6673bb4afdbe6ad8867b824ab788b6b3","stdout_sha256":"115fb89eab424714138920cb65144b8bce9f9ad060d6345fb741d1e4f21904ae","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":[],"parser_version":"synthetic-instantiate-parser-v1","stage":"instantiate","stage_receipt_schema":1,"state":"passed","stderr_sha256":"5c6c1d8ec39ae71fff8e948678da80cf26e48b4705297615b4459e54468d9fed","stdout_sha256":"dd20395fa27c5d9008f6168ed34a81e06f128b1424c572d76fa91fc8bd4225b8","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":[],"parser_version":"synthetic-smoke-parser-v1","stage":"smoke","stage_receipt_schema":1,"state":"passed","stderr_sha256":"f61850da616a9f5b3100d9da1f9dfe1ab446d04432bbf58d57cd2d2a91daf07b","stdout_sha256":"a1a73ff7b5098c9ec2309ae2fb03e881065dc6142fc235c57afba975d202ad14","symbol":null}],"unattributed":false},"result_id":"07a540545f0b0db883e906d7e6c456352789bc2fbfc5d9a18005af54fb04ced9","retry":{"assembly_retry_fingerprint":"b37031144deaa31b131447f2938b2293caec39f5e9f3dcca0617422b9ec93164","assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","backoff_seconds":null,"class":"none","status":"pass","transient_fault_fingerprint":null,"transient_retry_count":0},"revalidation":{"pre_compile_sha256":"7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6","pre_publication_sha256":"82f64bf9d672102074e0172b663ffbe6c9dafa33c3ba56ca1a8b3742581d0dbb"},"tool_world":{"argv":{"compile":[["emcc","-c","candidate.c","-o","candidate.o"]],"inspect":[["llvm-nm","candidate.o"]],"instantiate":["node","instantiate.js","candidate.wasm"],"link":["emcc","candidate.o","-o","candidate.wasm"],"smoke":["node","smoke.js","candidate.wasm"]},"environment":[{"name":"EMSDK","value_sha256":"3131313131313131313131313131313131313131313131313131313131313131"}],"identities":[{"file_sha256":"1111111111111111111111111111111111111111111111111111111111111111","resolved_path":"D:/synthetic/clang.exe","role":"clang","version_sha256":"2121212121212121212121212121212121212121212121212121212121212121"},{"file_sha256":"1212121212121212121212121212121212121212121212121212121212121212","resolved_path":"D:/synthetic/emcc.bat","role":"emcc","version_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},{"file_sha256":"1313131313131313131313131313131313131313131313131313131313131313","resolved_path":"D:/synthetic/node.exe","role":"node","version_sha256":"2323232323232323232323232323232323232323232323232323232323232323"},{"file_sha256":"1414141414141414141414141414141414141414141414141414141414141414","resolved_path":"D:/synthetic/llvm-nm.exe","role":"object-inspector","version_sha256":"2424242424242424242424242424242424242424242424242424242424242424"},{"file_sha256":"1515151515151515151515151515151515151515151515151515151515151515","resolved_path":"D:/synthetic/smoke.js","role":"smoke-script","version_sha256":"2525252525252525252525252525252525252525252525252525252525252525"},{"file_sha256":"1616161616161616161616161616161616161616161616161616161616161616","resolved_path":"D:/synthetic/wasm-ld.exe","role":"wasm-ld","version_sha256":"2626262626262626262626262626262626262626262626262626262626262626"}],"tool_world_schema":1,"tool_world_sha256":"1ce523c15a3d30aafba7e59d93848de812cb5225495175e3554fba3b8f89b5d7"},"unit":"synthetic-u","window":[{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"ordinal":0,"unit":"synthetic-u"}]}
+```
+
+#### tool non-pass
+
+Pre-compile check is `7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6`. The exact pre-publication decision is:
+
+```json
+{"check":null,"failure":null,"status":"not_reached"}
+```
+
+The ID preimage is 7,853 bytes; `result_id` is `2cba2aa68db75c0d464ab8e89a3e6c44104bd79bd1ab7e40190e643e30b0e389`. The complete 7,932-byte result is:
+
+```json
+{"assembly_result_schema":1,"attempt":1,"behavior_tier":"compile_only","candidate":{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"header_sha256":"4343434343434343434343434343434343434343434343434343434343434343","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"canonicalization":{"bundle_sha256":"5151515151515151515151515151515151515151515151515151515151515151","canonicalization_schema":1,"compatibility_checks":[],"discarded_variants":[],"owner_bindings":[],"relevant_catalog_sha256":"5252525252525252525252525252525252525252525252525252525252525252","status":"planned","translation_units":[{"compile_argv_sha256":"e42d3646adf2a7bd60ceb87af84ae391a2e8723006a9eb940a36d3995effa0d1","derived_source_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_relpath":"candidate.o","ordinal":0,"role":"candidate","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242","unit":"synthetic-u"}]},"objects":[{"defined_symbols":[],"imported_symbols":[],"inspector_receipt_sha256":"87d84ca58cbd08b5cb4659c52fabcc87000e0eb6ea9a49b4673ae4e9e84ee702","object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_size":32,"ordinal":0,"unit":"synthetic-u"}],"outcome":{"classification":"deterministic_blocker","code":"link_failed","contributors":[],"diagnostic_sha256":"851f979c3701c10cee340cfa30875d5995909faee390513106fab27d26b8fdd6","stage":"link","stage_receipts":[{"child_receipts":[{"argv":["emcc","-c","candidate.c","-o","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"489c910c843de67b128b684c849067771b91af854bab5e5599c34cf58a75b8bb","stderr_size":24,"stdout_sha256":"85e982a9556993ee56418312a4e626c3ba1e0fa5605d724c95fc593b7ddf67f7","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_receipt_schema":1,"state":"passed","stderr_sha256":"b116c438f4bcea2ac63b2ebfddaa247a3e1d72eeb3564ffc5262a9072c82d970","stdout_sha256":"d33a223670cffdc68f5f51af4d3b821abe3fa1fa703a485b7b7a5959c35ac27f","symbol":null},{"child_receipts":[{"argv":["llvm-nm","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"0e998d65f40fdc0f1ec0aff8bd5b5bd661ab9cf9973d359b228f484acd5f1ed9","stderr_size":24,"stdout_sha256":"d7dc7b2e512ea4543cecbe07911be308568a139ad1a8a14dd4d46f4690d6636a","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_receipt_schema":1,"state":"passed","stderr_sha256":"8a3a35e24d043e63dec034f478051c5cae3784c838fac7cc05d4a5b64cdd1c57","stdout_sha256":"f046343904baef900e5b5279edfe4b4b0b823489a76d4c772cb43f8fe2bf6489","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":"851f979c3701c10cee340cfa30875d5995909faee390513106fab27d26b8fdd6","execution_completed":true,"exit_status":2,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-link-parser-v1","stage":"link","stage_receipt_schema":1,"state":"failed","stderr_sha256":"117a72cb8592f535a1a7fe408c2c7fda6673bb4afdbe6ad8867b824ab788b6b3","stdout_sha256":"115fb89eab424714138920cb65144b8bce9f9ad060d6345fb741d1e4f21904ae","symbol":"bad_symbol"},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":false,"exit_status":null,"fault_class":null,"named_object_relpaths":[],"parser_version":null,"stage":"instantiate","stage_receipt_schema":1,"state":"not_run","stderr_sha256":null,"stdout_sha256":null,"symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":false,"exit_status":null,"fault_class":null,"named_object_relpaths":[],"parser_version":null,"stage":"smoke","stage_receipt_schema":1,"state":"not_run","stderr_sha256":null,"stdout_sha256":null,"symbol":null}],"unattributed":true},"result_id":"2cba2aa68db75c0d464ab8e89a3e6c44104bd79bd1ab7e40190e643e30b0e389","retry":{"assembly_retry_fingerprint":"6292936147b9211849c805a7bd6cc01f13bd006ff0f60ae69628992020417a9e","assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","backoff_seconds":null,"class":"deterministic_blocker","status":"waiting_assembly_world_change","transient_fault_fingerprint":null,"transient_retry_count":0},"revalidation":{"pre_compile_sha256":"7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6","pre_publication_sha256":null},"tool_world":{"argv":{"compile":[["emcc","-c","candidate.c","-o","candidate.o"]],"inspect":[["llvm-nm","candidate.o"]],"instantiate":["node","instantiate.js","candidate.wasm"],"link":["emcc","candidate.o","-o","candidate.wasm"],"smoke":["node","smoke.js","candidate.wasm"]},"environment":[{"name":"EMSDK","value_sha256":"3131313131313131313131313131313131313131313131313131313131313131"}],"identities":[{"file_sha256":"1111111111111111111111111111111111111111111111111111111111111111","resolved_path":"D:/synthetic/clang.exe","role":"clang","version_sha256":"2121212121212121212121212121212121212121212121212121212121212121"},{"file_sha256":"1212121212121212121212121212121212121212121212121212121212121212","resolved_path":"D:/synthetic/emcc.bat","role":"emcc","version_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},{"file_sha256":"1313131313131313131313131313131313131313131313131313131313131313","resolved_path":"D:/synthetic/node.exe","role":"node","version_sha256":"2323232323232323232323232323232323232323232323232323232323232323"},{"file_sha256":"1414141414141414141414141414141414141414141414141414141414141414","resolved_path":"D:/synthetic/llvm-nm.exe","role":"object-inspector","version_sha256":"2424242424242424242424242424242424242424242424242424242424242424"},{"file_sha256":"1515151515151515151515151515151515151515151515151515151515151515","resolved_path":"D:/synthetic/smoke.js","role":"smoke-script","version_sha256":"2525252525252525252525252525252525252525252525252525252525252525"},{"file_sha256":"1616161616161616161616161616161616161616161616161616161616161616","resolved_path":"D:/synthetic/wasm-ld.exe","role":"wasm-ld","version_sha256":"2626262626262626262626262626262626262626262626262626262626262626"}],"tool_world_schema":1,"tool_world_sha256":"1ce523c15a3d30aafba7e59d93848de812cb5225495175e3554fba3b8f89b5d7"},"unit":"synthetic-u","window":[{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"ordinal":0,"unit":"synthetic-u"}]}
+```
+
+#### deterministic pre-publication refusal
+
+Pre-compile check is `7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6`. The exact pre-publication decision is:
+
+```json
+{"check":{"check_sha256":"f8b21bd18b69f8448af010ed6cc99ba91bcc04746fc787ebdfd0388f9af16dd7","observation_sha256":"a234dbcf40eea7b08f11e0bee5c0dd9618643c6aafcb24bf4475985015a30325","passed":false,"receipt_sha256":"c9b5d457928ea8cc69fb3f4f53b6d51ca0b02893fa63020f0ece097c53f38d9f","refusal_code":"owner_changed","stage":"pre-publication"},"failure":{"check_sha256":"f8b21bd18b69f8448af010ed6cc99ba91bcc04746fc787ebdfd0388f9af16dd7","classification":"deterministic_blocker","code":"owner_changed","diagnostic_sha256":"636ec1a7f9396e105e53491352f30f91426bf6b3dfb079ea7688e407ba389aba","fault_class":null,"stage":"revalidate"},"status":"refused"}
+```
+
+The ID preimage is 8,143 bytes; `result_id` is `f8a525c79497bbe197d0eca0a5bfff93168ac40dc26b6106a230063a72d6154f`. The complete 8,222-byte result is:
+
+```json
+{"assembly_result_schema":1,"attempt":1,"behavior_tier":"compile_only","candidate":{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"header_sha256":"4343434343434343434343434343434343434343434343434343434343434343","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"canonicalization":{"bundle_sha256":"5151515151515151515151515151515151515151515151515151515151515151","canonicalization_schema":1,"compatibility_checks":[],"discarded_variants":[],"owner_bindings":[],"relevant_catalog_sha256":"5252525252525252525252525252525252525252525252525252525252525252","status":"planned","translation_units":[{"compile_argv_sha256":"e42d3646adf2a7bd60ceb87af84ae391a2e8723006a9eb940a36d3995effa0d1","derived_source_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_relpath":"candidate.o","ordinal":0,"role":"candidate","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242","unit":"synthetic-u"}]},"objects":[{"defined_symbols":[],"imported_symbols":[],"inspector_receipt_sha256":"87d84ca58cbd08b5cb4659c52fabcc87000e0eb6ea9a49b4673ae4e9e84ee702","object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_size":32,"ordinal":0,"unit":"synthetic-u"}],"outcome":{"classification":"deterministic_blocker","code":"owner_changed","contributors":[],"diagnostic_sha256":"636ec1a7f9396e105e53491352f30f91426bf6b3dfb079ea7688e407ba389aba","stage":"revalidate","stage_receipts":[{"child_receipts":[{"argv":["emcc","-c","candidate.c","-o","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"489c910c843de67b128b684c849067771b91af854bab5e5599c34cf58a75b8bb","stderr_size":24,"stdout_sha256":"85e982a9556993ee56418312a4e626c3ba1e0fa5605d724c95fc593b7ddf67f7","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_receipt_schema":1,"state":"passed","stderr_sha256":"b116c438f4bcea2ac63b2ebfddaa247a3e1d72eeb3564ffc5262a9072c82d970","stdout_sha256":"d33a223670cffdc68f5f51af4d3b821abe3fa1fa703a485b7b7a5959c35ac27f","symbol":null},{"child_receipts":[{"argv":["llvm-nm","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"0e998d65f40fdc0f1ec0aff8bd5b5bd661ab9cf9973d359b228f484acd5f1ed9","stderr_size":24,"stdout_sha256":"d7dc7b2e512ea4543cecbe07911be308568a139ad1a8a14dd4d46f4690d6636a","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_receipt_schema":1,"state":"passed","stderr_sha256":"8a3a35e24d043e63dec034f478051c5cae3784c838fac7cc05d4a5b64cdd1c57","stdout_sha256":"f046343904baef900e5b5279edfe4b4b0b823489a76d4c772cb43f8fe2bf6489","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-link-parser-v1","stage":"link","stage_receipt_schema":1,"state":"passed","stderr_sha256":"117a72cb8592f535a1a7fe408c2c7fda6673bb4afdbe6ad8867b824ab788b6b3","stdout_sha256":"115fb89eab424714138920cb65144b8bce9f9ad060d6345fb741d1e4f21904ae","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":[],"parser_version":"synthetic-instantiate-parser-v1","stage":"instantiate","stage_receipt_schema":1,"state":"passed","stderr_sha256":"5c6c1d8ec39ae71fff8e948678da80cf26e48b4705297615b4459e54468d9fed","stdout_sha256":"dd20395fa27c5d9008f6168ed34a81e06f128b1424c572d76fa91fc8bd4225b8","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":[],"parser_version":"synthetic-smoke-parser-v1","stage":"smoke","stage_receipt_schema":1,"state":"passed","stderr_sha256":"f61850da616a9f5b3100d9da1f9dfe1ab446d04432bbf58d57cd2d2a91daf07b","stdout_sha256":"a1a73ff7b5098c9ec2309ae2fb03e881065dc6142fc235c57afba975d202ad14","symbol":null}],"unattributed":true},"result_id":"f8a525c79497bbe197d0eca0a5bfff93168ac40dc26b6106a230063a72d6154f","retry":{"assembly_retry_fingerprint":"b898e560c2dacb3d5221649b1d64a7cb123a0e84c112e073988ffe72c7064846","assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","backoff_seconds":null,"class":"deterministic_blocker","status":"waiting_assembly_world_change","transient_fault_fingerprint":null,"transient_retry_count":0},"revalidation":{"pre_compile_sha256":"7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6","pre_publication_sha256":"f8b21bd18b69f8448af010ed6cc99ba91bcc04746fc787ebdfd0388f9af16dd7"},"tool_world":{"argv":{"compile":[["emcc","-c","candidate.c","-o","candidate.o"]],"inspect":[["llvm-nm","candidate.o"]],"instantiate":["node","instantiate.js","candidate.wasm"],"link":["emcc","candidate.o","-o","candidate.wasm"],"smoke":["node","smoke.js","candidate.wasm"]},"environment":[{"name":"EMSDK","value_sha256":"3131313131313131313131313131313131313131313131313131313131313131"}],"identities":[{"file_sha256":"1111111111111111111111111111111111111111111111111111111111111111","resolved_path":"D:/synthetic/clang.exe","role":"clang","version_sha256":"2121212121212121212121212121212121212121212121212121212121212121"},{"file_sha256":"1212121212121212121212121212121212121212121212121212121212121212","resolved_path":"D:/synthetic/emcc.bat","role":"emcc","version_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},{"file_sha256":"1313131313131313131313131313131313131313131313131313131313131313","resolved_path":"D:/synthetic/node.exe","role":"node","version_sha256":"2323232323232323232323232323232323232323232323232323232323232323"},{"file_sha256":"1414141414141414141414141414141414141414141414141414141414141414","resolved_path":"D:/synthetic/llvm-nm.exe","role":"object-inspector","version_sha256":"2424242424242424242424242424242424242424242424242424242424242424"},{"file_sha256":"1515151515151515151515151515151515151515151515151515151515151515","resolved_path":"D:/synthetic/smoke.js","role":"smoke-script","version_sha256":"2525252525252525252525252525252525252525252525252525252525252525"},{"file_sha256":"1616161616161616161616161616161616161616161616161616161616161616","resolved_path":"D:/synthetic/wasm-ld.exe","role":"wasm-ld","version_sha256":"2626262626262626262626262626262626262626262626262626262626262626"}],"tool_world_schema":1,"tool_world_sha256":"1ce523c15a3d30aafba7e59d93848de812cb5225495175e3554fba3b8f89b5d7"},"unit":"synthetic-u","window":[{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"ordinal":0,"unit":"synthetic-u"}]}
+```
+
+#### transient pre-publication refusal
+
+Pre-compile check is `7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6`. The exact pre-publication decision is:
+
+```json
+{"check":{"check_sha256":"ed9398df334b1699708362bf2541c8542cad8f10528cd9fe7adcd5a2abbde5a8","observation_sha256":"efe3c180fa92cf4e5262f01b3afbd23d67a4d706bc049d38605fa47ff17e5dc6","passed":false,"receipt_sha256":"c9b5d457928ea8cc69fb3f4f53b6d51ca0b02893fa63020f0ece097c53f38d9f","refusal_code":"stable_read_fault","stage":"pre-publication"},"failure":{"check_sha256":"ed9398df334b1699708362bf2541c8542cad8f10528cd9fe7adcd5a2abbde5a8","classification":"transient_fault","code":"stable_read_fault","diagnostic_sha256":"856a0f667d6f19654b7e4dd480d0644cfd95469a7b5bf1ab99c078faed6d359c","fault_class":"stable_read","stage":"revalidate"},"status":"refused"}
+```
+
+The ID preimage is 8,181 bytes; `result_id` is `32f2f5c141bfbd75e387e70b9e0db776c0dcd93cea0f22797da34e799b816056`. The complete 8,260-byte result is:
+
+```json
+{"assembly_result_schema":1,"attempt":1,"behavior_tier":"compile_only","candidate":{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"header_sha256":"4343434343434343434343434343434343434343434343434343434343434343","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"canonicalization":{"bundle_sha256":"5151515151515151515151515151515151515151515151515151515151515151","canonicalization_schema":1,"compatibility_checks":[],"discarded_variants":[],"owner_bindings":[],"relevant_catalog_sha256":"5252525252525252525252525252525252525252525252525252525252525252","status":"planned","translation_units":[{"compile_argv_sha256":"e42d3646adf2a7bd60ceb87af84ae391a2e8723006a9eb940a36d3995effa0d1","derived_source_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_relpath":"candidate.o","ordinal":0,"role":"candidate","source_sha256":"4242424242424242424242424242424242424242424242424242424242424242","unit":"synthetic-u"}]},"objects":[{"defined_symbols":[],"imported_symbols":[],"inspector_receipt_sha256":"87d84ca58cbd08b5cb4659c52fabcc87000e0eb6ea9a49b4673ae4e9e84ee702","object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_size":32,"ordinal":0,"unit":"synthetic-u"}],"outcome":{"classification":"transient_fault","code":"stable_read_fault","contributors":[],"diagnostic_sha256":"856a0f667d6f19654b7e4dd480d0644cfd95469a7b5bf1ab99c078faed6d359c","stage":"revalidate","stage_receipts":[{"child_receipts":[{"argv":["emcc","-c","candidate.c","-o","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"a3ce973ac8959c59913c1919fb4c2d42626d04f18837ef6bc3ea66237a562209","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"489c910c843de67b128b684c849067771b91af854bab5e5599c34cf58a75b8bb","stderr_size":24,"stdout_sha256":"85e982a9556993ee56418312a4e626c3ba1e0fa5605d724c95fc593b7ddf67f7","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"5597071754af9bbe42a2fa65fc43043c1c59cc2153d23e8940adaf0f86ecdc87","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-compile-parser-v1","stage":"compile","stage_receipt_schema":1,"state":"passed","stderr_sha256":"b116c438f4bcea2ac63b2ebfddaa247a3e1d72eeb3564ffc5262a9072c82d970","stdout_sha256":"d33a223670cffdc68f5f51af4d3b821abe3fa1fa703a485b7b7a5959c35ac27f","symbol":null},{"child_receipts":[{"argv":["llvm-nm","candidate.o"],"child_ordinal":0,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"input_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","object_ordinal":0,"object_relpath":"candidate.o","object_sha256":"9796d39e80e3864272c26fa9407f4add720ee56e4b640a88cdd9df05a16b5354","parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_child_receipt_schema":1,"state":"passed","stderr_sha256":"0e998d65f40fdc0f1ec0aff8bd5b5bd661ab9cf9973d359b228f484acd5f1ed9","stderr_size":24,"stdout_sha256":"d7dc7b2e512ea4543cecbe07911be308568a139ad1a8a14dd4d46f4690d6636a","stdout_size":24,"symbol":null,"terminal":true,"unit":"synthetic-u"}],"child_transcript_sha256":"67eb92399a94b59e58f244e30399c1f6ad1d88fb06af787a6b493fbd4c9fbf37","diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-inspect-parser-v1","stage":"inspect","stage_receipt_schema":1,"state":"passed","stderr_sha256":"8a3a35e24d043e63dec034f478051c5cae3784c838fac7cc05d4a5b64cdd1c57","stdout_sha256":"f046343904baef900e5b5279edfe4b4b0b823489a76d4c772cb43f8fe2bf6489","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":["candidate.o"],"parser_version":"synthetic-link-parser-v1","stage":"link","stage_receipt_schema":1,"state":"passed","stderr_sha256":"117a72cb8592f535a1a7fe408c2c7fda6673bb4afdbe6ad8867b824ab788b6b3","stdout_sha256":"115fb89eab424714138920cb65144b8bce9f9ad060d6345fb741d1e4f21904ae","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":[],"parser_version":"synthetic-instantiate-parser-v1","stage":"instantiate","stage_receipt_schema":1,"state":"passed","stderr_sha256":"5c6c1d8ec39ae71fff8e948678da80cf26e48b4705297615b4459e54468d9fed","stdout_sha256":"dd20395fa27c5d9008f6168ed34a81e06f128b1424c572d76fa91fc8bd4225b8","symbol":null},{"child_receipts":[],"child_transcript_sha256":null,"diagnostic_sha256":null,"execution_completed":true,"exit_status":0,"fault_class":null,"named_object_relpaths":[],"parser_version":"synthetic-smoke-parser-v1","stage":"smoke","stage_receipt_schema":1,"state":"passed","stderr_sha256":"f61850da616a9f5b3100d9da1f9dfe1ab446d04432bbf58d57cd2d2a91daf07b","stdout_sha256":"a1a73ff7b5098c9ec2309ae2fb03e881065dc6142fc235c57afba975d202ad14","symbol":null}],"unattributed":true},"result_id":"32f2f5c141bfbd75e387e70b9e0db776c0dcd93cea0f22797da34e799b816056","retry":{"assembly_retry_fingerprint":"0d5e000eb991471ed939846165d13d0616275c86ca36df485d1bdd941b97c81c","assembly_world_sha256":"6161616161616161616161616161616161616161616161616161616161616161","backoff_seconds":30,"class":"transient_fault","status":"transient_retry","transient_fault_fingerprint":"5200c61f3b31b5b0a561bfd616c9628c0a03430f4c0a0f82826c18a755457f2a","transient_retry_count":1},"revalidation":{"pre_compile_sha256":"7d3739653926d62e6ec0a8769805916242ab20267dfb5e25c5010c567f5f74c6","pre_publication_sha256":"ed9398df334b1699708362bf2541c8542cad8f10528cd9fe7adcd5a2abbde5a8"},"tool_world":{"argv":{"compile":[["emcc","-c","candidate.c","-o","candidate.o"]],"inspect":[["llvm-nm","candidate.o"]],"instantiate":["node","instantiate.js","candidate.wasm"],"link":["emcc","candidate.o","-o","candidate.wasm"],"smoke":["node","smoke.js","candidate.wasm"]},"environment":[{"name":"EMSDK","value_sha256":"3131313131313131313131313131313131313131313131313131313131313131"}],"identities":[{"file_sha256":"1111111111111111111111111111111111111111111111111111111111111111","resolved_path":"D:/synthetic/clang.exe","role":"clang","version_sha256":"2121212121212121212121212121212121212121212121212121212121212121"},{"file_sha256":"1212121212121212121212121212121212121212121212121212121212121212","resolved_path":"D:/synthetic/emcc.bat","role":"emcc","version_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},{"file_sha256":"1313131313131313131313131313131313131313131313131313131313131313","resolved_path":"D:/synthetic/node.exe","role":"node","version_sha256":"2323232323232323232323232323232323232323232323232323232323232323"},{"file_sha256":"1414141414141414141414141414141414141414141414141414141414141414","resolved_path":"D:/synthetic/llvm-nm.exe","role":"object-inspector","version_sha256":"2424242424242424242424242424242424242424242424242424242424242424"},{"file_sha256":"1515151515151515151515151515151515151515151515151515151515151515","resolved_path":"D:/synthetic/smoke.js","role":"smoke-script","version_sha256":"2525252525252525252525252525252525252525252525252525252525252525"},{"file_sha256":"1616161616161616161616161616161616161616161616161616161616161616","resolved_path":"D:/synthetic/wasm-ld.exe","role":"wasm-ld","version_sha256":"2626262626262626262626262626262626262626262626262626262626262626"}],"tool_world_schema":1,"tool_world_sha256":"1ce523c15a3d30aafba7e59d93848de812cb5225495175e3554fba3b8f89b5d7"},"unit":"synthetic-u","window":[{"artifact_relpath":"candidate.c","artifact_sha256":"4141414141414141414141414141414141414141414141414141414141414141","artifact_size":64,"ordinal":0,"unit":"synthetic-u"}]}
+```
+
+
+Crossed-combination refusals mutate each decision independently and must fail
+before hashing: `not_reached` with either nonnull member; `passed` with a
+null/failed check or any failure; `refused` with null/passing check, null
+failure, classification outside the closed enum, null diagnostic, different
+code, different check digest, deterministic/non-null fault, transient/null
+fault, or a check not binding the draft composition
+receipt. Tool non-pass with `passed|refused`, or an all-pass tool tuple with
+`not_reached`, also refuses. Tests recompute all four IDs from literal bytes
+and prove changing any child transcript digest changes both result ID and the
+assembly retry fingerprint. Missing/mismatched/future `RetryHistory`, or a
+history digest different from the draft, refuses before result hashing.
 
 The private attempt has a mutable control marker, but durable evidence is
 immutable. Canonical JSON means UTF-8, sorted keys, no insignificant
@@ -846,15 +1551,19 @@ whitespace, LF, integers only where specified, and a trailing LF.
    list[WindowItem]`, `behavior_tier: 'compile_only'|'oracle_green'`, and these
    six exact nested values:
 
-   - `canonicalization` = `{canonicalization_schema: 1, bundle_sha256:
-     sha256, relevant_catalog_sha256: sha256, owner_bindings:
+   - `canonicalization` = `{canonicalization_schema: 1, status:
+     'not_started'|'failed'|'planned', bundle_sha256: sha256|null,
+     relevant_catalog_sha256: sha256|null, owner_bindings:
      list[OwnerBinding], compatibility_checks: list[CompatibilityEvidence],
      discarded_variants: list[exact {symbol: C identifier,
      source_relpath: owned relative string, prototype_sha256: sha256}],
      translation_units: list[exact {ordinal: nonnegative-int, unit: nonempty
      string, role: 'candidate'|'window', source_sha256: sha256,
      derived_source_sha256: sha256, object_relpath: owned relative string,
-     compile_argv_sha256: sha256}]}`. Every discarded variant has exactly one
+     compile_argv_sha256: sha256}]}`. `not_started` requires both digests null
+     and every list empty; `failed` requires null bundle, a real relevant-
+     catalog digest and no translation units; `planned` requires both digests.
+     Every discarded variant has exactly one
      matching `compatibility_checks` entry with result `compatible`; a result
      `incompatible` permits no write and produces the deterministic blocker.
      Variants sort by `(symbol,source_relpath,prototype_sha256)`;
@@ -864,36 +1573,43 @@ whitespace, LF, integers only where specified, and a trailing LF.
      list[SymbolObservation], imported_symbols: list[SymbolObservation],
      inspector_receipt_sha256}`; symbol lists are unique sorted by
      `(name,kind)`.
-   - `tool_world` = `{assembly_world_sha256: sha256, identities:
+   - `tool_world` = `{tool_world_sha256: sha256, tool_world_schema: 1,
+     identities:
      list[{role: 'emcc'|'clang'|'wasm-ld'|'object-inspector'|'node'|
      'smoke-script', resolved_path: absolute string, file_sha256: sha256,
-     version_sha256: sha256}], argv: {compile: list[list[string]], link:
-     list[string], instantiate: list[string], smoke: list[string]},
+     version_sha256: sha256}], argv: {compile: list[list[string]], inspect:
+     list[list[string]], link: list[string], instantiate: list[string], smoke:
+     list[string]},
      environment: list[{name: string, value_sha256: sha256}]}`. Roles and
      environment names are unique sorted; argv order is semantic. The world
      hash preimage is canonical `tool_world` with only
-     `assembly_world_sha256` removed.
+     `tool_world_sha256` removed. It contains tools/argv/environment only.
    - `outcome` = `{classification:
      'pass'|'deterministic_blocker'|'transient_fault', stage:
-     'owner'|'canonicalize'|'compile'|'inspect'|'link'|'instantiate'|'smoke'|
-     'revalidate'|'internal', code: nonempty string, diagnostic_sha256:
-     sha256|null, contributors: list[Contributor], unattributed: bool,
-     linked: bool|null, instantiated: bool|null, smoke_passed: bool|null}`.
-     Nullable booleans mean the stage did not run; `diagnostic_sha256` is null
-     only for pass.
+     'owner'|'canonicalize'|'materialize'|'compile'|'inspect'|'link'|
+     'instantiate'|'smoke'|'revalidate'|'internal', code: nonempty string,
+     stage_receipts: [StageReceipt,StageReceipt,StageReceipt,StageReceipt,
+     StageReceipt], diagnostic_sha256: sha256|null, contributors:
+     list[Contributor], unattributed: bool}`. The receipt tuple obeys the exact
+     truth matrix above. Owner/canonicalize/materialize/pre-compile refusals use
+     all `not_run`; a post-tool revalidation refusal retains the completed tool
+     history. `diagnostic_sha256` is null only for pass.
    - `revalidation` = `{pre_compile_sha256: sha256|null,
      pre_publication_sha256: sha256|null}`; null is allowed only when failure
      occurred before that boundary.
    - `retry` = `{class: 'none'|'deterministic_blocker'|'transient_fault',
      status: 'pass'|'waiting_assembly_world_change'|'transient_retry'|
-     'assembly_transient_exhausted', assembly_retry_fingerprint: sha256,
+     'assembly_transient_exhausted', assembly_world_sha256: sha256,
+     assembly_retry_fingerprint: sha256,
      transient_fault_fingerprint: sha256|null, transient_retry_count:
      nonnegative-int, backoff_seconds: null|30|120|600}`. Null transient fields
      are required for `none`/deterministic; transient status/count/backoff must
      agree with the bounded schedule.
 
-   The driver canonicalizes the complete object without `result_id`, hashes
-   those bytes for `result_id`, inserts it, canonicalizes again, and writes
+   The deep finalizer constructs the ID preimage and complete result exactly as
+   specified above. The driver builds a separate read-only validation
+   projection that excludes `result_id`, recomputes it, requires equality, and
+   writes the unchanged complete object to
    `assembly-result/<result_id>.json` atomically. `result_sha256` always means
    the SHA-256 of those final bytes. Result schema 1 contains no timestamp,
    clock, run ID, journal receipt, or manifest path; none enters either hash.
@@ -950,8 +1666,8 @@ whitespace, LF, integers only where specified, and a trailing LF.
    `assembly_blocked_schema: 1`, `transition_id`, `unit`, `attempt`,
    `state_preimage_sha256`, `projected_state_semantic_sha256`, `result_id`,
    `result_sha256`, `candidate: Candidate`, `window: list[WindowItem]`,
-   `owner_bindings: list[{symbol,owner_binding_sha256}]`, `tool_world:
-   {assembly_world_sha256}`, `retry` in the exact result shape, and
+   `owner_bindings: list[{symbol,owner_binding_sha256}]`,
+   `assembly_world_sha256: sha256`, `retry` in the exact result shape, and
    `behavior_tier`. Owner refs sort by symbol. No field is nullable except the
    two retry fields defined above; unknown/missing/nonnormalized fields refuse.
    Blocked schema 1 contains no timestamp, next-retry wall clock, run ID,
@@ -1032,33 +1748,33 @@ with SHA-256
 The exact blocked-manifest bytes are:
 
 ```json
-{"assembly_blocked_schema":1,"attempt":2,"behavior_tier":"compile_only","candidate":{"artifact_relpath":"candidate","artifact_sha256":"1111111111111111111111111111111111111111111111111111111111111111","artifact_size":1,"header_sha256":"6666666666666666666666666666666666666666666666666666666666666666","source_sha256":"7777777777777777777777777777777777777777777777777777777777777777"},"owner_bindings":[],"projected_state_semantic_sha256":"21df203c7aacc943f272066f34aaca5715854ad59d194def011c0438a6fd449f","result_id":"2222222222222222222222222222222222222222222222222222222222222222","result_sha256":"3333333333333333333333333333333333333333333333333333333333333333","retry":{"assembly_retry_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","backoff_seconds":null,"class":"deterministic_blocker","status":"waiting_assembly_world_change","transient_fault_fingerprint":null,"transient_retry_count":0},"state_preimage_sha256":"5555555555555555555555555555555555555555555555555555555555555555","tool_world":{"assembly_world_sha256":"8888888888888888888888888888888888888888888888888888888888888888"},"transition_id":"85cf5e3c0b91fdc36a49b519d837fabf7691cec2b418406194a35b03600fd5e0","unit":"synthetic-u","window":[{"artifact_relpath":"candidate","artifact_sha256":"1111111111111111111111111111111111111111111111111111111111111111","artifact_size":1,"ordinal":0,"unit":"synthetic-u"}]}
+{"assembly_blocked_schema":1,"assembly_world_sha256":"8888888888888888888888888888888888888888888888888888888888888888","attempt":2,"behavior_tier":"compile_only","candidate":{"artifact_relpath":"candidate","artifact_sha256":"1111111111111111111111111111111111111111111111111111111111111111","artifact_size":1,"header_sha256":"6666666666666666666666666666666666666666666666666666666666666666","source_sha256":"7777777777777777777777777777777777777777777777777777777777777777"},"owner_bindings":[],"projected_state_semantic_sha256":"21df203c7aacc943f272066f34aaca5715854ad59d194def011c0438a6fd449f","result_id":"2222222222222222222222222222222222222222222222222222222222222222","result_sha256":"3333333333333333333333333333333333333333333333333333333333333333","retry":{"assembly_retry_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","backoff_seconds":null,"class":"deterministic_blocker","status":"waiting_assembly_world_change","transient_fault_fingerprint":null,"transient_retry_count":0},"state_preimage_sha256":"5555555555555555555555555555555555555555555555555555555555555555","transition_id":"85cf5e3c0b91fdc36a49b519d837fabf7691cec2b418406194a35b03600fd5e0","unit":"synthetic-u","window":[{"artifact_relpath":"candidate","artifact_sha256":"1111111111111111111111111111111111111111111111111111111111111111","artifact_size":1,"ordinal":0,"unit":"synthetic-u"}]}
 ```
 
 with SHA-256
-`765d1384282c617d9a2902a9cc6d65592751a4bed2519a7476bffa8d20119e5a`.
+`17059ed2e9e81f5297d4e59a5d75354878ab47d9c0ca07ccbf89ef1e1bb79bc1`.
 Replacing only the semantic projection's 64 zeroes with that manifest hash
 produces the exact full projected-state SHA-256
-`9f53a60486657cc42208a1fd554d4d854a1961044ba288a4482ea49a5b1799ef`.
+`8bf77598cbe453a4fb4d0f13c7cf58eceb511fbdd9203ff34c4801b9fbfcac03`.
 Tests recompute every value rather than treating the strings as snapshots.
 
 For the same synthetic values, the normative complete journal record (the
 fixed timestamp/run ID are illustrative journal-owned values) is exactly:
 
 ```json
-{"attempt":2,"detail":"composition_blocked result_id=2222222222222222222222222222222222222222222222222222222222222222","extra":{"assembly_blocked_manifest_sha256":"765d1384282c617d9a2902a9cc6d65592751a4bed2519a7476bffa8d20119e5a","assembly_result_id":"2222222222222222222222222222222222222222222222222222222222222222","assembly_result_sha256":"3333333333333333333333333333333333333333333333333333333333333333","assembly_retry_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","projected_state_semantic_sha256":"21df203c7aacc943f272066f34aaca5715854ad59d194def011c0438a6fd449f","projected_state_sha256":"9f53a60486657cc42208a1fd554d4d854a1961044ba288a4482ea49a5b1799ef","retry_class":"deterministic_blocker","state_preimage_sha256":"5555555555555555555555555555555555555555555555555555555555555555","transition_id":"85cf5e3c0b91fdc36a49b519d837fabf7691cec2b418406194a35b03600fd5e0"},"model":null,"oracle_summary":null,"product_commit":null,"product_commit_failed":false,"product_effect":"no product-tree change by design","product_pushed":null,"result":"retryable","run_id":"synthetic-run","schema":1,"stage":"assembly","tier":"compile_only","timestamp":"2030-01-02T03:04:05Z","unit":"synthetic-u","unit_id":"synthetic-u"}
+{"attempt":2,"detail":"composition_blocked result_id=2222222222222222222222222222222222222222222222222222222222222222","extra":{"assembly_blocked_manifest_sha256":"17059ed2e9e81f5297d4e59a5d75354878ab47d9c0ca07ccbf89ef1e1bb79bc1","assembly_result_id":"2222222222222222222222222222222222222222222222222222222222222222","assembly_result_sha256":"3333333333333333333333333333333333333333333333333333333333333333","assembly_retry_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","projected_state_semantic_sha256":"21df203c7aacc943f272066f34aaca5715854ad59d194def011c0438a6fd449f","projected_state_sha256":"8bf77598cbe453a4fb4d0f13c7cf58eceb511fbdd9203ff34c4801b9fbfcac03","retry_class":"deterministic_blocker","state_preimage_sha256":"5555555555555555555555555555555555555555555555555555555555555555","transition_id":"85cf5e3c0b91fdc36a49b519d837fabf7691cec2b418406194a35b03600fd5e0"},"model":null,"oracle_summary":null,"product_commit":null,"product_commit_failed":false,"product_effect":"no product-tree change by design","product_pushed":null,"result":"retryable","run_id":"synthetic-run","schema":1,"stage":"assembly","tier":"compile_only","timestamp":"2030-01-02T03:04:05Z","unit":"synthetic-u","unit_id":"synthetic-u"}
 ```
 
 Its canonical full-record SHA-256 is
-`723fdc05103b4554221facea88a9fae4746c2009b6dd11c98d1136487f68432f`.
+`c3fa6414a384aac50f466f2cfffde17cd975b767cae834eadcbed5d6c4a3b141`.
 Applying the unchanged `transition_semantics` exclusion gives exactly:
 
 ```json
-{"attempt":2,"detail":"composition_blocked result_id=2222222222222222222222222222222222222222222222222222222222222222","extra":{"assembly_blocked_manifest_sha256":"765d1384282c617d9a2902a9cc6d65592751a4bed2519a7476bffa8d20119e5a","assembly_result_id":"2222222222222222222222222222222222222222222222222222222222222222","assembly_result_sha256":"3333333333333333333333333333333333333333333333333333333333333333","assembly_retry_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","projected_state_semantic_sha256":"21df203c7aacc943f272066f34aaca5715854ad59d194def011c0438a6fd449f","projected_state_sha256":"9f53a60486657cc42208a1fd554d4d854a1961044ba288a4482ea49a5b1799ef","retry_class":"deterministic_blocker","state_preimage_sha256":"5555555555555555555555555555555555555555555555555555555555555555","transition_id":"85cf5e3c0b91fdc36a49b519d837fabf7691cec2b418406194a35b03600fd5e0"},"model":null,"oracle_summary":null,"product_commit":null,"product_commit_failed":false,"product_effect":"no product-tree change by design","product_pushed":null,"result":"retryable","schema":1,"stage":"assembly","tier":"compile_only","unit":"synthetic-u","unit_id":"synthetic-u"}
+{"attempt":2,"detail":"composition_blocked result_id=2222222222222222222222222222222222222222222222222222222222222222","extra":{"assembly_blocked_manifest_sha256":"17059ed2e9e81f5297d4e59a5d75354878ab47d9c0ca07ccbf89ef1e1bb79bc1","assembly_result_id":"2222222222222222222222222222222222222222222222222222222222222222","assembly_result_sha256":"3333333333333333333333333333333333333333333333333333333333333333","assembly_retry_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","projected_state_semantic_sha256":"21df203c7aacc943f272066f34aaca5715854ad59d194def011c0438a6fd449f","projected_state_sha256":"8bf77598cbe453a4fb4d0f13c7cf58eceb511fbdd9203ff34c4801b9fbfcac03","retry_class":"deterministic_blocker","state_preimage_sha256":"5555555555555555555555555555555555555555555555555555555555555555","transition_id":"85cf5e3c0b91fdc36a49b519d837fabf7691cec2b418406194a35b03600fd5e0"},"model":null,"oracle_summary":null,"product_commit":null,"product_commit_failed":false,"product_effect":"no product-tree change by design","product_pushed":null,"result":"retryable","schema":1,"stage":"assembly","tier":"compile_only","unit":"synthetic-u","unit_id":"synthetic-u"}
 ```
 
 Thus `remote_record_sha256` is
-`b321655ea78201efed77fb1222ec75ec44c8b342dd59f2633c91b3fd06085686`.
+`0ed217da30ae21b0bf7dc018361d384699a61691cae4b7b55e0a8d4bf7918c10`.
 Tests reconstruct via `UnitTransition.to_record`, call the existing semantic
 projection, recompute both hashes, accept a same-ID record differing only in
 timestamp/run ID, and refuse a same-ID record differing in each outer field or
@@ -1247,37 +1963,70 @@ rtk C:\Users\manny\AppData\Local\Programs\Python\Python313\python.exe -m pytest 
    Acceptance: strict independent OGhidra adapter tests including all eight
    marker-wins rows; stable snapshot/range validation; injected production-
    Clang/fake parser seam; exact embedded preamble/undef bytes and complete
-   audited alias/tag refusals; both bound argv arrays; source-offset
-   parameter-name erasure and exact `-ast-print` extraction; mandatory
-   synthetic-param/return `desugaredQualType` ABI tuple and framing; all seven
+   audited alias/tag refusals; all bound argv arrays; source-offset
+   parameter-name erasure and whole-stdout top-level `-ast-print` extraction;
+   mandatory synthetic-param/return `desugaredQualType` ABI tuple and framing,
+   including exact `_Bool`/`bool` parameter and return sources, compiler-owned
+   `bool` tuple vectors, and crossed refusals without Python rewriting;
+   exact adjusted-array primary/secondary sources, AST paths, digests, and
+   refusal vectors; all seven
    byte pass/refusal/reparse vectors plus four typedef/preamble ABI vectors;
    exact Clang-owned compatibility source/argv/JSON projection with five
    qualifier vectors and pair-specific evidence/retry digests; exact gnu11
-   conformance refusals; owner/tool digests; and pure planning/composition/
-   revalidation. Tests explicitly prove unequal tuple spellings can be
-   compatible and pointee qualifiers remain incompatible.
+   conformance refusals; complete closed-alias enforcement; exact inspector
+   receipts, all eleven five-stage truth vectors/refusal complement, exact
+   StageChildReceipt/transcript/aggregate validation, and all twelve one/multi-
+   child digest vectors; both
+   canonical world payload/digest vectors plus tool-only/assembly-only changes;
+   closed/versioned retry-history and both fingerprint preimages, literal pass/
+   tool/deterministic/transient/mutation vectors, repeated transient schedule,
+   changed-fingerprint reset, exact Candidate-artifact projection, total stage-
+   to-adapter-role table with compile/link/instantiate/smoke vectors and crossed
+   refusals, and finalizer-only retry construction; the
+   three-way finalization union, closed
+   prepublication decision/refusal evidence, four full result-ID vectors and
+   crossed refusals; owner/tool digests; and
+   pure planning/composition/revalidation. Tests explicitly prove unequal tuple
+   spellings can be compatible and pointee qualifiers remain incompatible.
 3. **Replace registry-less merge with bundle canonicalization and object
    attribution.** Files (4): `src/port_assembly_gate.py`,
    `src/port_wasm_units.py`, `tests/test_port_assembly_gate.py`, and
    `tests/test_port_assembly_abi.py`. Acceptance: gate-owned writes/compiler/
    inspector/rechecks, deterministic per-object compile/link manifests, exact
+   construction of ordered compile/inspect child receipts plus transcript and
+   stream aggregates for single/multi pass/completed-failure/fault, exact
    contributors, bound tool/smoke identities, a complete in-memory
-   `CompositionResult`, and no gate/deep-module durable evidence write. This
+   `CompositionResult` only through the exact finalization union, and no gate/
+   deep-module durable evidence write. Pre-draft and precompile refusals return
+   complete results; the gate passes the same driver-owned `RetryHistory` to
+   analyze and every finalization member, and the draft history digest must
+   match. The gate constructs typed attempted-stage/fault evidence from the
+   adapter it actually invoked; Task 2's finalizer alone derives/validates the
+   closed role projection without Task 3 reclassification. Precompile refusal
+   executes zero tool/analyze spies; bare
+   canonical receipts at prepublication and null pass hashes refuse; callers
+   never insert/remove result fields or IDs. This
    task also owns the schema-1 `processed_results` result-ID/digest index and
    `assembly-gate.lock` critical section: same-ID/same-digest is a raw-byte
    no-op, same-ID/different-digest/bad schema/busy lock refuses without ledger
    mutation, and distinct result IDs preserve the current recurrence fold.
-4. **Add retained-candidate composition retry.** Files (3):
-   `src/port_wasm_units.py`, `tests/test_port_wasm_units.py`, and
+4. **Add retained-candidate composition retry.** Files (4):
+   `src/port_assembly_abi.py`, `src/port_wasm_units.py`,
+   `tests/test_port_wasm_units.py`, and
    `tests/test_port_question_escalation.py`.
    Acceptance: `_next_unit` routes retained candidates; unchanged deterministic
-   blockers wait; transient faults observe exact backoff/bounds; relevant world
-   changes rerun assembly only; journal-only recovery uses no tools; all paths
-   make zero LLM/diagnosis/question calls. No scheduler file changes.
+   blockers wait; the driver supplies exact durable `RetryHistory` while the
+   accepted Task 2 finalizer alone validates/classifies/hashes and emits the
+   final count/backoff projection; Task 4 consumes it without reclassification;
+   statuses are
+   `1/30`, `2/120`, `3/600`, then exhausted; relevant world changes rerun
+   assembly only; journal-only recovery uses no tools; all paths make zero
+   LLM/diagnosis/question calls. No scheduler file changes.
 5. **Bind journal and promotion semantics.** Files (3):
    `src/port_wasm_units.py`, `tests/test_port_wasm_units.py`, and
    `tests/test_port_progress.py`.
-   Acceptance: the driver is the sole result/blocked writer; exact schema-1
+   Acceptance: the driver is the sole result/blocked writer and validates the
+   deep-finalizer-owned ID without field mutation; exact schema-1
    bytes/IDs and every normative transition/state/remote-record hash;
    idempotent local fold;
    path-cycle-free transition; existing authoritative receipt projected as
