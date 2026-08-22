@@ -349,6 +349,7 @@ CLASS_UNDEFINED8_FORK = "undefined8_fork"
 CLASS_COLLISION_STUB = "collision_stub"
 CLASS_DAT_DIVERGENCE = "dat_width_divergence"
 CLASS_DECL_DIVERGENCE = "declaration_divergence"
+CLASS_CANONICALIZATION_REFUSED = "canonicalization_refused"
 CLASS_LINK_FAILURE = "link_failure"
 CLASS_INSTANTIATION_FAILURE = "instantiation_failure"
 
@@ -1425,6 +1426,7 @@ def run_assembly_gate(
     *,
     candidate: UnitArtifact | None = None,
     selection_evidence: dict[str, Any] | None = None,
+    canonicalization: "CanonicalizationRequest | None" = None,
 ) -> dict[str, Any]:
     """Run one N-unit assembly-gate pass. Pure orchestration: emcc and node
     arrive as injected runners.
@@ -1505,6 +1507,22 @@ def run_assembly_gate(
             + ", ".join(duplicate_names)
         )
         return result
+    if canonicalization is not None:
+        # Owner-derived canonicalization (spec section 3). Replaces the
+        # registry-less textual merge entirely: each unit keeps its own header,
+        # canonicalized against the unique verified owner definition, so the
+        # linker sees one ABI per symbol instead of one per caller guess.
+        canonical = _canonicalize_window(
+            units, workdir, candidate, canonicalization, result
+        )
+        if canonical is None:
+            return result
+        c_files, canonical_evidence = canonical
+        result["canonicalization"] = canonical_evidence
+        return _link_and_smoke(
+            result, units, names, workdir, c_files, link_runner, smoke_runner, candidate
+        )
+
     headers = [
         (unit.name, (unit.directory / "gnt4_shim.h").read_text(encoding="utf-8-sig"))
         for unit in units
@@ -1542,6 +1560,124 @@ def run_assembly_gate(
         (workdir / file_name).write_text(source, encoding="utf-8", newline="\n")
         c_files.append(file_name)
 
+    return _link_and_smoke(
+        result, units, names, workdir, c_files, link_runner, smoke_runner, candidate
+    )
+
+
+@dataclass(frozen=True)
+class CanonicalizationRequest:
+    """Everything owner-derived canonicalization needs, supplied by the driver.
+
+    Passing this to run_assembly_gate opts one composition into spec section 3.
+    Omitting it leaves the registry-less merge path byte-identical, so the live
+    gate does not change behaviour until the driver deliberately supplies an
+    owner snapshot.
+    """
+
+    repo_root: Path
+    owner_snapshot: Any
+    attempt: int
+    behavior_tier: str
+    smoke_script: Path
+    environment: tuple[tuple[str, str], ...] = ()
+
+
+def _canonicalization_refusal(
+    result: dict[str, Any], names: list[str], code: str, detail: str
+) -> None:
+    result["stage"] = "canonicalize"
+    result["conflicts"] = [
+        _conflict_record(
+            None, CLASS_CANONICALIZATION_REFUSED, names, {}, f"{code}: {detail}"[:600]
+        )
+    ]
+    result["detail"] = f"{code}: {detail}"[:1200]
+
+
+def _canonicalize_window(
+    units: list[UnitArtifact],
+    workdir: Path,
+    candidate: UnitArtifact | None,
+    request: CanonicalizationRequest,
+    result: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]] | None:
+    """Plan and materialize the owner-canonicalized bundle.
+
+    Returns (c_files, evidence), or None with `result` populated by a contested
+    refusal. Planning is whole-bundle and in memory; nothing is written until
+    the plan succeeds, so a refusal leaves no partial canonical bundle.
+    """
+    from src.port_assembly_abi import CanonicalizationPlan, plan_canonicalization
+
+    names = [unit.name for unit in units]
+    candidate_name = candidate.name if candidate is not None else units[-1].name
+    try:
+        bundle = build_assembly_bundle(
+            units,
+            candidate_name=candidate_name,
+            repo_root=request.repo_root,
+            attempt=request.attempt,
+            behavior_tier=request.behavior_tier,
+            smoke_script=request.smoke_script,
+            environment=request.environment,
+        )
+    except AssemblyAbiError as error:
+        _canonicalization_refusal(
+            result, names, error.refusal.code, error.refusal.detail
+        )
+        return None
+
+    plan = plan_canonicalization(bundle, request.owner_snapshot)
+    if not isinstance(plan, CanonicalizationPlan):
+        # Zero or several owners, an owner/catalog contradiction, or a
+        # Clang-incompatible declaration variant. All are contested: the gate
+        # stops before compile/link rather than picking a winner.
+        _canonicalization_refusal(result, names, plan.code, plan.detail)
+        return None
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    c_files: list[str] = []
+    for item in plan.translation_units:
+        source_path = workdir / item.source_relpath
+        header_path = workdir / item.header_relpath
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        header_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(item.derived_source)
+        header_path.write_bytes(item.derived_header)
+        c_files.append(item.source_relpath)
+
+    evidence = {
+        "receipt_sha256": plan.receipt.sha256,
+        "derived_bundle_sha256": plan.receipt.derived_bundle_sha256,
+        "registry_sha256": plan.receipt.registry_sha256,
+        "tool_world_sha256": plan.receipt.tool_world_sha256,
+        "owners": [item.public_dict() for item in plan.owner_bindings],
+        "compatibility_checks": [item.to_dict() for item in plan.compatibility_checks],
+        "discarded_variants": [item.to_dict() for item in plan.discarded_variants],
+        # Structural ABI evidence only. This makes no behavioural claim and
+        # never raises a unit's verification tier.
+        "behavior_claim": None,
+    }
+    return c_files, evidence
+
+
+def _link_and_smoke(
+    result: dict[str, Any],
+    units: list[UnitArtifact],
+    names: list[str],
+    workdir: Path,
+    c_files: list[str],
+    link_runner: Callable[[Path, list[str], list[str], list[str]], tuple[bool, str]],
+    smoke_runner: Callable[[Path], tuple[bool, str]] | None,
+    candidate: UnitArtifact | None,
+) -> dict[str, Any]:
+    """Link, smoke, and re-verify artifact integrity.
+
+    Shared by the registry-less merge path and the owner-derived
+    canonicalization path so both compose under identical settings -- the gate
+    must never pass under laxer conditions on one route than the other.
+    """
     exports = sorted(
         {
             export

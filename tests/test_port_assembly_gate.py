@@ -1341,3 +1341,276 @@ def test_bundle_refuses_an_unreadable_artifact(tmp_path: Path, smoke_script: Pat
         _build([unit], "auto-c0000-000", smoke_script)
     assert caught.value.refusal.code == "tool_world_unresolvable"
     assert "cannot read" in caught.value.refusal.detail
+
+
+# ------------------------------------------------- canonicalization wiring
+#
+# These exercise the opt-in owner-derived path end to end against a synthetic
+# owner snapshot, so they run without the real schema-1 product registry.
+
+from tests.test_port_assembly_abi import FakeParser, _write_product  # noqa: E402
+
+
+def _synthetic_snapshot(root: Path):
+    """A synthetic owner registry parsed by the REAL pinned Clang.
+
+    The deep module refuses (`parser_tool_identity_mismatch`) unless the parser
+    that produced the owner snapshot is byte-identical to the ToolWorld's clang
+    identity -- the ABI evidence has to come from the same compiler that
+    compiles the bundle. So the registry may be synthetic, but the parser
+    cannot be.
+    """
+    import src.port_assembly_abi as abi
+
+    parser = abi.ClangDeclaratorParser.from_product_root(PRODUCT_ROOT)
+    registry_path, _ = _write_product(root.resolve(), parser=parser)
+    return abi.load_owner_snapshot(root.resolve(), registry_path, parser)
+
+
+OWNED_SYMBOL = "zz_00262b4_"
+OWNER_PROTOTYPE = f"void {OWNED_SYMBOL}(int value);"
+
+
+def _write_unit(directory: Path, name: str, declaration: str) -> None:
+    """One staged-shaped unit that declares OWNED_SYMBOL its own way.
+
+    No include guard. A declaration site's span walks back to the previous
+    statement terminator, so the FIRST declaration in a container swallows any
+    leading preprocessor directives and the dialect preflight refuses them.
+    Real staged headers do lead with directives; see the open question in
+    assembly-abi-resume-status.md.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gnt4_shim.h").write_text(
+        declaration + "\n", encoding="utf-8", newline="\n"
+    )
+    (directory / "unit.c").write_text(
+        "void " + name.replace("-", "_") + "(void) { " + OWNED_SYMBOL + "(1); }\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _artifact(directory: Path, name: str):
+    from src.port_assembly_gate import UnitArtifact, unit_artifact_sha256
+
+    return UnitArtifact(
+        name, directory, unit_artifact_sha256(directory), "", [], [], "compile_only"
+    )
+
+
+@requires_toolchain
+def test_canonicalization_replaces_a_compatible_variant_and_links(
+    tmp_path: Path, smoke_script: Path
+):
+    """Two units spell a compatible declaration differently.
+
+    The registry-less merge calls that a contested conflict on text alone.
+    Owner-derived canonicalization proves the pair compatible with Clang and
+    replaces both with the one owner prototype, so the window reaches the
+    linker with a single ABI.
+    """
+    from src.port_assembly_gate import (
+        CanonicalizationRequest,
+        merge_headers,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+
+    staging = tmp_path / "staging"
+    # A top-level parameter qualifier does not change the function type in C,
+    # so Clang calls these compatible -- but the text merge sees two different
+    # declarations. Parameter NAMES alone would not do: the merge already
+    # normalises those away.
+    _write_unit(staging / "unit-a", "unit-a", f"extern void {OWNED_SYMBOL}(int value);")
+    _write_unit(
+        staging / "unit-b", "unit-b", f"extern void {OWNED_SYMBOL}(const int value);"
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    # Baseline: the current registry-less merge refuses this exact shape.
+    headers = [
+        (unit.name, (unit.directory / "gnt4_shim.h").read_text(encoding="utf-8-sig"))
+        for unit in units
+    ]
+    assert merge_headers(headers).merged_text is None
+
+    linked: dict[str, Any] = {}
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        linked["c_files"] = list(c_files)
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+    )
+
+    assert result["passed"] is True, result["detail"]
+    assert result["stage"] == "pass"
+    assert result["conflicts"] == []
+    assert sorted(linked["c_files"]) == ["unit-a/unit.c", "unit-b/unit.c"]
+    for name in ("unit-a", "unit-b"):
+        header = (tmp_path / "work" / name / "gnt4_shim.h").read_text(encoding="utf-8")
+        assert OWNED_SYMBOL in header
+    evidence = result["canonicalization"]
+    assert evidence["behavior_claim"] is None
+    assert len(evidence["receipt_sha256"]) == 64
+    assert any(item["symbol"] == OWNED_SYMBOL for item in evidence["owners"])
+    assert evidence["compatibility_checks"]
+
+
+@requires_toolchain
+def test_generic_int_guess_is_contested_against_a_void_owner(
+    tmp_path: Path, smoke_script: Path
+):
+    """The dominant real-world shape, and the design's biggest open question.
+
+    Ghidra emits `extern int NAME();` as its default caller-side guess. In C
+    that type is incompatible with a `void` owner, so the spec's rule -- only a
+    `compatible` variant may be replaced -- makes it contested.
+
+    Measured on the 45 staged units: 201 of 239 unique-owner declaration
+    variants (84%) are exactly this generic form. Applied as specified, the
+    gate would therefore fail closed on most windows rather than resolve them.
+    Only 15 variants are specific AND contradict their owner -- the genuine
+    decompiler self-contradictions. Whether the generic form should count as a
+    competing declaration at all, or as the absence of one (the RCA's own P2
+    finding), is an owner decision recorded in assembly-abi-resume-status.md.
+    This test pins today's behaviour so that decision is explicit.
+    """
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        CanonicalizationRequest,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    staging = tmp_path / "staging"
+    _write_unit(staging / "unit-a", "unit-a", f"extern int {OWNED_SYMBOL}();")
+    _write_unit(staging / "unit-b", "unit-b", f"extern void {OWNED_SYMBOL}(int value);")
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("a contested window must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "canonicalize"
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    assert "owner_variant_abi_incompatible" in result["detail"]
+
+
+@requires_toolchain
+def test_canonicalization_refusal_is_contested_and_writes_nothing(
+    tmp_path: Path, smoke_script: Path
+):
+    """An unknown callee has no owner, so the gate must stop before compiling."""
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        CanonicalizationRequest,
+        run_assembly_gate,
+    )
+
+    product = tmp_path / "product"
+    snapshot = _synthetic_snapshot(product)
+
+    staging = tmp_path / "staging"
+    for name in ("unit-a", "unit-b"):
+        directory = staging / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "gnt4_shim.h").write_text(
+            "#ifndef GNT4_SHIM_H\n#define GNT4_SHIM_H\n"
+            "extern int zz_deadbeef_();\n#endif\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (directory / "unit.c").write_text(
+            '#include "gnt4_shim.h"\n\n'
+            f'void {name.replace("-", "_")}(void) {{ zz_deadbeef_(1); }}\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+    units = [_artifact(staging / name, name) for name in ("unit-a", "unit-b")]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("a contested window must never reach the linker")
+
+    workdir = tmp_path / "work"
+    result = run_assembly_gate(
+        units,
+        workdir,
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "canonicalize"
+    assert result["conflicts"]
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    # No partial canonical bundle survives a refusal.
+    assert not (workdir / "unit-a").exists()
+    assert not (workdir / "unit-b").exists()
+
+
+@requires_toolchain
+def test_omitting_canonicalization_leaves_the_merge_path_unchanged(tmp_path: Path):
+    """The live gate must not change behaviour until the driver opts in."""
+    from src.port_assembly_gate import run_assembly_gate
+
+    staging = tmp_path / "staging"
+    _write_unit(staging / "unit-a", "unit-a", f"extern int {OWNED_SYMBOL}();")
+    _write_unit(
+        staging / "unit-b", "unit-b", f"extern void {OWNED_SYMBOL}(int param_1);"
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("the merge must refuse before linking")
+
+    result = run_assembly_gate(
+        units, tmp_path / "work", link_runner=link_runner, candidate=units[-1]
+    )
+    assert result["passed"] is False
+    assert result["stage"] == "merge"
+    assert result["conflicts"]
+    assert "canonicalization" not in result
