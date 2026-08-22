@@ -62,6 +62,14 @@ TRANSIENT_MARKERS = (
     "service unavailable",
     "no model loaded",
     "connection refused",
+    # 409 is the serving host telling us another client holds the single model
+    # slot -- on this machine the open-model-research sweep shares :8888. That
+    # is the backend being busy, not this unit being bad, so it must refund the
+    # attempt and pause rather than burn a good unit. Both shapes appear: httpx
+    # renders "Client error '409 Conflict' for url ...", and the structured
+    # path renders "status_code: 409".
+    "409 conflict",
+    "status_code: 409",
     "status_code: 429",
     "status_code: 500",
     "status_code: 502",

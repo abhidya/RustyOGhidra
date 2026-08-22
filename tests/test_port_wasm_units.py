@@ -4578,3 +4578,23 @@ def test_canonicalization_falls_back_when_the_registry_is_absent(tmp_path: Path)
     probe = _RequestProbe(tmp_path)
     assert probe._canonicalization_request([], tmp_path / "work") is None
     assert probe.events.seen == []
+
+
+@pytest.mark.parametrize(
+    ("message", "is_provider_fault"),
+    [
+        # The serving host says another client holds the single model slot.
+        # On this machine the open-model-research sweep shares :8888, so this
+        # is routine contention -- it must refund the attempt, not burn a unit.
+        ("Client error '409 Conflict' for url 'http://127.0.0.1:8888/v1/chat/completions'", True),
+        ("status_code: 409", True),
+        ("no model loaded", True),
+        ("status_code: 503", True),
+        # A real compile error is the unit's fault and must stay so.
+        ("unit.c:12: error: undeclared identifier", False),
+        # "409" alone must not match -- token counts contain digits too.
+        ("409 tokens generated", False),
+    ],
+)
+def test_backend_contention_is_a_provider_fault(message: str, is_provider_fault: bool):
+    assert WasmUnitDriver._is_provider_fault(Exception(message)) is is_provider_fault
