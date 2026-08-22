@@ -1,0 +1,50 @@
+{
+  "fixture_schema": 1,
+  "fixture_id": "assembly-abi-public-synthetic-v1",
+  "historical_evidence_sha256": {
+    "auto-c0018-018": "e96ef43340ddd601613940fd3a7cd1aa2c778ffe1f5d43e64aeb41651ceaf4f4",
+    "auto-c0035-006": "04243bba39c02497077e668df7eadda68fd489427d9d67772166689cf3524352"
+  },
+  "marker_wins": [
+    {"name": "zz_00262b4_", "encoded": "800262b4", "marker": "80026250", "unit": "auto-c0003-004", "chunk": "chunk_0003.c"},
+    {"name": "zz_00c3484_", "encoded": "800c3484", "marker": "800c2d4c", "unit": "auto-c0020-004", "chunk": "chunk_0020.c"},
+    {"name": "zz_0147d74_", "encoded": "80147d74", "marker": "80147ce4", "unit": "auto-c0038-005", "chunk": "chunk_0038.c"},
+    {"name": "zz_0181c70_", "encoded": "80181c70", "marker": "80181c54", "unit": "auto-c0045-009", "chunk": "chunk_0045.c"},
+    {"name": "zz_01aadb4_", "encoded": "801aadb4", "marker": "801aad50", "unit": "auto-c0051-010", "chunk": "chunk_0051.c"},
+    {"name": "zz_0232a10_", "encoded": "80232a10", "marker": "80232a08", "unit": "auto-c0068-012", "chunk": "chunk_0068.c"},
+    {"name": "zz_0281554_", "encoded": "80281554", "marker": "802813dc", "unit": "auto-c0076-007", "chunk": "chunk_0076.c"},
+    {"name": "zz_02a8e80_", "encoded": "802a8e80", "marker": "802a8b3c", "unit": "auto-c0078-016", "chunk": "chunk_0078.c"}
+  ],
+  "owner_template": {
+    "return_type": "void",
+    "params": ["int"],
+    "structural_class": "C",
+    "returns_value": false,
+    "has_pointer_args": false
+  },
+  "bundle": {
+    "unit": "synthetic-candidate",
+    "attempt": 2,
+    "behavior_tier": "compile_only",
+    "objects": [
+      {"ordinal": 0, "unit": "synthetic-window-0", "role": "window", "source": "int window_0(void){return zz_00262b4_();}\n", "header": "extern void zz_00262b4_(const int);\n"},
+      {"ordinal": 1, "unit": "synthetic-window-1", "role": "window", "source": "int window_1(void){return 1;}\n", "header": "extern void zz_00262b4_(int);\n"},
+      {"ordinal": 2, "unit": "synthetic-window-2", "role": "window", "source": "int window_2(void){return 2;}\n", "header": ""},
+      {"ordinal": 3, "unit": "synthetic-window-3", "role": "window", "source": "int window_3(void){return 3;}\n", "header": ""},
+      {"ordinal": 4, "unit": "synthetic-candidate", "role": "candidate", "source": "void zz_00262b4_(int);\n/* ==== VERBATIM: synthetic.c 1-4 ==== */\nint candidate(void){zz_00262b4_(1);return 7;}\n", "header": "extern void zz_00262b4_(int);\n"}
+    ]
+  },
+  "conflicts": {
+    "three_argument": ["int", "float *", "undefined8"],
+    "sixteen_argument": ["undefined8", "double", "double", "double", "double", "double", "double", "double", "int", "float *", "undefined *", "undefined4", "undefined4", "undefined4", "undefined4", "undefined4"],
+    "zero_owner_symbol": "zz_0000001_",
+    "two_owner_symbol": "zz_0000002_"
+  },
+  "payloads": {
+    "candidate_bytes": "int fixture(void){return 7;}\n",
+    "candidate_sha256": "20b12a5fdc95d41ed77a5f8c791b8ca7e287c448291f6d57ffd052659afeaeb8",
+    "candidate_directory_sha256": "753614caf2ae356f2f204f37c7c9a028078971d7af7c449b767af1e3ce982507",
+    "owner_bytes": "int fixture_owner(void){return 7;}\n",
+    "owner_sha256": "eb3de2969f48d834228125a8e6e1e6c8a149f44964a3d3a8b0df9f9a1d6f7067"
+  }
+}
