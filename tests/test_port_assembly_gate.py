@@ -1203,3 +1203,141 @@ def test_resolve_node_refuses_zero_or_several_pinned_nodes(tmp_path: Path, count
     with pytest.raises(AssemblyAbiError) as caught:
         resolve_node_executable(tmp_path)
     assert caught.value.refusal.code == "tool_world_unresolvable"
+
+
+# ----------------------------------------------------------- assembly bundle
+
+STAGING_ROOT = PRODUCT_ROOT / "research/decomp/port-units-staging"
+
+
+def _staged_unit(name: str):
+    from src.port_assembly_gate import UnitArtifact
+
+    directory = STAGING_ROOT / name
+    provenance = json.loads((directory / "provenance.json").read_text(encoding="utf-8-sig"))
+    return UnitArtifact(
+        name,
+        directory,
+        "a" * 64,
+        provenance.get("generated_at", ""),
+        provenance.get("exported_functions") or [],
+        provenance.get("allowed_extra_imports") or [],
+        provenance.get("tier", "compile_only"),
+    )
+
+
+# The exact five-artifact window from the 2026-08-21 RCA, whose link failed
+# with `wasm-ld: error: function signature mismatch: zz_00076d0_`.
+RCA_C0035_WINDOW = (
+    "auto-c0011-010",
+    "auto-c0034-018",
+    "auto-c0035-002",
+    "auto-c0029-013",
+    "auto-c0035-006",
+)
+
+requires_staging = pytest.mark.skipif(
+    not all((STAGING_ROOT / name / "unit.c").is_file() for name in RCA_C0035_WINDOW),
+    reason="staged RCA window not present in this checkout",
+)
+
+
+def _build(units, candidate_name: str, smoke_script: Path, **overrides):
+    from src.port_assembly_gate import build_assembly_bundle
+
+    kwargs = dict(
+        candidate_name=candidate_name,
+        repo_root=PRODUCT_ROOT,
+        attempt=1,
+        behavior_tier="compile_only",
+        smoke_script=smoke_script,
+    )
+    kwargs.update(overrides)
+    return build_assembly_bundle(units, **kwargs)
+
+
+@requires_toolchain
+@requires_staging
+def test_bundle_from_the_rca_window_satisfies_the_deep_module(smoke_script: Path):
+    from src.port_assembly_abi import _bundle_candidate, _bundle_window, _validate_bundle
+
+    units = [_staged_unit(name) for name in RCA_C0035_WINDOW]
+    bundle = _build(units, "auto-c0035-006", smoke_script)
+
+    assert _validate_bundle(bundle) is None
+    assert [item.ordinal for item in bundle.translation_units] == [0, 1, 2, 3, 4]
+    roles = [item.role for item in bundle.translation_units]
+    assert roles.count("candidate") == 1
+    assert bundle.translation_units[-1].unit == "auto-c0035-006"
+    assert bundle.translation_units[-1].role == "candidate"
+    # Each unit compiles from its own directory so its verbatim
+    # `#include "gnt4_shim.h"` resolves to its own derived header.
+    for item in bundle.translation_units:
+        assert item.source_relpath == f"{item.unit}/unit.c"
+        assert item.header_relpath == f"{item.unit}/gnt4_shim.h"
+        assert item.object_relpath == f"{item.unit}/unit.o"
+    # The validator requires the world's compile argv to equal the plan's, in
+    # order; a mismatch means the composition is not bound to its own compiles.
+    assert bundle.tool_world.compile_argv == tuple(
+        item.compile_argv for item in bundle.translation_units
+    )
+    assert len(bundle.tool_world.inspect_argv) == len(bundle.translation_units)
+    assert _bundle_candidate(bundle).artifact_relpath == "auto-c0035-006/unit.c"
+    assert len(_bundle_window(bundle)) == 5
+
+
+@requires_toolchain
+@requires_staging
+def test_bundle_binds_the_exact_staged_bytes(smoke_script: Path):
+    import hashlib
+
+    units = [_staged_unit(name) for name in RCA_C0035_WINDOW]
+    bundle = _build(units, "auto-c0035-006", smoke_script)
+    for item in bundle.translation_units:
+        on_disk = (STAGING_ROOT / item.unit / "unit.c").read_bytes()
+        assert item.source == on_disk
+        assert item.source_sha256 == hashlib.sha256(on_disk).hexdigest()
+
+
+@requires_toolchain
+@requires_staging
+@pytest.mark.parametrize(
+    ("mutation", "detail"),
+    [
+        ("empty", "at least one unit"),
+        ("duplicate", "unique unit names"),
+        ("absent_candidate", "exactly once"),
+        # A repeated candidate is a repeated NAME, and the uniqueness check
+        # runs first. Pinning that precedence keeps the refusal deterministic.
+        ("repeated_candidate", "unique unit names"),
+    ],
+)
+def test_bundle_refuses_malformed_windows(smoke_script: Path, mutation: str, detail: str):
+    from src.port_assembly_abi import AssemblyAbiError
+
+    units = [_staged_unit(name) for name in RCA_C0035_WINDOW]
+    candidate = "auto-c0035-006"
+    if mutation == "empty":
+        units = []
+    elif mutation == "duplicate":
+        units = [*units, _staged_unit("auto-c0034-018")]
+    elif mutation == "absent_candidate":
+        candidate = "auto-c9999-999"
+    else:
+        units = [*units, _staged_unit("auto-c0035-006")]
+    with pytest.raises(AssemblyAbiError) as caught:
+        _build(units, candidate, smoke_script)
+    assert caught.value.refusal.code == "tool_world_unresolvable"
+    assert detail in caught.value.refusal.detail
+
+
+@requires_toolchain
+def test_bundle_refuses_an_unreadable_artifact(tmp_path: Path, smoke_script: Path):
+    from src.port_assembly_abi import AssemblyAbiError
+    from src.port_assembly_gate import UnitArtifact
+
+    unit = UnitArtifact("auto-c0000-000", tmp_path / "absent", "a" * 64, "", [], [], "compile_only")
+    with pytest.raises(AssemblyAbiError) as caught:
+        _build([unit], "auto-c0000-000", smoke_script)
+    assert caught.value.refusal.code == "tool_world_unresolvable"
+    assert "cannot read" in caught.value.refusal.detail

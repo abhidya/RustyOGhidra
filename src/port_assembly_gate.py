@@ -194,6 +194,135 @@ def build_tool_world(
     )
 
 
+# Every unit.c opens with `#include "gnt4_shim.h"` -- verified uniform across
+# the staged corpus -- and canonicalization gives each unit its OWN derived
+# header. So each translation unit compiles from its own directory, where that
+# include resolves to its own header. The old single shared merged header
+# cannot express per-unit canonicalization, and rewriting the include would
+# edit a verbatim body, which section 3 forbids.
+ASSEMBLY_OUTPUT = "assembly.wasm"
+
+_EMCC_COMPILE_FLAGS: tuple[str, ...] = (
+    "-O1",
+    "-fno-strict-aliasing",
+    "-Wno-implicit-function-declaration",
+    "-Wno-int-conversion",
+    "-Wno-deprecated-non-prototype",
+    "-Wno-incompatible-pointer-types",
+    "-Wno-pointer-sign",
+    "-ferror-limit=0",
+)
+
+
+def bundle_relpaths(unit_name: str) -> tuple[str, str, str]:
+    """(source, header, object) relpaths for one unit inside the attempt dir."""
+    return (
+        f"{unit_name}/unit.c",
+        f"{unit_name}/gnt4_shim.h",
+        f"{unit_name}/unit.o",
+    )
+
+
+def build_assembly_bundle(
+    units: list[UnitArtifact],
+    *,
+    candidate_name: str,
+    repo_root: Path,
+    attempt: int,
+    behavior_tier: str,
+    smoke_script: Path,
+    environment: tuple[tuple[str, str], ...] = (),
+) -> "AssemblyBundle":
+    """Adapt the gate's UnitArtifact window into one deep-module AssemblyBundle.
+
+    Reads each unit's verbatim `unit.c` and its generated `gnt4_shim.h` and
+    binds both by digest. Nothing is written and nothing is canonicalized here:
+    this is purely the record the planner validates and plans against.
+
+    `candidate_name` must name exactly one member of `units`; the deep module
+    requires exactly one candidate role and derives the candidate/window
+    bindings from the translation units when they are not supplied.
+    """
+    from src.port_assembly_abi import AssemblyBundle, BundleTranslationUnit
+
+    if not units:
+        raise AssemblyAbiError(
+            _tool_world_refusal("assembly bundle requires at least one unit")
+        )
+    names = [unit.name for unit in units]
+    if len(set(names)) != len(names):
+        raise AssemblyAbiError(
+            _tool_world_refusal("assembly bundle requires unique unit names")
+        )
+    if names.count(candidate_name) != 1:
+        raise AssemblyAbiError(
+            _tool_world_refusal(
+                f"candidate {candidate_name!r} must appear exactly once in the window"
+            )
+        )
+
+    emcc = (Path(repo_root) / _TOOL_RELPATHS["emcc"]).resolve()
+    inspector = (Path(repo_root) / _TOOL_RELPATHS["object-inspector"]).resolve()
+
+    translation_units: list[BundleTranslationUnit] = []
+    compile_argv: list[tuple[str, ...]] = []
+    inspect_argv: list[tuple[str, ...]] = []
+    for ordinal, unit in enumerate(units):
+        source_rel, header_rel, object_rel = bundle_relpaths(unit.name)
+        try:
+            source = (unit.directory / "unit.c").read_bytes()
+            header = (unit.directory / "gnt4_shim.h").read_bytes()
+        except OSError as error:
+            raise AssemblyAbiError(
+                _tool_world_refusal(f"cannot read {unit.name} artifact: {error}")
+            ) from error
+        unit_compile = (
+            str(emcc),
+            *_EMCC_COMPILE_FLAGS,
+            "-c",
+            source_rel,
+            "-o",
+            object_rel,
+        )
+        unit_inspect = (str(inspector), "--print-file-name", "--defined-only", object_rel)
+        translation_units.append(
+            BundleTranslationUnit(
+                ordinal,
+                unit.name,
+                "candidate" if unit.name == candidate_name else "window",
+                source_rel,
+                source,
+                hashlib.sha256(source).hexdigest(),
+                header_rel,
+                header,
+                hashlib.sha256(header).hexdigest(),
+                object_rel,
+                unit_compile,
+            )
+        )
+        compile_argv.append(unit_compile)
+        inspect_argv.append(unit_inspect)
+
+    objects = tuple(item.object_relpath for item in translation_units)
+    world = build_tool_world(
+        repo_root,
+        compile_argv=tuple(compile_argv),
+        inspect_argv=tuple(inspect_argv),
+        link_argv=(str(emcc), "--no-entry", *objects, "-o", ASSEMBLY_OUTPUT),
+        instantiate_argv=(str(resolve_node_executable(Path(repo_root))), "-e", "instantiate"),
+        smoke_argv=(str(resolve_node_executable(Path(repo_root))), str(Path(smoke_script).resolve())),
+        smoke_script=smoke_script,
+        environment=environment,
+    )
+    return AssemblyBundle(
+        candidate_name,
+        attempt,
+        behavior_tier,  # type: ignore[arg-type]
+        tuple(translation_units),
+        world,
+    )
+
+
 # Rolling window size: link the last N green/staged units on every green.
 # Env-tunable without a code change; read at call time so tests can vary it.
 DEFAULT_ASSEMBLY_N = 5
