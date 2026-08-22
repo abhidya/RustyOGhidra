@@ -738,6 +738,31 @@ def merge_headers(headers: list[tuple[str, str]]) -> MergeResult:
 _DEF_SITE = re.compile(r"\b([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*\{")
 
 
+def header_defines_external_functions(header_text: str) -> list[str]:
+    """Non-static function definitions in a shim header.
+
+    A shim header may legitimately carry `static inline` helpers -- the seed has
+    two. A NON-static definition is different in kind: it creates a real symbol,
+    silently replacing the ROM function of that name with whatever body it
+    carries. The compile-fix model reaches for exactly this as a shortcut to
+    make a unit link, e.g. `void FUN_801336a4(void) { }`.
+
+    Returns the offending symbol names, sorted.
+    """
+    found: set[str] = set()
+    for chunk in parse_header_chunks(header_text):
+        if chunk.kind != "function_def" or chunk.symbol is None:
+            continue
+        head = strip_comments(chunk.text).lstrip()
+        if head.startswith('static') and not (
+            len(head) > 6 and (head[6].isalnum() or head[6] == '_')
+        ):
+            continue
+            continue
+        found.add(chunk.symbol)
+    return sorted(found)
+
+
 def scan_function_definitions(unit_c_text: str) -> set[str]:
     """Names of functions DEFINED (not merely declared) in one unit.c."""
     names: set[str] = set()

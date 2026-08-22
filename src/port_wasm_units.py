@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from src.port_assembly_gate import (
+    header_defines_external_functions,
     BACKFILL_ALLOWED_IGNORED_EVIDENCE,
     BACKFILL_REQUIRED_COMMITTED_FILES,
     ELIGIBLE_CANONICAL_TIERS,
@@ -3843,6 +3844,30 @@ class WasmUnitDriver:
             # redefines the helper" channel deterministically).
             if materialized.transform["sites"]:
                 fixed = ensure_bitcast_helper(fixed)
+            # The model's shortcut to "make it link" is to DEFINE the missing
+            # callee in the header, e.g. `void FUN_801336a4(void) { }`. That is
+            # not a shim: it creates a real symbol and silently replaces the ROM
+            # function with an empty body. Canonicalization catches it at the
+            # assembly gate, but only for symbols that have a registry owner, and
+            # only after the whole compile-fix loop has been paid for. Reject it
+            # here and hand the model the reason. `static` helpers are fine --
+            # the seed carries two.
+            invented = header_defines_external_functions(fixed)
+            if invented:
+                prompt_errors = (
+                    'gnt4_shim.h must DECLARE, never DEFINE. It defines '
+                    + ', '.join(invented[:6])
+                    + ". A definition here creates a real symbol and replaces the "
+                    'ROM function with this body. Replace each with a declaration '
+                    "ending in ';' (a `static` helper is the only definition allowed)."
+                )
+                self.events.emit(
+                    'wasm_unit_header_defines_symbol',
+                    unit=name,
+                    iteration=iteration,
+                    symbols=invented[:6],
+                )
+                continue
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             # Section 2.3 [V4-4]: snapshots are ATTEMPT-scoped
             # (header-attempt{A}-iter{I}.h) so a later attempt can never

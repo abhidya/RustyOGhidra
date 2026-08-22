@@ -1725,3 +1725,47 @@ def test_omitting_canonicalization_leaves_the_merge_path_unchanged(tmp_path: Pat
     assert result["stage"] == "merge"
     assert result["conflicts"]
     assert "canonicalization" not in result
+
+
+# ------------------------------------------- header must declare, never define
+
+
+SEED_HEADER = (
+    "static inline uint countLeadingZeros(int x) { return x; }\n"
+    "extern int zz_00076d0_();\n"
+    "typedef unsigned char undefined1;\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (SEED_HEADER, []),
+        # The model's shortcut to make a unit link: define the callee it is
+        # missing. That creates a real symbol and replaces the ROM function.
+        (SEED_HEADER + "void FUN_801336a4(void) { }\n", ["FUN_801336a4"]),
+        ("static inline int helper(int x) { return x; }\n", []),
+        ("static void h(void) { }\n", []),
+        # `static` must match as a whole word, not a prefix.
+        ("void staticky(void) { }\n", ["staticky"]),
+        ("extern int zz_00076d0_();\n", []),
+        ("void a1(void) { }\nint b2(int x) { return x; }\n", ["a1", "b2"]),
+    ],
+)
+def test_header_defines_external_functions(header: str, expected: list[str]):
+    from src.port_assembly_gate import header_defines_external_functions
+
+    assert header_defines_external_functions(header) == expected
+
+
+def test_the_real_seed_header_defines_nothing_external():
+    """The shipped seed carries two `static inline` helpers and must pass."""
+    from src.port_assembly_gate import header_defines_external_functions
+
+    seed = (
+        PRODUCT_ROOT
+        / "research/decomp/generated/finish-game-port/gnt4_shim_seed.h"
+    )
+    if not seed.is_file():
+        pytest.skip("seed header not present in this checkout")
+    assert header_defines_external_functions(seed.read_text(encoding="utf-8-sig")) == []
