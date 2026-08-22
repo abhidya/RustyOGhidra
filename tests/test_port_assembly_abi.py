@@ -2964,3 +2964,45 @@ def test_the_real_product_registry_is_accepted():
     assert len(registry["functions"]) > 10_000
     assert len({row["unit"] for row in registry["functions"]}) > 1_000
     assert len(registry["ranked_units"]) < len({row["unit"] for row in registry["functions"]})
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (b"#define FUN_801336a4 ((code *)0x801336a4)\n", {"FUN_801336a4"}),
+        (b"  #define GC_U8(a) (*(unsigned char *)(a))\n", {"GC_U8"}),
+        (b"void zz_a_(int);\n", set()),
+        (b"#include <stdbool.h>\n", set()),
+    ],
+)
+def test_macro_defined_symbol_detection(header: bytes, expected: set[str]):
+    """A macro-defined name must never receive an appended prototype.
+
+    `void FUN_801336a4(int);` after `#define FUN_801336a4 ((code *)0x801336a4)`
+    preprocesses to `void ((code *)0x801336a4)(int);`, which does not compile.
+    """
+    assert abi._macro_defined_symbols(header) == expected
+
+
+def test_a_declaration_site_is_not_taken_from_a_macro_line():
+    """`#define ABS(x) __builtin_fabs(x)` reads as a call to the token scanner."""
+    data = b"#define ABS(x) __builtin_fabs(x)\nvoid zz_00262b4_(int);\n"
+    assert abi._site_for_token(data, "ABS", data.index(b"ABS"), data.index(b"ABS") + 3, 0) is None
+
+
+def test_a_declaration_end_ignores_a_semicolon_inside_a_comment():
+    """Raw-scanning for ';' ended real fragments mid-comment."""
+    data = b"/* note; more */\nvoid zz_00262b4_(int);\n"
+    start = data.index(b"zz_00262b4_")
+    site = abi._site_for_token(data, "zz_00262b4_", start, start + len("zz_00262b4_"), 0)
+    assert site is not None
+    kind, begin, finish = site
+    assert kind == "declaration"
+    assert data[begin:finish] == b"void zz_00262b4_(int);"
+
+
+@pytest.mark.parametrize("keyword", ["void", "int", "typedef", "struct", "return"])
+def test_keywords_are_never_declaration_sites(keyword: str):
+    """`typedef void (code)();` made the scanner treat `void` as a callee."""
+    data = b"typedef void (code)();\n"
+    assert abi._site_for_token(data, keyword, 0, len(keyword), 0) is None

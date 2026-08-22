@@ -1640,7 +1640,12 @@ def test_consuming_body_is_contested_when_the_owner_is_linked_in(
 def test_canonicalization_refusal_is_contested_and_writes_nothing(
     tmp_path: Path, smoke_script: Path
 ):
-    """An unknown callee has no owner, so the gate must stop before compiling."""
+    """An owner-eligible callee with no owner must stop before compiling.
+
+    The symbol has to match the internal shape (`zz_` + exactly seven hex
+    digits); an eight-digit name is not owner-eligible at all and would simply
+    pass through uncanonicalized.
+    """
     from src.port_assembly_gate import (
         CLASS_CANONICALIZATION_REFUSED,
         CanonicalizationRequest,
@@ -1656,13 +1661,13 @@ def test_canonicalization_refusal_is_contested_and_writes_nothing(
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "gnt4_shim.h").write_text(
             "#ifndef GNT4_SHIM_H\n#define GNT4_SHIM_H\n"
-            "extern int zz_deadbeef_();\n#endif\n",
+            "extern int zz_0fffff0_();\n#endif\n",
             encoding="utf-8",
             newline="\n",
         )
         (directory / "unit.c").write_text(
             '#include "gnt4_shim.h"\n\n'
-            f'void {name.replace("-", "_")}(void) {{ zz_deadbeef_(1); }}\n',
+            f'void {name.replace("-", "_")}(void) {{ zz_0fffff0_(1); }}\n',
             encoding="utf-8",
             newline="\n",
         )

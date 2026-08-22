@@ -113,6 +113,16 @@ _VERBATIM_MARKER = b"/* ==== VERBATIM:"
 _CONTROL_WORDS = {
     "if", "for", "while", "switch", "return", "sizeof", "_Alignof", "__typeof__", "typeof",
 }
+# Keywords that can be followed by "(" without naming a function. `typedef void
+# (code)();` in the real seed header made the scanner treat `void` as a callee
+# and refuse the whole window on the enclosing typedef.
+_TYPE_KEYWORDS = frozenset(
+    {
+        "void", "char", "short", "int", "long", "float", "double", "signed",
+        "unsigned", "const", "volatile", "restrict", "struct", "union", "enum",
+        "typedef", "static", "extern", "inline", "register", "auto", "_Bool",
+    }
+)
 _EXTERNAL_PREFIXES = ("gnt4_", "emscripten_", "invoke_", "dynCall_", "__")
 _CLOSED_ALIASES = frozenset(
     {
@@ -1155,8 +1165,15 @@ def _parse_index(data: bytes) -> dict[str, tuple[str, str]]:
     addresses: set[str] = set()
     for line in lines[1:]:
         fields = line.split("\t")
-        if len(fields) != 3 or re.fullmatch(r"[0-9A-Fa-f]{8}", fields[0]) is None or _IDENTIFIER_RE.fullmatch(fields[1]) is None:
+        if len(fields) != 3 or re.fullmatch(r"[0-9A-Fa-f]{8}", fields[0]) is None:
             _fail("owner_index_invalid", "owner", f"malformed index row: {line!r}")
+        if _IDENTIFIER_RE.fullmatch(fields[1]) is None:
+            # The export legitimately indexes names that are not C identifiers
+            # (e.g. gnt4-__init_hardware-bl). The registry excludes them -- 22
+            # rows under excluded_reasons.non_c_identifier -- so they are never
+            # looked up here. Refusing the whole index over a row that cannot be
+            # requested made the real index unusable.
+            continue
         address, name, chunk = fields[0].lower(), fields[1], fields[2]
         if name in result or address in addresses:
             _fail("owner_index_invalid", "owner", f"duplicate index name/address: {line!r}")
@@ -2475,6 +2492,16 @@ def _symbol_tokens(data: bytes) -> list[tuple[str, int, int, int]]:
 
 
 def _site_for_token(data: bytes, symbol: str, start: int, end: int, depth: int) -> tuple[str, int, int] | None:
+    if symbol in _CONTROL_WORDS or symbol in _TYPE_KEYWORDS:
+        return None
+    # A token on a preprocessor directive line is not a declaration site.
+    # `#define ABS(x) __builtin_fabs(x)` reads as a function reference to the
+    # symbol scanner, and its span then swallowed the header's whole macro
+    # prelude, which the dialect preflight refused.
+    newline = bytes([10])
+    line_start = data.rfind(newline, 0, start) + 1
+    if data[line_start:start].lstrip().startswith(bytes([35])):
+        return None
     if depth != 0:
         return None
     mask = _code_mask(data)
@@ -2483,7 +2510,10 @@ def _site_for_token(data: bytes, symbol: str, start: int, end: int, depth: int) 
         return None
     closing = _match_balanced(data, mask, opening, ord("("), ord(")"))
     cursor = _skip_space(data, mask, closing + 1)
-    while cursor < len(data) and data[cursor] not in b";{":
+    # Respect the mask: a ";" inside a comment is not the end of a declaration.
+    # Scanning raw bytes here ended real fragments mid-comment, and the
+    # resulting slice failed the lexical balance check.
+    while cursor < len(data) and not (mask[cursor] and data[cursor] in b";{"):
         cursor += 1
     if cursor >= len(data):
         return None
@@ -2497,6 +2527,20 @@ def _site_for_token(data: bytes, symbol: str, start: int, end: int, depth: int) 
         if mask[index] and data[index] in b";}":
             begin = index + 1
             break
+    # A declaration never spans a preprocessor directive. Real headers open
+    # with a macro prelude containing no code-visible ";", so the walk above
+    # fell all the way to offset 0 and swept every #define into the fragment,
+    # which the dialect preflight then refused.
+    newline = bytes([10])
+    hash_byte = bytes([35])
+    cursor_line = begin
+    while True:
+        stop = data.find(newline, cursor_line, start)
+        if stop < 0:
+            break
+        if data[cursor_line:stop].lstrip().startswith(hash_byte):
+            begin = stop + 1
+        cursor_line = stop + 1
     begin = _skip_space(data, mask, begin)
     if kind == "declaration":
         prefix_tokens = re.findall(rb"[A-Za-z_][A-Za-z0-9_]*", data[begin:start])
@@ -2745,6 +2789,37 @@ def _import_safe_prototype(owner: OwnerBinding) -> str | None:
     return f"int {owner.symbol}({body});"
 
 
+def _macro_defined_symbols(data: bytes) -> set[str]:
+    """Symbols this translation unit defines as preprocessor macros.
+
+    A unit may carry a pointer-table macro such as
+    `#define FUN_801336a4 ((code *)0x801336a4)`. Appending a prototype for that
+    name puts the macro in the declarator, and the preprocessor expands it into
+    `void ((code *)0x801336a4)(int);`, which does not compile.
+    """
+    found: set[str] = set()
+    define = bytes([35]) + b"define"
+    for raw in data.split(bytes([10])):
+        stripped = raw.lstrip()
+        if not stripped.startswith(define):
+            continue
+        rest = stripped[len(define):].lstrip()
+        match = _IDENTIFIER_BYTES_RE.match(rest)
+        if match is not None:
+            found.add(match.group().decode("ascii"))
+    return found
+
+
+def _on_directive_line(data: bytes, offset: int) -> bool:
+    """True when `offset` sits on a preprocessor directive line.
+
+    A pointer-table macro such as `#define FUN_801336a4 ((code *)0x801336a4)`
+    is not a declaration, but it does put the symbol immediately before "(".
+    """
+    line_start = data.rfind(bytes([10]), 0, offset) + 1
+    return data[line_start:offset].lstrip().startswith(bytes([35]))
+
+
 def _symbols_declared_more_than_once(
     header: bytes, selected: Mapping[str, OwnerBinding]
 ) -> list[str]:
@@ -2758,6 +2833,7 @@ def _symbols_declared_more_than_once(
             match
             for match in re.finditer(pattern, masked)
             if not (match.start() and masked[match.start() - 1] in _IDENTIFIER_BYTE)
+            and not _on_directive_line(masked, match.start())
         ]
         if len(sites) > 1:
             repeated.append(symbol)
@@ -2895,6 +2971,12 @@ def plan_canonicalization(
     # declaration site and then appending the owner's would leave two
     # contradictory declarations of one symbol in the same header.
     chosen_prototype: dict[str, str] = {}
+    # A unit.c carries both the auto-generated prototype and the verbatim
+    # definition for the same symbol, so one owner/variant pair is compared
+    # twice in one file. That is the same fact recorded twice, not ambiguity --
+    # the owner and the variant prototype are identical, so the result must be.
+    seen_compatibility: set[tuple[str, str, str]] = set()
+    seen_discarded: set[tuple[str, str, str]] = set()
     try:
         registryless: dict[str, set[str]] = {}
         for site in sites:
@@ -2951,7 +3033,10 @@ def plan_canonicalization(
                 # fails closed on 84% of windows instead of resolving them.
                 chosen_prototype[site.symbol] = substitute
                 if site.kind == "declaration":
-                    discarded.append(DiscardedVariant(site.symbol, site.relpath, variant.canonical_prototype_sha256))
+                    discard_key = (site.symbol, site.relpath, variant.canonical_prototype_sha256)
+                    if discard_key not in seen_discarded:
+                        seen_discarded.add(discard_key)
+                        discarded.append(DiscardedVariant(*discard_key))
                     replacements.setdefault((site.ordinal, site.container), []).append(
                         (site.start, site.end, substitute.encode("utf-8"))
                     )
@@ -2981,7 +3066,10 @@ def plan_canonicalization(
                 owner.projection.canonical_prototype,
                 variant.canonical_prototype,
             )
-            compatibility.append(evidence)
+            evidence_key = (site.symbol, site.relpath, variant.canonical_prototype_sha256)
+            if evidence_key not in seen_compatibility:
+                seen_compatibility.add(evidence_key)
+                compatibility.append(evidence)
             if not probe.compatible:
                 return AssemblyAbiRefusal(
                     "owner_variant_abi_incompatible",
@@ -2990,7 +3078,10 @@ def plan_canonicalization(
                     probe.source_sha256,
                 )
             if site.kind == "declaration":
-                discarded.append(DiscardedVariant(site.symbol, site.relpath, variant.canonical_prototype_sha256))
+                discard_key = (site.symbol, site.relpath, variant.canonical_prototype_sha256)
+                if discard_key not in seen_discarded:
+                    seen_discarded.add(discard_key)
+                    discarded.append(DiscardedVariant(*discard_key))
                 replacements.setdefault((site.ordinal, site.container), []).append(
                     (site.start, site.end, owner.normalized_prototype.encode("utf-8"))
                 )
@@ -3011,7 +3102,10 @@ def plan_canonicalization(
         try:
             header = _apply_replacements(item.header, replacements.get((item.ordinal, "header"), ()))
             source = _apply_replacements(item.source, replacements.get((item.ordinal, "source"), ()))
+            macro_defined = _macro_defined_symbols(header)
             for symbol in sorted(selected):
+                if symbol in macro_defined:
+                    continue
                 prototype = chosen_prototype.get(
                     symbol, selected[symbol].normalized_prototype
                 ).encode("utf-8")
