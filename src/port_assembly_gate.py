@@ -48,6 +48,152 @@ from typing import Any, Callable
 
 from src.port_chunk_workflow import atomic_write_json, utc_now
 
+from src.port_assembly_abi import (
+    AssemblyAbiError,
+    ToolIdentity,
+    ToolWorld,
+)
+
+# The six tool roles ToolWorld requires, and where each lives under the repo
+# root. `node` is discovered because emsdk pins its version in the directory
+# name; hardcoding one silently breaks on the next emsdk bump.
+_TOOL_RELPATHS: dict[str, str] = {
+    "clang": "research/tools/emsdk/upstream/bin/clang.exe",
+    "emcc": "research/tools/emsdk/upstream/emscripten/emcc.exe",
+    "object-inspector": "research/tools/emsdk/upstream/bin/llvm-nm.exe",
+    "wasm-ld": "research/tools/emsdk/upstream/bin/wasm-ld.exe",
+}
+_NODE_GLOB = "research/tools/emsdk/node/*/node.exe"
+_EMSCRIPTEN_VERSION_RELPATH = "research/tools/emsdk/upstream/emscripten/emscripten-version.txt"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _tool_version_sha256(path: Path, version_argv: tuple[str, ...]) -> str:
+    """Digest of the tool's own --version output.
+
+    A toolchain upgrade that keeps the same file name must still move the
+    world digest, so composition reds reopen. Failure to run the tool is a
+    refusal, never a placeholder digest.
+    """
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            [str(path), *version_argv],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AssemblyAbiError(
+            _tool_world_refusal(f"cannot run {path.name} {' '.join(version_argv)}: {error}")
+        ) from error
+    if completed.returncode != 0:
+        raise AssemblyAbiError(
+            _tool_world_refusal(
+                f"{path.name} {' '.join(version_argv)} exited {completed.returncode}"
+            )
+        )
+    return hashlib.sha256(completed.stdout + completed.stderr).hexdigest()
+
+
+def _tool_world_refusal(detail: str):
+    from src.port_assembly_abi import AssemblyAbiRefusal
+
+    return AssemblyAbiRefusal("tool_world_unresolvable", "tool-world", detail)
+
+
+def resolve_node_executable(repo_root: Path) -> Path:
+    """The single emsdk-pinned node. Zero or several is a refusal: picking one
+    would bind the world to a tool the next run may not choose."""
+    matches = sorted(repo_root.glob(_NODE_GLOB))
+    if len(matches) != 1:
+        raise AssemblyAbiError(
+            _tool_world_refusal(
+                f"expected exactly one emsdk node, found {len(matches)}: "
+                + ", ".join(str(item) for item in matches[:4])
+            )
+        )
+    return matches[0]
+
+
+def build_tool_world(
+    repo_root: Path,
+    *,
+    compile_argv: tuple[tuple[str, ...], ...],
+    inspect_argv: tuple[tuple[str, ...], ...],
+    link_argv: tuple[str, ...],
+    instantiate_argv: tuple[str, ...],
+    smoke_argv: tuple[str, ...],
+    smoke_script: Path,
+    environment: tuple[tuple[str, str], ...] = (),
+) -> ToolWorld:
+    """Build the production ToolWorld for one assembly composition.
+
+    Every role is bound to a real absolute path, the file's own digest, and the
+    digest of its `--version` output. `smoke-script` is a generated file rather
+    than an executable, so its content digest serves as both identities -- it
+    has no version to interrogate, and its bytes are what actually change.
+
+    Any unresolvable tool refuses; the gate must never compose against a
+    partially-identified toolchain.
+    """
+    root = Path(repo_root).resolve(strict=True)
+    identities: list[ToolIdentity] = []
+    for role, relpath in _TOOL_RELPATHS.items():
+        path = (root / relpath).resolve()
+        if not path.is_file():
+            raise AssemblyAbiError(
+                _tool_world_refusal(f"{role} is not a file at {path}")
+            )
+        if role == "emcc":
+            # emcc.exe is a launcher that needs emsdk_env sourced, so
+            # `emcc --version` exits 1 when run directly and cannot serve as
+            # the version identity. emscripten pins its own release in
+            # emscripten-version.txt, which is exactly what moves on an
+            # upgrade -- and unlike sourcing emsdk it costs no subprocess.
+            version_file = (root / _EMSCRIPTEN_VERSION_RELPATH).resolve()
+            if not version_file.is_file():
+                raise AssemblyAbiError(
+                    _tool_world_refusal(f"emscripten version file missing at {version_file}")
+                )
+            version_digest = _sha256_file(version_file)
+        else:
+            version_digest = _tool_version_sha256(path, ("--version",))
+        identities.append(
+            ToolIdentity(role, str(path), _sha256_file(path), version_digest)
+        )
+    node = resolve_node_executable(root).resolve()
+    identities.append(
+        ToolIdentity("node", str(node), _sha256_file(node), _tool_version_sha256(node, ("--version",)))
+    )
+    script = Path(smoke_script).resolve()
+    if not script.is_file():
+        raise AssemblyAbiError(
+            _tool_world_refusal(f"smoke-script is not a file at {script}")
+        )
+    script_digest = _sha256_file(script)
+    identities.append(ToolIdentity("smoke-script", str(script), script_digest, script_digest))
+
+    environment_sorted = tuple(sorted(environment, key=lambda item: item[0]))
+    return ToolWorld(
+        tuple(sorted(identities, key=lambda item: item.role)),
+        compile_argv,
+        inspect_argv,
+        link_argv,
+        instantiate_argv,
+        smoke_argv,
+        environment_sorted,
+    )
+
+
 # Rolling window size: link the last N green/staged units on every green.
 # Env-tunable without a code change; read at call time so tests can vary it.
 DEFAULT_ASSEMBLY_N = 5

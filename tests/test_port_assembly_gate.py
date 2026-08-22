@@ -1056,3 +1056,150 @@ def test_gate_refuses_duplicate_unit_names_loudly(tmp_path):
     assert result["stage"] == "select"
     assert linked == []
     assert result["conflicts"] and result["conflicts"][0]["symbol"] == "auto-x"
+
+
+# --------------------------------------------------------------- tool world
+#
+# Task 3 needs a production ToolWorld: the deep module only shipped
+# ToolWorld.synthetic(), which cannot bind a real composition to the toolchain
+# that produced it.
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _discover_product_root() -> Path:
+    """Walk up until the emsdk toolchain appears.
+
+    The OGhidra checkout sits at <product>/research/tools/OGhidra, but review
+    worktrees live at <product>/.tmp/<name>, so a fixed parents[n] index
+    silently skips these tests in exactly the tree they are meant to guard.
+    """
+    probe = "research/tools/emsdk/upstream/bin/clang.exe"
+    for candidate in (REPO_ROOT, *REPO_ROOT.parents):
+        if (candidate / probe).is_file():
+            return candidate
+    return REPO_ROOT
+
+
+PRODUCT_ROOT = _discover_product_root()
+
+
+def _tool_world_kwargs(smoke_script: Path, **overrides):
+    kwargs = dict(
+        compile_argv=(("clang", "-c", "unit.c"),),
+        inspect_argv=(("llvm-nm", "unit.o"),),
+        link_argv=("wasm-ld", "-o", "assembly.wasm"),
+        instantiate_argv=("node", "instantiate.cjs"),
+        smoke_argv=("node", "assembly-smoke.cjs"),
+        smoke_script=smoke_script,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.fixture
+def smoke_script(tmp_path: Path) -> Path:
+    path = tmp_path / "assembly-smoke.cjs"
+    path.write_text('console.log("smoke");\n', encoding="utf-8")
+    return path
+
+
+def _product_root_available() -> bool:
+    from src.port_assembly_gate import _EMSCRIPTEN_VERSION_RELPATH, _TOOL_RELPATHS
+
+    return all((PRODUCT_ROOT / rel).is_file() for rel in _TOOL_RELPATHS.values()) and (
+        PRODUCT_ROOT / _EMSCRIPTEN_VERSION_RELPATH
+    ).is_file()
+
+
+requires_toolchain = pytest.mark.skipif(
+    not _product_root_available(), reason="emsdk toolchain not present in this checkout"
+)
+
+
+@requires_toolchain
+def test_tool_world_binds_every_role_to_the_real_toolchain(smoke_script: Path):
+    from src.port_assembly_abi import _validate_tool_world
+    from src.port_assembly_gate import build_tool_world
+
+    world = build_tool_world(PRODUCT_ROOT, **_tool_world_kwargs(smoke_script))
+    _validate_tool_world(world)
+    assert tuple(item.role for item in world.identities) == (
+        "clang",
+        "emcc",
+        "node",
+        "object-inspector",
+        "smoke-script",
+        "wasm-ld",
+    )
+    for item in world.identities:
+        assert Path(item.resolved_path).is_file()
+        assert len(item.file_sha256) == 64 and len(item.version_sha256) == 64
+    # emcc.exe cannot answer --version without emsdk_env, so its version
+    # identity comes from emscripten-version.txt; it must NOT silently fall
+    # back to the file digest, which would not move on an in-place upgrade.
+    emcc = next(item for item in world.identities if item.role == "emcc")
+    assert emcc.version_sha256 != emcc.file_sha256
+    # The smoke script has no version to interrogate; both identities are its
+    # own bytes, which is exactly what changes when it is regenerated.
+    script = next(item for item in world.identities if item.role == "smoke-script")
+    assert script.version_sha256 == script.file_sha256
+
+
+@requires_toolchain
+def test_tool_world_digest_moves_when_the_smoke_script_changes(smoke_script: Path):
+    from src.port_assembly_gate import build_tool_world
+
+    before = build_tool_world(PRODUCT_ROOT, **_tool_world_kwargs(smoke_script))
+    smoke_script.write_text('console.log("smoke2");\n', encoding="utf-8")
+    after = build_tool_world(PRODUCT_ROOT, **_tool_world_kwargs(smoke_script))
+    assert before.tool_world_sha256 != after.tool_world_sha256
+
+
+@requires_toolchain
+def test_tool_world_sorts_environment_regardless_of_input_order(smoke_script: Path):
+    from src.port_assembly_gate import build_tool_world
+
+    world = build_tool_world(
+        PRODUCT_ROOT,
+        **_tool_world_kwargs(
+            smoke_script, environment=(("PATH", "b" * 64), ("EMSDK", "a" * 64))
+        ),
+    )
+    assert tuple(name for name, _ in world.environment) == ("EMSDK", "PATH")
+
+
+def test_tool_world_refuses_a_missing_smoke_script(tmp_path: Path):
+    from src.port_assembly_abi import AssemblyAbiError
+    from src.port_assembly_gate import build_tool_world
+
+    if not _product_root_available():
+        pytest.skip("emsdk toolchain not present in this checkout")
+    with pytest.raises(AssemblyAbiError) as caught:
+        build_tool_world(
+            PRODUCT_ROOT, **_tool_world_kwargs(tmp_path / "absent.cjs")
+        )
+    assert caught.value.refusal.code == "tool_world_unresolvable"
+
+
+def test_tool_world_refuses_a_root_without_the_toolchain(tmp_path: Path, smoke_script: Path):
+    from src.port_assembly_abi import AssemblyAbiError
+    from src.port_assembly_gate import build_tool_world
+
+    with pytest.raises(AssemblyAbiError) as caught:
+        build_tool_world(tmp_path, **_tool_world_kwargs(smoke_script))
+    assert caught.value.refusal.code == "tool_world_unresolvable"
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_resolve_node_refuses_zero_or_several_pinned_nodes(tmp_path: Path, count: int):
+    from src.port_assembly_abi import AssemblyAbiError
+    from src.port_assembly_gate import resolve_node_executable
+
+    for index in range(count):
+        node_dir = tmp_path / "research/tools/emsdk/node" / f"2{index}.0.0_64bit"
+        node_dir.mkdir(parents=True)
+        (node_dir / "node.exe").write_bytes(b"stub")
+    with pytest.raises(AssemblyAbiError) as caught:
+        resolve_node_executable(tmp_path)
+    assert caught.value.refusal.code == "tool_world_unresolvable"
