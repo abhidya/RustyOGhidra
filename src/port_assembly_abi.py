@@ -203,6 +203,10 @@ class AssemblyAbiRefusal:
     detail: str
     evidence_sha256: str | None = None
     revalidation_check: object | None = None
+    # The implicated symbol when the refusal is about one. The gate records this
+    # on the conflict, and the knowledge registry keys assembly conflicts by
+    # symbol -- a null one is harvested as "no symbol" and dropped.
+    symbol: str | None = None
 
 
 class AssemblyAbiError(ValueError):
@@ -3091,6 +3095,7 @@ def plan_canonicalization(
                     "canonicalize",
                     f"Clang rejected {site.symbol} owner/variant pair at {site.relpath}",
                     probe.source_sha256,
+                    symbol=site.symbol,
                 )
             if site.kind == "declaration":
                 discard_key = (site.symbol, site.relpath, variant.canonical_prototype_sha256)

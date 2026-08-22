@@ -1584,12 +1584,16 @@ class CanonicalizationRequest:
 
 
 def _canonicalization_refusal(
-    result: dict[str, Any], names: list[str], code: str, detail: str
+    result: dict[str, Any],
+    names: list[str],
+    code: str,
+    detail: str,
+    symbol: str | None = None,
 ) -> None:
     result["stage"] = "canonicalize"
     result["conflicts"] = [
         _conflict_record(
-            None, CLASS_CANONICALIZATION_REFUSED, names, {}, f"{code}: {detail}"[:600]
+            symbol, CLASS_CANONICALIZATION_REFUSED, names, {}, f"{code}: {detail}"[:600]
         )
     ]
     result["detail"] = f"{code}: {detail}"[:1200]
@@ -1633,7 +1637,9 @@ def _canonicalize_window(
         # Zero or several owners, an owner/catalog contradiction, or a
         # Clang-incompatible declaration variant. All are contested: the gate
         # stops before compile/link rather than picking a winner.
-        _canonicalization_refusal(result, names, plan.code, plan.detail)
+        _canonicalization_refusal(
+            result, names, plan.code, plan.detail, getattr(plan, "symbol", None)
+        )
         return None
 
     workdir.mkdir(parents=True, exist_ok=True)

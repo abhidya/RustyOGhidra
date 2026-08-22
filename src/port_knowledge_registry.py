@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any
 
 from src.port_assembly_gate import (
+    CLASS_CANONICALIZATION_REFUSED,
     CLASS_COLLISION_STUB,
     CLASS_DAT_DIVERGENCE,
     CLASS_DECL_DIVERGENCE,
@@ -125,6 +126,7 @@ KNOWN_ASSEMBLY_CONFLICT_CLASSES = frozenset(
         CLASS_DECL_DIVERGENCE,
         CLASS_LINK_FAILURE,
         CLASS_INSTANTIATION_FAILURE,
+        CLASS_CANONICALIZATION_REFUSED,
     }
 )
 
@@ -320,6 +322,10 @@ def _canonical_assembly_conflict(
     if symbol is None and conflict_class not in {
         CLASS_LINK_FAILURE,
         CLASS_INSTANTIATION_FAILURE,
+        # A canonicalization refusal usually names its symbol, but a
+        # bundle-wide one (an ambiguous owner catalog, say) legitimately has
+        # none. Dropping the whole harvest over that loses the record.
+        CLASS_CANONICALIZATION_REFUSED,
     }:
         raise ValueError(f"assembly conflict {source_key!r} has no symbol")
     if not isinstance(units, list) or not units or any(
