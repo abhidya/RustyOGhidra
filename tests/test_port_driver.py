@@ -514,3 +514,71 @@ def test_batch_push_uses_an_explicit_refspec(tmp_path: Path, monkeypatch):
     driver._batch_push()
     pushes = [args for args in calls if len(args) > 1 and args[1] == "push"]
     assert pushes == [("git", "push", "origin", "HEAD")]
+
+
+# --------------------------------------------------------------- driver lock
+#
+# The OS reuses process ids. driver.lock in the live run directory still names
+# a pid that is now an unrelated cmd.exe started twelve days after the lock was
+# written, so liveness alone cannot decide staleness.
+
+def _write_lock(path, pid, started_at):
+    path.write_text(
+        json.dumps({"pid": pid, "started_at": started_at}), encoding="utf-8"
+    )
+
+
+def test_lock_from_a_dead_holder_is_reclaimed(tmp_path):
+    from src.port_driver import DriverLock
+
+    path = tmp_path / "wasm-units.lock"
+    _write_lock(path, 0x7FFFFFFE, "2026-08-21T22:00:29.165026Z")
+    lock = DriverLock(path)
+    assert lock.acquire() is True
+    lock.release()
+    assert not path.exists()
+
+
+def test_lock_whose_pid_was_recycled_is_reclaimed(tmp_path):
+    """A live pid that started long AFTER the lock is a different process."""
+    from src.port_driver import DriverLock
+
+    path = tmp_path / "wasm-units.lock"
+    # This process is alive, and it certainly started after the year 2000 --
+    # exactly the recycled shape, and the only case that may be reclaimed.
+    _write_lock(path, os.getpid(), "2000-01-01T00:00:00.000000Z")
+    lock = DriverLock(path)
+    assert lock.acquire() is True
+    lock.release()
+
+
+@pytest.mark.parametrize(
+    "started_at",
+    ["", "not-a-timestamp", None, 12345],
+)
+def test_unreadable_start_stamp_never_reclaims_a_live_lock(tmp_path, started_at):
+    """Uncertainty must hold the lock: stalling beats stealing a live run."""
+    from src.port_driver import DriverLock
+
+    path = tmp_path / "wasm-units.lock"
+    path.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": started_at}), encoding="utf-8"
+    )
+    assert DriverLock(path).acquire() is False
+    assert path.exists()
+
+
+def test_a_holder_started_within_tolerance_still_holds(tmp_path):
+    """The normal case: the holder writes its lock moments after starting."""
+    import psutil
+    from datetime import datetime, timezone
+
+    from src.port_driver import DriverLock
+
+    path = tmp_path / "wasm-units.lock"
+    created = datetime.fromtimestamp(
+        psutil.Process(os.getpid()).create_time(), tz=timezone.utc
+    )
+    _write_lock(path, os.getpid(), created.isoformat().replace("+00:00", "Z"))
+    assert DriverLock(path).acquire() is False
+    assert path.exists()

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,42 @@ class DriverEvents:
             handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
 
 
+# A lock is written by its holder immediately after that process starts, so the
+# holder's creation time is always at or before the recorded started_at. Allow a
+# small margin for clock granularity before calling a PID reused.
+_PID_RECYCLE_TOLERANCE_SECONDS = 30.0
+
+
+def _holder_pid_was_recycled(holder: dict[str, Any], pid: int) -> bool:
+    """True only when the live PID provably belongs to a DIFFERENT process.
+
+    The OS reuses process ids. This directory has a proven case: driver.lock
+    still names a pid that is now an unrelated cmd.exe started twelve days after
+    the lock was written. Liveness alone therefore cannot decide staleness -- a
+    recycled pid looks alive forever and the driver refuses to start until
+    someone deletes the file by hand.
+
+    Any uncertainty returns False. Stalling is recoverable; stealing a running
+    driver's lock corrupts the run it is in the middle of.
+    """
+    stamp = holder.get("started_at")
+    if not isinstance(stamp, str) or not stamp:
+        return False
+    try:
+        recorded = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if recorded.tzinfo is None:
+        recorded = recorded.replace(tzinfo=timezone.utc)
+    try:
+        import psutil
+
+        created = datetime.fromtimestamp(psutil.Process(pid).create_time(), tz=timezone.utc)
+    except Exception:
+        return False
+    return created > recorded + timedelta(seconds=_PID_RECYCLE_TOLERANCE_SECONDS)
+
+
 class DriverLock:
     """Single-instance guard (R9). Stale locks from SIGKILLed drivers are reclaimed."""
 
@@ -191,8 +228,12 @@ class DriverLock:
                     holder = json.loads(self.path.read_text(encoding="utf-8-sig"))
                     holder_pid = int(holder.get("pid", 0))
                 except (json.JSONDecodeError, OSError, ValueError):
-                    holder_pid = 0
-                if holder_pid and _pid_alive(holder_pid):
+                    holder, holder_pid = {}, 0
+                if (
+                    holder_pid
+                    and _pid_alive(holder_pid)
+                    and not _holder_pid_was_recycled(holder, holder_pid)
+                ):
                     return False
                 try:
                     self.path.unlink()
