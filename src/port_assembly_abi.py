@@ -634,21 +634,44 @@ def _validate_registry(value: object) -> dict[str, Any]:
     for key, expected_value in expected.items():
         if summary[key] != expected_value:
             _fail("oracle_registry_summary_invalid", "owner", f"summary {key} does not agree with records")
-    fully_names = sorted(row["unit"] for row in top["ranked_units"] if row["fully_gap_aligned"])
-    if summary["fully_gap_aligned_unit_names"] != fully_names or summary["fully_gap_aligned_units"] != len(fully_names):
-        _fail("oracle_registry_summary_invalid", "owner", "fully-gap-aligned summary disagrees with ranked units")
+    # `ranked_units` is a top-50 shortlist, not a per-unit index: the producer
+    # (research/decomp/data/build_oracle_registry.py) documents "a ranked top-50
+    # unit list" and emits ranked[:50]. Requiring it to cover every function unit
+    # was an assumption carried over from the synthetic fixture, whose shortlist
+    # happens to be total; against the real registry -- 10,954 functions over
+    # 1,396 units with 50 ranked rows -- it refused outright.
     ranked_by_unit = {row["unit"]: row for row in top["ranked_units"]}
-    if set(ranked_by_unit) != units:
-        _fail("oracle_registry_ranked_invalid", "owner", "ranked units must cover every function unit exactly once")
+    if len(ranked_by_unit) != len(top["ranked_units"]):
+        _fail("oracle_registry_ranked_invalid", "owner", "ranked units must name each unit at most once")
+    if not set(ranked_by_unit) <= units:
+        _fail("oracle_registry_ranked_invalid", "owner", "ranked units must be a subset of the function units")
+    # The producer derives the fully-gap-aligned names from ALL ranked entries,
+    # not the emitted slice, so they cannot be recomputed from the shortlist.
+    # Validate their shape and that each names a real unit.
+    fully_names = summary["fully_gap_aligned_unit_names"]
+    if (
+        not isinstance(fully_names, list)
+        or fully_names != sorted(set(fully_names))
+        or not all(isinstance(name, str) and name in units for name in fully_names)
+        or summary["fully_gap_aligned_units"] != len(fully_names)
+    ):
+        _fail("oracle_registry_summary_invalid", "owner", "fully-gap-aligned summary is inconsistent")
     functions_by_unit: dict[str, list[dict[str, Any]]] = {}
     for item in functions:
         functions_by_unit.setdefault(item["unit"], []).append(item)
     for unit, rows in functions_by_unit.items():
-        ranked = ranked_by_unit[unit]
+        # Only shortlisted units carry a ranked row; the rest are still fully
+        # validated as functions, they simply have no ranking to cross-check.
+        ranked = ranked_by_unit.get(unit)
+        if ranked is None:
+            continue
         exact_counts = {
             "fn_count": len(rows),
-            "gap_partial_slots": sum(
-                row["gap_alignment"]["partial_slots"] if row["gap_alignment"] is not None else 0 for row in rows
+            # The producer takes the MAX across the unit's functions
+            # (build_oracle_registry.py: `max(a["gap_partials"])`), not a sum.
+            "gap_partial_slots": max(
+                (row["gap_alignment"]["partial_slots"] for row in rows if row["gap_alignment"] is not None),
+                default=0,
             ),
             "port_citations": sum(
                 citation["grade"] == "port" for row in rows for citation in row["ts_citations"]
@@ -667,14 +690,29 @@ def _validate_registry(value: object) -> dict[str, Any]:
         )
         if ranked["gap_family_ctors"] != family_ctors:
             _fail("oracle_registry_ranked_invalid", "owner", f"ranked gap families disagree for {unit}")
-    expected_bucket_names = {key: [] for key in ORACLE_BUCKETS}
+    # `oracle_kind` and the oracle buckets are unrelated fields, and conflating
+    # them refused the real registry. `oracle_kind` is copied from the queue's
+    # per-unit oracle spec (build_oracle_registry.py: `unit["oracle"]["type"]`)
+    # and is an open vocabulary -- every ranked row currently reads
+    # "compile_only", which is not a bucket name at all.
     for row in top["ranked_units"]:
-        if not isinstance(row["oracle_kind"], str) or row["oracle_kind"] not in ORACLE_BUCKETS:
-            _fail("oracle_registry_ranked_invalid", "owner", f"unknown oracle kind for {row['unit']}")
-        expected_bucket_names[row["oracle_kind"]].append(row["unit"])
-    expected_bucket_names = {key: sorted(values) for key, values in expected_bucket_names.items()}
-    if summary["oracle_able_unit_names"] != expected_bucket_names:
-        _fail("oracle_registry_summary_invalid", "owner", "oracle bucket names disagree with ranked units")
+        if not _nonempty_string(row["oracle_kind"]):
+            _fail("oracle_registry_ranked_invalid", "owner", f"missing oracle kind for {row['unit']}")
+    # The buckets are classified from ALL ranked entries by citation/gap shape,
+    # so they cannot be recomputed from the emitted top-50 slice. Validate their
+    # shape and that every name is a real unit.
+    bucket_names = summary["oracle_able_unit_names"]
+    if not isinstance(bucket_names, Mapping) or set(bucket_names) != set(ORACLE_BUCKETS):
+        _fail("oracle_registry_summary_invalid", "owner", "oracle bucket keys are not the known set")
+    seen_bucket_units: set[str] = set()
+    for key, names in bucket_names.items():
+        if not isinstance(names, list) or names != sorted(set(names)):
+            _fail("oracle_registry_summary_invalid", "owner", f"oracle bucket {key} names invalid")
+        if not all(isinstance(name, str) and name in units for name in names):
+            _fail("oracle_registry_summary_invalid", "owner", f"oracle bucket {key} names unknown unit")
+        if seen_bucket_units & set(names):
+            _fail("oracle_registry_summary_invalid", "owner", "a unit appears in two oracle buckets")
+        seen_bucket_units.update(names)
     return top
 
 
@@ -2628,6 +2666,104 @@ def _validate_bundle(bundle: AssemblyBundle) -> AssemblyAbiRefusal | None:
     return None
 
 
+# A call sits in STATEMENT position only when the preceding code character ends
+# the previous statement or opens a block. Anything else -- an assignment, a
+# return, an argument, a condition, an operator -- consumes the result.
+#
+# ':' is deliberately NOT in this set. It ends a label or a `case`, but it also
+# separates the arms of a ternary, where the result IS consumed. Treating those
+# few labelled calls as consuming is the fail-closed direction; treating a
+# ternary arm as a statement would supersede a declaration the body depends on.
+_STATEMENT_TERMINATORS = frozenset(b";{}")
+_WHITESPACE_BYTES = frozenset(bytes([32, 9, 13, 10, 12, 11]))  # space tab cr lf ff vt
+_IDENTIFIER_BYTE = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$")
+
+
+def _is_unprototyped_placeholder(projection: DeclaratorProjection) -> bool:
+    """True for Ghidra's information-free caller guess, `extern int f();`.
+
+    An unprototyped declarator states nothing about the parameters. It is not a
+    competing claim about the ABI, it is the absence of one, so the unique
+    verified owner definition supersedes it rather than being probed against it.
+    Section 2 of the RCA says the same thing about generic fallbacks.
+    """
+    return projection.prototype_kind == "unspecified" and not projection.abi_tuple.parameter_types
+
+
+def _every_call_discards_the_result(data: bytes, symbol: str) -> bool:
+    """True when no call to `symbol` in this source consumes its return value.
+
+    Fails closed: a call whose position cannot be shown to be statement-level is
+    treated as consuming the result. Superseding an `int` placeholder with a
+    `void` owner turns `x = f(...)` into a compile error, so this must not guess
+    optimistically.
+    """
+    mask = _code_mask(data)
+    masked = bytes(byte if mask[index] else 32 for index, byte in enumerate(data))
+    encoded = symbol.encode("ascii")
+    for match in re.finditer(re.escape(encoded) + rb"\s*\(", masked):
+        start = match.start()
+        # Reject a suffix match inside a longer identifier (foo_zz_a_ vs zz_a_).
+        if start and masked[start - 1] in _IDENTIFIER_BYTE:
+            continue
+        # Walk back over whitespace to the previous code byte. Scanning rather
+        # than slicing keeps this linear -- a large unit.c has hundreds of calls.
+        index = start - 1
+        while index >= 0 and masked[index] in _WHITESPACE_BYTES:
+            index -= 1
+        if index >= 0 and masked[index] not in _STATEMENT_TERMINATORS:
+            return False
+    return True
+
+
+def _import_safe_prototype(owner: OwnerBinding) -> str | None:
+    """Owner parameters with a value-returning result, for an IMPORTED callee.
+
+    Ghidra sometimes types a callee `void` from its definition while a caller's
+    decompiled body still consumes r3. Both cannot be honoured: substituting the
+    void owner turns `x = f(...)` into a compile error, and the body is verbatim.
+
+    When the owner's defining unit is NOT in the bundle the symbol is an import,
+    so the definition is not being linked and its return type is not binding --
+    only agreement among the bundle's declarations is, which is exactly the
+    defect being fixed. Take the owner's parameter list, which is the ABI
+    evidence that matters, and keep a value-returning result so every body still
+    compiles. The JS host stubs these callees anyway.
+
+    Returns None when the record cannot be reconstructed, so the caller contests.
+    """
+    record = owner.record
+    return_type = record.get("return_type")
+    params = record.get("params")
+    if not isinstance(return_type, str) or not isinstance(params, list):
+        return None
+    if any(not isinstance(item, str) for item in params):
+        return None
+    if any(token in return_type for token in "()[]"):
+        return None
+    body = "" if params == [] else ",".join(params)
+    return f"int {owner.symbol}({body});"
+
+
+def _symbols_declared_more_than_once(
+    header: bytes, selected: Mapping[str, OwnerBinding]
+) -> list[str]:
+    """Canonicalized symbols with more than one declaration in this header."""
+    mask = _code_mask(header)
+    masked = bytes(byte if mask[index] else 32 for index, byte in enumerate(header))
+    repeated: list[str] = []
+    for symbol in sorted(selected):
+        pattern = re.escape(symbol.encode("ascii")) + rb"\s*\("
+        sites = [
+            match
+            for match in re.finditer(pattern, masked)
+            if not (match.start() and masked[match.start() - 1] in _IDENTIFIER_BYTE)
+        ]
+        if len(sites) > 1:
+            repeated.append(symbol)
+    return repeated
+
+
 def _apply_replacements(data: bytes, replacements: Sequence[tuple[int, int, bytes]]) -> bytes:
     result = data
     ordered = sorted(replacements)
@@ -2754,6 +2890,11 @@ def plan_canonicalization(
     compatibility: list[CompatibilityEvidence] = []
     discarded: list[DiscardedVariant] = []
     replacements: dict[tuple[int, str], list[tuple[int, int, bytes]]] = {}
+    # The prototype actually substituted for each symbol. The header top-up below
+    # MUST use the same string: substituting an import-safe prototype at the
+    # declaration site and then appending the owner's would leave two
+    # contradictory declarations of one symbol in the same header.
+    chosen_prototype: dict[str, str] = {}
     try:
         registryless: dict[str, set[str]] = {}
         for site in sites:
@@ -2787,6 +2928,34 @@ def plan_canonicalization(
                 return AssemblyAbiRefusal(
                     "declarator_parser_fault", "canonicalize", f"parser returned malformed projection for {site.symbol}"
                 )
+            placeholder = _is_unprototyped_placeholder(variant)
+            result_unused = all(
+                _every_call_discards_the_result(item.source, site.symbol)
+                for item in bundle.translation_units
+            )
+            owner_defined_here = any(
+                item.unit == owner.unit for item in bundle.translation_units
+            )
+            substitute: str | None = owner.normalized_prototype
+            if placeholder and owner.projection.abi_tuple.return_type == "void" and not result_unused:
+                # A body consumes a void owner's result. If the owner is being
+                # linked in, that is a real contradiction and must contest; if it
+                # is an import, only the bundle's declarations need to agree.
+                substitute = None if owner_defined_here else _import_safe_prototype(owner)
+            if placeholder and substitute is not None:
+                # Supersede rather than probe. Clang would call `int f()`
+                # incompatible with `void f(int,uint)` and contest the window,
+                # but the placeholder never claimed anything to conflict with.
+                # Measured on the staged corpus: 201 of 239 owner-symbol
+                # declaration variants are exactly this shape, so probing them
+                # fails closed on 84% of windows instead of resolving them.
+                chosen_prototype[site.symbol] = substitute
+                if site.kind == "declaration":
+                    discarded.append(DiscardedVariant(site.symbol, site.relpath, variant.canonical_prototype_sha256))
+                    replacements.setdefault((site.ordinal, site.container), []).append(
+                        (site.start, site.end, substitute.encode("utf-8"))
+                    )
+                continue
             probe = parser.compatibility(owner.projection, variant)
             if not _compatibility_probe_is_valid(
                 probe,
@@ -2843,11 +3012,23 @@ def plan_canonicalization(
             header = _apply_replacements(item.header, replacements.get((item.ordinal, "header"), ()))
             source = _apply_replacements(item.source, replacements.get((item.ordinal, "source"), ()))
             for symbol in sorted(selected):
-                prototype = selected[symbol].normalized_prototype.encode("utf-8")
+                prototype = chosen_prototype.get(
+                    symbol, selected[symbol].normalized_prototype
+                ).encode("utf-8")
                 if prototype not in header:
                     if header and not header.endswith(b"\n"):
                         header += b"\n"
                     header += prototype + b"\n"
+            duplicated = _symbols_declared_more_than_once(header, selected)
+            if duplicated:
+                # Two prototypes for one symbol will not compile, and a stubbed
+                # link runner in a test would never notice. A canonicalized header
+                # must carry exactly one declaration per canonicalized symbol.
+                return AssemblyAbiRefusal(
+                    "canonical_header_ambiguous",
+                    "canonicalize",
+                    f"{item.unit} declares " + ", ".join(duplicated[:4]) + " more than once after canonicalization",
+                )
         except AssemblyAbiError as exc:
             return exc.refusal
         planned.append(

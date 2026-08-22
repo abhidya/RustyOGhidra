@@ -2848,3 +2848,119 @@ def test_real_clang_gnu11_refusals_are_typed(
     with pytest.raises(abi.AssemblyAbiError) as caught:
         parser.parse_definition(source, "synthetic")
     assert caught.value.refusal.code == code
+
+
+# ------------------------------------------- placeholder supersession helpers
+
+
+@pytest.mark.parametrize(
+    ("source", "discards", "label"),
+    [
+        (b"void u(void){ zz_a_(1); }", True, "plain statement"),
+        (b"void u(void){ x = zz_a_(1); }", False, "assignment"),
+        (b"void u(void){ return zz_a_(1); }", False, "return"),
+        (b"void u(void){ f(zz_a_(1)); }", False, "argument"),
+        (b"void u(void){ x = c ? zz_a_(1) : 0; }", False, "ternary true arm"),
+        # ':' ends a label but also separates ternary arms, so it must not count
+        # as statement position -- this arm's result IS consumed.
+        (b"void u(void){ x = c ? 0 : zz_a_(1); }", False, "ternary false arm"),
+        (b"void u(void){ if (zz_a_(1)) {} }", False, "condition"),
+        (b"void u(void){ foo_zz_a_(1); }", True, "suffix of a longer identifier"),
+        (b"void u(void){ /* zz_a_(1) */ y = 1; }", True, "inside a comment"),
+        (b"void u(void){\n  zz_a_(1);\n  zz_a_(2);\n}", True, "two statements"),
+        (b"void u(void){\n  zz_a_(1);\n  x = zz_a_(2);\n}", False, "one of two consumes"),
+        (b"void u(void){ zz_a_ (1); }", True, "space before paren"),
+    ],
+)
+def test_call_result_use_detection(source: bytes, discards: bool, label: str):
+    assert abi._every_call_discards_the_result(source, "zz_a_") is discards, label
+
+
+@pytest.mark.parametrize(
+    ("fragment", "expected"),
+    [
+        (b"extern int zz_a_();", True),
+        (b"extern void zz_a_();", True),
+        (b"extern void zz_a_(int);", False),
+        (b"extern void zz_a_(void);", False),
+    ],
+)
+def test_unprototyped_placeholder_detection(fragment: bytes, expected: bool):
+    """Only a declarator with no parameter list at all is a placeholder."""
+    parser = FakeParser()
+    projection = parser.parse_declaration(fragment, "zz_a_")
+    assert abi._is_unprototyped_placeholder(projection) is expected
+
+
+def test_import_safe_prototype_keeps_owner_params_and_a_value_result(tmp_path: Path):
+    """An imported callee typed `void` whose caller consumes r3.
+
+    Both cannot be honoured: substituting the void owner turns `x = f(...)` into
+    a compile error and the body is verbatim. When the owner is NOT linked in,
+    only the bundle's declarations need to agree, so keep the owner's parameter
+    list -- the ABI evidence that matters -- with a value-returning result.
+    """
+    snapshot = _load_snapshot(tmp_path.resolve())
+    binding = snapshot.owner_index["zz_00262b4_"][0]
+    prototype = abi._import_safe_prototype(binding)
+    assert prototype is not None
+    assert prototype.startswith("int zz_00262b4_(")
+    assert prototype.endswith(");")
+    # the parameter list is the owner's, verbatim from the registry record
+    assert ",".join(binding.record["params"]) in prototype
+
+
+def test_import_safe_prototype_refuses_an_unrepresentable_record(tmp_path: Path):
+    """A return declarator schema 1 cannot reconstruct must contest, not guess."""
+    from dataclasses import replace as _replace
+    from types import MappingProxyType
+
+    snapshot = _load_snapshot(tmp_path.resolve())
+    binding = snapshot.owner_index["zz_00262b4_"][0]
+    for bad in ({"return_type": "void (*)(int)", "params": []}, {"return_type": "int", "params": [1]}):
+        record = dict(binding.record)
+        record.update(bad)
+        assert abi._import_safe_prototype(_replace(binding, record=MappingProxyType(record))) is None
+
+
+class _Sym:
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (b"int zz_a_(int);\n", []),
+        # Two prototypes for one symbol will not compile; a stubbed link runner
+        # in a test would never notice, so the planner must refuse structurally.
+        (b"int zz_a_(int);\nvoid zz_a_(int);\n", ["zz_a_"]),
+        (b"int foo_zz_a_(int);\nint zz_a_(int);\n", []),
+        (b"/* int zz_a_(int); */\nint zz_a_(int);\n", []),
+    ],
+)
+def test_duplicate_declaration_detection(header: bytes, expected: list[str]):
+    assert abi._symbols_declared_more_than_once(header, {"zz_a_": _Sym("zz_a_")}) == expected
+
+
+REAL_REGISTRY = REAL_PRODUCT_ROOT / "research/decomp/data/oracle-registry.json"
+
+
+@pytest.mark.skipif(
+    not REAL_REGISTRY.is_file()
+    or json.loads(REAL_REGISTRY.read_text(encoding="utf-8-sig")).get("oracle_registry_schema") != 1,
+    reason="the schema-1 product registry is not present in this checkout",
+)
+def test_the_real_product_registry_is_accepted():
+    """The adapter had only ever run against the synthetic fixture.
+
+    Against the real registry it refused outright on three assumptions the
+    fixture happened to satisfy: that ranked_units covers every function unit
+    (it is a documented top-50 shortlist), that gap_partial_slots is a sum
+    (the producer takes a max), and that oracle_kind names an oracle bucket
+    (it is an open vocabulary copied from the queue, currently "compile_only").
+    """
+    registry = abi._validate_registry(abi._parse_json(REAL_REGISTRY.read_bytes()))
+    assert len(registry["functions"]) > 10_000
+    assert len({row["unit"] for row in registry["functions"]}) > 1_000
+    assert len(registry["ranked_units"]) < len({row["unit"] for row in registry["functions"]})

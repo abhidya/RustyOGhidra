@@ -1371,7 +1371,7 @@ OWNED_SYMBOL = "zz_00262b4_"
 OWNER_PROTOTYPE = f"void {OWNED_SYMBOL}(int value);"
 
 
-def _write_unit(directory: Path, name: str, declaration: str) -> None:
+def _write_unit(directory: Path, name: str, declaration: str, body: str | None = None) -> None:
     """One staged-shaped unit that declares OWNED_SYMBOL its own way.
 
     No include guard. A declaration site's span walks back to the previous
@@ -1384,8 +1384,9 @@ def _write_unit(directory: Path, name: str, declaration: str) -> None:
     (directory / "gnt4_shim.h").write_text(
         declaration + "\n", encoding="utf-8", newline="\n"
     )
+    statement = body if body is not None else OWNED_SYMBOL + "(1);"
     (directory / "unit.c").write_text(
-        "void " + name.replace("-", "_") + "(void) { " + OWNED_SYMBOL + "(1); }\n",
+        "void " + name.replace("-", "_") + "(void) { " + statement + " }\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -1474,29 +1475,18 @@ def test_canonicalization_replaces_a_compatible_variant_and_links(
 
 
 @requires_toolchain
-def test_generic_int_guess_is_contested_against_a_void_owner(
+def test_generic_placeholder_is_superseded_not_contested(
     tmp_path: Path, smoke_script: Path
 ):
-    """The dominant real-world shape, and the design's biggest open question.
+    """Ghidra's `extern int NAME();` is the absence of a claim, not a rival one.
 
-    Ghidra emits `extern int NAME();` as its default caller-side guess. In C
-    that type is incompatible with a `void` owner, so the spec's rule -- only a
-    `compatible` variant may be replaced -- makes it contested.
-
-    Measured on the 45 staged units: 201 of 239 unique-owner declaration
-    variants (84%) are exactly this generic form. Applied as specified, the
-    gate would therefore fail closed on most windows rather than resolve them.
-    Only 15 variants are specific AND contradict their owner -- the genuine
-    decompiler self-contradictions. Whether the generic form should count as a
-    competing declaration at all, or as the absence of one (the RCA's own P2
-    finding), is an owner decision recorded in assembly-abi-resume-status.md.
-    This test pins today's behaviour so that decision is explicit.
+    Clang calls `int f()` incompatible with a `void f(int)`, so probing the
+    placeholder contests the window. Measured on the staged corpus, 201 of 239
+    owner-symbol declaration variants are exactly this shape -- probing them
+    fails closed on 84% of windows instead of resolving them. The unique
+    verified owner supersedes it instead.
     """
-    from src.port_assembly_gate import (
-        CLASS_CANONICALIZATION_REFUSED,
-        CanonicalizationRequest,
-        run_assembly_gate,
-    )
+    from src.port_assembly_gate import CanonicalizationRequest, run_assembly_gate
 
     snapshot = _synthetic_snapshot(tmp_path / "product")
     staging = tmp_path / "staging"
@@ -1505,6 +1495,123 @@ def test_generic_int_guess_is_contested_against_a_void_owner(
     units = [
         _artifact(staging / "unit-a", "unit-a"),
         _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    linked: dict[str, Any] = {}
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        linked["c_files"] = list(c_files)
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+    )
+
+    assert result["passed"] is True, result["detail"]
+    assert result["conflicts"] == []
+    header = (tmp_path / "work" / "unit-a" / "gnt4_shim.h").read_text(encoding="utf-8")
+    assert f"extern int {OWNED_SYMBOL}();" not in header
+    assert OWNED_SYMBOL in header
+    # The placeholder is recorded as discarded, and no probe is fabricated for it.
+    evidence = result["canonicalization"]
+    assert any(item["symbol"] == OWNED_SYMBOL for item in evidence["discarded_variants"])
+
+
+@requires_toolchain
+def test_consuming_body_resolves_against_an_imported_owner(
+    tmp_path: Path, smoke_script: Path
+):
+    """Owner typed `void`, body consumes the result, owner NOT linked in.
+
+    Substituting the void owner would turn `x = f(...)` into a compile error and
+    the body is verbatim. Because the owner is an import, only the bundle's
+    declarations have to agree, so the owner's parameters are kept with a
+    value-returning result and the window resolves.
+    """
+    from src.port_assembly_gate import CanonicalizationRequest, run_assembly_gate
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    staging = tmp_path / "staging"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern int {OWNED_SYMBOL}();",
+        body=f"int taken = {OWNED_SYMBOL}(1); (void)taken;",
+    )
+    _write_unit(staging / "unit-b", "unit-b", f"extern int {OWNED_SYMBOL}();")
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    linked: dict[str, Any] = {}
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        linked["ok"] = True
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+    )
+
+    assert result["passed"] is True, result["detail"]
+    assert linked.get("ok") is True
+    header = (tmp_path / "work" / "unit-a" / "gnt4_shim.h").read_text(encoding="utf-8")
+    # value-returning, and carrying the owner's parameter list
+    assert f"int {OWNED_SYMBOL}(" in header
+    assert f"void {OWNED_SYMBOL}(" not in header
+
+
+@requires_toolchain
+def test_consuming_body_is_contested_when_the_owner_is_linked_in(
+    tmp_path: Path, smoke_script: Path
+):
+    """Same shape, but the owner's own unit is IN the bundle.
+
+    Now the definition is being linked, so its `void` result is binding and the
+    consuming body is a genuine contradiction. The gate must stop before compile
+    rather than invent a return type that disagrees with the definition it is
+    about to link.
+    """
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        CanonicalizationRequest,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    owner_unit = snapshot.owner_index[OWNED_SYMBOL][0].unit
+    staging = tmp_path / "staging"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern int {OWNED_SYMBOL}();",
+        body=f"int taken = {OWNED_SYMBOL}(1); (void)taken;",
+    )
+    _write_unit(staging / owner_unit, owner_unit, f"extern int {OWNED_SYMBOL}();")
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / owner_unit, owner_unit),
     ]
 
     def link_runner(workdir, c_files, exports, allowed_extra):
@@ -1527,7 +1634,6 @@ def test_generic_int_guess_is_contested_against_a_void_owner(
     assert result["passed"] is False
     assert result["stage"] == "canonicalize"
     assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
-    assert "owner_variant_abi_incompatible" in result["detail"]
 
 
 @requires_toolchain
