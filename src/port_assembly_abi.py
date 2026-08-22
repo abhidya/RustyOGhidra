@@ -901,7 +901,7 @@ def _projection_text(value: object) -> bool:
 def _abi_tuple_is_valid(value: object) -> bool:
     if type(value) is not AbiTuple:
         return False
-    return (
+    if not (
         _projection_text(value.return_type)
         and isinstance(value.parameter_types, tuple)
         and all(_projection_text(item) for item in value.parameter_types)
@@ -911,7 +911,11 @@ def _abi_tuple_is_valid(value: object) -> bool:
         and type(value.abi_tuple_schema) is int
         and value.abi_tuple_schema == 1
         and value.calling_convention == "c"
-    )
+    ):
+        return False
+    if value.prototype_kind in {"unspecified", "void"}:
+        return not value.parameter_types and not value.variadic
+    return bool(value.parameter_types)
 
 
 def _adjusted_parameter_evidence_is_valid(value: object) -> bool:
@@ -972,7 +976,12 @@ def _declarator_projection_is_valid(value: object, expected_symbol: str) -> bool
         or value.variadic != value.abi_tuple.variadic
     ):
         return False
-    return _abi_probe_evidence_is_valid(value.abi_probe_evidence, value.abi_tuple.arity)
+    if not _abi_probe_evidence_is_valid(value.abi_probe_evidence, value.abi_tuple.arity):
+        return False
+    return all(
+        item.desugared_qual_type == value.abi_tuple.parameter_types[item.ordinal]
+        for item in value.abi_probe_evidence.adjusted_parameters
+    )
 
 
 @dataclass(frozen=True)
@@ -981,6 +990,26 @@ class CompatibilityProbe:
     source: bytes
     source_sha256: str
     parser_identity_sha256: str
+
+
+def _compatibility_probe_is_valid(
+    value: object,
+    owner: DeclaratorProjection,
+    variant: DeclaratorProjection,
+    parser_identity_sha256: str,
+) -> bool:
+    if type(value) is not CompatibilityProbe or type(value.compatible) is not bool or not isinstance(value.source, bytes):
+        return False
+    expected = build_compatibility_source(
+        owner.canonical_prototype,
+        variant.canonical_prototype,
+        symbol=owner.symbol,
+    )
+    return (
+        value.source == expected
+        and value.source_sha256 == _hash_bytes(expected)
+        and value.parser_identity_sha256 == parser_identity_sha256
+    )
 
 
 class DeclaratorParser(Protocol):
@@ -2171,6 +2200,9 @@ class CompatibilityEvidence:
     probe_source_sha256: str
     parser_identity_sha256: str
     result: Literal["compatible", "incompatible"]
+    _probe_source: bytes = field(repr=False)
+    _owner_prototype: str = field(repr=False)
+    _variant_prototype: str = field(repr=False)
     compatibility_schema: int = 1
 
     def to_dict(self) -> dict[str, object]:
@@ -2187,6 +2219,65 @@ class CompatibilityEvidence:
             "variant_abi_tuple_sha256": self.variant_abi_tuple_sha256,
             "variant_prototype_sha256": self.variant_prototype_sha256,
         }
+
+
+def _compatibility_evidence_is_valid(
+    value: object,
+    parser_identity_sha256: str,
+    owner_bindings: Mapping[str, OwnerBinding],
+) -> bool:
+    if type(value) is not CompatibilityEvidence:
+        return False
+    if (
+        not isinstance(value.symbol, str)
+        or _IDENTIFIER_RE.fullmatch(value.symbol) is None
+        or not isinstance(value.source_relpath, str)
+        or not _projection_text(value._owner_prototype)
+        or not _projection_text(value._variant_prototype)
+        or not isinstance(value._probe_source, bytes)
+        or not all(
+            _valid_sha(digest)
+            for digest in (
+                value.owner_prototype_sha256,
+                value.variant_prototype_sha256,
+                value.owner_abi_tuple_sha256,
+                value.variant_abi_tuple_sha256,
+                value.probe_source_sha256,
+                value.parser_identity_sha256,
+            )
+        )
+        or not _positive_int(value.probe_source_size)
+        or not isinstance(value.result, str)
+        or value.result not in {"compatible", "incompatible"}
+        or type(value.compatibility_schema) is not int
+        or value.compatibility_schema != 1
+        or value.parser_identity_sha256 != parser_identity_sha256
+    ):
+        return False
+    owner = owner_bindings.get(value.symbol)
+    if owner is None or not _declarator_projection_is_valid(owner.projection, value.symbol):
+        return False
+    if (
+        owner.normalized_prototype != value._owner_prototype
+        or owner.projection.canonical_prototype_sha256 != value.owner_prototype_sha256
+        or owner.projection.abi_tuple.sha256 != value.owner_abi_tuple_sha256
+        or _hash_bytes(value._owner_prototype.encode("utf-8")) != value.owner_prototype_sha256
+        or _hash_bytes(value._variant_prototype.encode("utf-8")) != value.variant_prototype_sha256
+    ):
+        return False
+    try:
+        expected_source = build_compatibility_source(
+            value._owner_prototype,
+            value._variant_prototype,
+            symbol=value.symbol,
+        )
+    except AssemblyAbiError:
+        return False
+    return (
+        value._probe_source == expected_source
+        and value.probe_source_size == len(expected_source)
+        and value.probe_source_sha256 == _hash_bytes(expected_source)
+    )
 
 
 @dataclass(frozen=True)
@@ -2264,6 +2355,8 @@ class CanonicalizationReceipt:
     bundle_files: tuple[BundleFileBinding, ...]
     tool_world_sha256: str
     assembly_world_sha256: str
+    parser_identity: ParserIdentity = field(repr=False)
+    tool_world: ToolWorld = field(repr=False)
     receipt_schema: int = 1
 
     def to_dict(self) -> dict[str, object]:
@@ -2695,7 +2788,12 @@ def plan_canonicalization(
                     "declarator_parser_fault", "canonicalize", f"parser returned malformed projection for {site.symbol}"
                 )
             probe = parser.compatibility(owner.projection, variant)
-            if not isinstance(probe, CompatibilityProbe):
+            if not _compatibility_probe_is_valid(
+                probe,
+                owner.projection,
+                variant,
+                owners.parser_identity.sha256,
+            ):
                 return AssemblyAbiRefusal(
                     "declarator_parser_fault", "canonicalize", f"parser returned malformed compatibility probe for {site.symbol}"
                 )
@@ -2710,6 +2808,9 @@ def plan_canonicalization(
                 probe.source_sha256,
                 probe.parser_identity_sha256,
                 "compatible" if probe.compatible else "incompatible",
+                probe.source,
+                owner.projection.canonical_prototype,
+                variant.canonical_prototype,
             )
             compatibility.append(evidence)
             if not probe.compatible:
@@ -2842,6 +2943,8 @@ def plan_canonicalization(
         tuple(sorted(bundle_files, key=lambda item: item.relpath)),
         bundle.tool_world.tool_world_sha256,
         assembly_world_sha,
+        owners.parser_identity,
+        bundle.tool_world,
     )
     return CanonicalizationPlan(bundle, tuple(planned), bindings, tuple(compatibility), tuple(discarded), receipt)
 
@@ -3778,7 +3881,30 @@ def _canonical_receipt_is_valid(receipt: object) -> bool:
         receipt.tool_world_sha256,
         receipt.assembly_world_sha256,
     )
-    if not all(_valid_sha(value) for value in scalar_hashes) or receipt.receipt_schema != 1:
+    if (
+        not all(_valid_sha(value) for value in scalar_hashes)
+        or type(receipt.receipt_schema) is not int
+        or receipt.receipt_schema != 1
+        or not _parser_identity_is_valid(receipt.parser_identity)
+        or receipt.parser_identity.sha256 != receipt.parser_identity_sha256
+    ):
+        return False
+    try:
+        _validate_tool_world(receipt.tool_world)
+    except (AssemblyAbiError, AttributeError, TypeError, ValueError):
+        return False
+    if receipt.tool_world.tool_world_sha256 != receipt.tool_world_sha256:
+        return False
+    clang_identity = next(
+        (identity for identity in receipt.tool_world.identities if identity.role == "clang"),
+        None,
+    )
+    if (
+        clang_identity is None
+        or receipt.parser_identity.executable_path != clang_identity.resolved_path
+        or receipt.parser_identity.binary_sha256 != clang_identity.file_sha256
+        or receipt.parser_identity.version_sha256 != clang_identity.version_sha256
+    ):
         return False
     try:
         _validate_relpath(receipt.registry_relpath)
@@ -3827,25 +3953,9 @@ def _canonical_receipt_is_valid(receipt: object) -> bool:
             _validate_relpath(item.chunk_file)
     except AssemblyAbiError:
         return False
-    if not all(
-        isinstance(item, CompatibilityEvidence)
-        and isinstance(item.symbol, str)
-        and _IDENTIFIER_RE.fullmatch(item.symbol) is not None
-        and isinstance(item.source_relpath, str)
-        and all(
-            _valid_sha(value)
-            for value in (
-                item.owner_prototype_sha256,
-                item.variant_prototype_sha256,
-                item.owner_abi_tuple_sha256,
-                item.variant_abi_tuple_sha256,
-                item.probe_source_sha256,
-                item.parser_identity_sha256,
-            )
-        )
-        and _nonnegative_int(item.probe_source_size)
-        and item.result in {"compatible", "incompatible"}
-        and item.compatibility_schema == 1
+    owner_binding_map = {item.symbol: item for item in receipt.owner_bindings}
+    if len(owner_binding_map) != len(receipt.owner_bindings) or not all(
+        _compatibility_evidence_is_valid(item, receipt.parser_identity_sha256, owner_binding_map)
         for item in receipt.compatibility_checks
     ):
         return False

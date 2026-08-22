@@ -813,6 +813,62 @@ def test_owner_parser_nested_projection_member_types_refuse_typed(tmp_path: Path
     assert caught.value.refusal.code == "owner_declarator_parser_fault"
 
 
+@pytest.mark.parametrize(
+    ("prototype_kind", "parameter_types", "variadic"),
+    [
+        ("void", ("int",), False),
+        ("unspecified", ("int",), False),
+        ("prototype", (), False),
+        ("void", (), True),
+        ("unspecified", (), True),
+    ],
+)
+def test_owner_parser_refuses_prototype_kind_arity_and_variadic_contradictions(
+    tmp_path: Path,
+    prototype_kind: str,
+    parameter_types: tuple[str, ...],
+    variadic: bool,
+):
+    base = FakeParser._projection(b"void zz_00262b4_(int);", "zz_00262b4_")
+    tuple_value = abi.AbiTuple("void", parameter_types, prototype_kind, variadic)
+    malformed = replace(
+        base,
+        spelled_parameter_types=parameter_types,
+        prototype_kind=prototype_kind,
+        variadic=variadic,
+        abi_tuple=tuple_value,
+    )
+
+    class MalformedParser(FakeParser):
+        @staticmethod
+        def _projection(fragment: bytes, symbol: str) -> abi.DeclaratorProjection:
+            return replace(malformed, symbol=symbol)
+
+    registry_path, parser = _write_product(tmp_path.resolve(), parser=MalformedParser())
+    with pytest.raises(abi.AssemblyAbiError) as caught:
+        abi.load_owner_snapshot(tmp_path.resolve(), registry_path, parser)
+    assert caught.value.refusal.code == "owner_declarator_parser_fault"
+
+
+def test_owner_parser_refuses_adjusted_parameter_evidence_that_disagrees_with_tuple(tmp_path: Path):
+    base = FakeParser._projection(b"void zz_00262b4_(int);", "zz_00262b4_")
+    adjusted = abi.AdjustedParameterEvidence(0, "int", 1, "a" * 64, "float *")
+    malformed = replace(
+        base,
+        abi_probe_evidence=replace(base.abi_probe_evidence, adjusted_parameters=(adjusted,)),
+    )
+
+    class MalformedParser(FakeParser):
+        @staticmethod
+        def _projection(fragment: bytes, symbol: str) -> abi.DeclaratorProjection:
+            return replace(malformed, symbol=symbol)
+
+    registry_path, parser = _write_product(tmp_path.resolve(), parser=MalformedParser())
+    with pytest.raises(abi.AssemblyAbiError) as caught:
+        abi.load_owner_snapshot(tmp_path.resolve(), registry_path, parser)
+    assert caught.value.refusal.code == "owner_declarator_parser_fault"
+
+
 def test_plan_is_bundle_wide_atomic_verbatim_preserving_and_deterministic(tmp_path: Path):
     snapshot = _load_snapshot(tmp_path.resolve())
     bundle = _bundle()
@@ -836,6 +892,80 @@ def test_plan_is_bundle_wide_atomic_verbatim_preserving_and_deterministic(tmp_pa
     assert original[original.index(marker) :] == derived[derived.index(marker) :]
     assert b"void zz_00262b4_(int);" in derived
     assert all(plan.object_relpath.endswith(".o") for plan in first.translation_units)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["compatible_type", "source_type", "source_bytes", "source_sha256", "parser_identity_sha256"],
+)
+def test_plan_refuses_crossed_compatibility_probe_evidence_before_receipt(tmp_path: Path, mutation: str):
+    class MaliciousCompatibilityParser(FakeParser):
+        def compatibility(
+            self,
+            left: abi.DeclaratorProjection,
+            right: abi.DeclaratorProjection,
+        ) -> abi.CompatibilityProbe:
+            probe = super().compatibility(left, right)
+            if mutation == "compatible_type":
+                return replace(probe, compatible=1)
+            if mutation == "source_type":
+                return replace(probe, source=[])
+            if mutation == "source_bytes":
+                return replace(probe, source=b"x")
+            if mutation == "source_sha256":
+                return replace(probe, source_sha256="b" * 64)
+            return replace(probe, parser_identity_sha256="c" * 64)
+
+    registry_path, parser = _write_product(tmp_path.resolve(), parser=MaliciousCompatibilityParser())
+    snapshot = abi.load_owner_snapshot(tmp_path.resolve(), registry_path, parser)
+    refusal = abi.plan_canonicalization(_bundle(), snapshot)
+    assert isinstance(refusal, abi.AssemblyAbiRefusal)
+    assert refusal.code == "declarator_parser_fault"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "probe_source",
+        "owner_prototype",
+        "variant_prototype",
+        "probe_source_size",
+        "probe_source_sha256",
+        "parser_identity_sha256",
+        "receipt_parser_identity",
+        "receipt_tool_world",
+    ],
+)
+def test_revalidation_repeats_exact_compatibility_pair_and_parser_tool_binding(tmp_path: Path, mutation: str):
+    plan = abi.plan_canonicalization(_bundle(), _load_snapshot(tmp_path.resolve()))
+    assert isinstance(plan, abi.CanonicalizationPlan)
+    receipt = plan.receipt
+    evidence = receipt.compatibility_checks[0]
+    if mutation == "probe_source":
+        evidence = replace(evidence, _probe_source=b"x")
+    elif mutation == "owner_prototype":
+        evidence = replace(evidence, _owner_prototype="void zz_00262b4_(float);")
+    elif mutation == "variant_prototype":
+        evidence = replace(evidence, _variant_prototype="void zz_00262b4_(float);")
+    elif mutation == "probe_source_size":
+        evidence = replace(evidence, probe_source_size=evidence.probe_source_size + 1)
+    elif mutation == "probe_source_sha256":
+        evidence = replace(evidence, probe_source_sha256="b" * 64)
+    elif mutation == "parser_identity_sha256":
+        evidence = replace(evidence, parser_identity_sha256="c" * 64)
+    elif mutation == "receipt_parser_identity":
+        receipt = replace(receipt, parser_identity=replace(receipt.parser_identity, binary_sha256="d" * 64))
+    else:
+        identities = tuple(
+            replace(item, file_sha256="e" * 64) if item.role == "clang" else item
+            for item in receipt.tool_world.identities
+        )
+        receipt = replace(receipt, tool_world=replace(receipt.tool_world, identities=identities))
+    if mutation not in {"receipt_parser_identity", "receipt_tool_world"}:
+        receipt = replace(receipt, compatibility_checks=(evidence, *receipt.compatibility_checks[1:]))
+    refusal = abi.revalidate_receipt(receipt, tmp_path.resolve(), abi.ReceiptObservation.from_plan(plan))
+    assert isinstance(refusal, abi.AssemblyAbiRefusal)
+    assert refusal.code == "canonicalization_receipt_invalid"
 
 
 def test_plan_refuses_pointee_qualifier_difference_but_accepts_top_level_qualifiers(tmp_path: Path):
