@@ -1873,6 +1873,26 @@ class WasmUnitDriver:
             return False, (completed.stderr + completed.stdout)[-8000:]
         bad = scan_disallowed_imports(workdir / ASSEMBLY_WASM)
         bad = [name for name in bad if name not in set(allowed_extra)]
+        # Same address-taken allowance as the per-unit gate, for the same
+        # reason: a symbol stored into a dispatch slot rather than called is
+        # missing from allowed_extra_imports, because that list comes from a
+        # regex requiring a following "(". Keeping the two gates symmetric is
+        # this function's stated contract -- it must not be LAXER than the
+        # per-unit build, and after the per-unit fix it was stricter, which
+        # turned units that now link individually into assembly-gate reds
+        # (auto-c0053-012 on FUN_80047aa4 and FUN_801b9adc, both written as
+        # `*(code **)(slot) = FUN_...;`).
+        if bad:
+            address_taken: set[str] = set()
+            for c_name in c_files:
+                try:
+                    text = (workdir / c_name).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+                address_taken.update(ADDRESS_TAKEN_SYMBOL.findall(text))
+            bad = [name for name in bad if name not in address_taken]
         if bad:
             return False, (
                 "link gate: these symbols are UNDEFINED across the assembled "
