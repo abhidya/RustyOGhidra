@@ -152,6 +152,11 @@ MAX_COMPILE_ITERS = int(os.getenv("OGHIDRA_PORT_MAX_ITERS", "4"))
 EXPORT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 BUILD_TIMEOUT_SECONDS = 600
 ORACLE_TIMEOUT_SECONDS = 1800
+# A ROM symbol referenced without being called -- its address taken and stored
+# into a dispatch slot. Mirrors port_unit_generator.ADDR_TAKEN; keep the two in
+# step, since that module decides the queue's whitelist and this one decides
+# whether the live gate accepts an import the queue failed to list.
+ADDRESS_TAKEN_SYMBOL = re.compile(r"\b((?:zz_[0-9a-f]+_|FUN_[0-9a-f]{8}))\b(?!\s*\()")
 # Post-link import whitelist (POC finding: a missing CONCAT44 linked "fine" as a
 # dead env import). Only the SDK seam may be imported; these wasm plumbing names
 # are structural, not code imports.
@@ -1215,6 +1220,31 @@ def emcc_build_unit(
     # stubs+logs them (auto-stub rule) — so they are whitelisted per unit.
     if allowed_extra:
         bad = [name for name in bad if name not in allowed_extra]
+    # A ROM symbol whose ADDRESS is taken and stored into a dispatch slot --
+    # `*(code **)(puVar1 + 0xc) = zz_01a4e90_;` -- imports exactly like a direct
+    # callee, but the queue's allowed_extra_imports missed it: that list comes
+    # from a regex requiring a following "(". The gate then demands the model
+    # DEFINE a function whose body lives in another chunk, it can only answer
+    # with a prototype, diagnostics repeat verbatim, and the unit reds as
+    # "stuck: identical diagnostics after applied fix".
+    #
+    # Reading them out of unit.c is safe precisely because unit.c is VERBATIM
+    # decompiler output that the model may never edit (see SYSTEM_PROMPT), so
+    # every symbol here is a real ROM symbol rather than something invented in a
+    # reply. Unresolved ones still fail later at the assembly gate, exactly as
+    # whitelisted imports do -- this defers the failure to where cross-unit
+    # ownership is actually decided, it does not hide it.
+    #
+    # port_unit_generator.py now collects these too; this stays as the path that
+    # works against the CURRENT queue, which was generated before that fix.
+    if bad:
+        try:
+            verbatim = (workdir / "unit.c").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            verbatim = ""
+        if verbatim:
+            address_taken = set(ADDRESS_TAKEN_SYMBOL.findall(verbatim))
+            bad = [name for name in bad if name not in address_taken]
     if bad:
         return False, (
             "link gate: these symbols are UNDEFINED and became wasm imports, but "
