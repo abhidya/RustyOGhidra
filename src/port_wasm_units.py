@@ -3663,6 +3663,10 @@ class WasmUnitDriver:
         previous_stage: str | None = None
         previous_fingerprint: str | None = None
         header_applied = False
+        # Set when a returned header is rejected before it is applied; it is
+        # appended to the NEXT round's prompt. Assigning prompt_errors directly
+        # would not survive -- it is recomputed from build_error each iteration.
+        header_guard_note: str | None = None
         no_new_header_rounds = 0
         # Section 2.5 [V4-9]: a SECOND consecutive no_new_header round ends
         # the attempt -- after the format-reminder re-ask has also failed, the
@@ -3738,6 +3742,9 @@ class WasmUnitDriver:
             # Section 2.4: the model sees the deduplicated summary; the raw
             # text stays in build_error for fingerprinting and the state record.
             prompt_errors = summarise_build_error(build_error, budget=2000)
+            if header_guard_note:
+                prompt_errors = prompt_errors + chr(10) + chr(10) + header_guard_note
+                header_guard_note = None
             fixed = None
             for format_reminder in (False, True):
                 try:
@@ -3854,12 +3861,12 @@ class WasmUnitDriver:
             # the seed carries two.
             invented = header_defines_external_functions(fixed)
             if invented:
-                prompt_errors = (
-                    'gnt4_shim.h must DECLARE, never DEFINE. It defines '
+                header_guard_note = (
+                    'gnt4_shim.h must DECLARE, never DEFINE. Your reply defined '
                     + ', '.join(invented[:6])
                     + ". A definition here creates a real symbol and replaces the "
-                    'ROM function with this body. Replace each with a declaration '
-                    "ending in ';' (a `static` helper is the only definition allowed)."
+                    'ROM function with that body. Replace each with a declaration '
+                    "ending in ';'. A `static` helper is the only definition allowed."
                 )
                 self.events.emit(
                     'wasm_unit_header_defines_symbol',
@@ -3867,6 +3874,9 @@ class WasmUnitDriver:
                     iteration=iteration,
                     symbols=invented[:6],
                 )
+                # The header was NOT applied, so the next iteration must not
+                # rebuild identical input -- reuse this round's build_error.
+                header_applied = False
                 continue
             (workdir / "gnt4_shim.h").write_text(fixed, encoding="utf-8", newline="\n")
             # Section 2.3 [V4-4]: snapshots are ATTEMPT-scoped

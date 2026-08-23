@@ -4598,3 +4598,44 @@ def test_canonicalization_falls_back_when_the_registry_is_absent(tmp_path: Path)
 )
 def test_backend_contention_is_a_provider_fault(message: str, is_provider_fault: bool):
     assert WasmUnitDriver._is_provider_fault(Exception(message)) is is_provider_fault
+
+
+def test_a_header_defining_a_function_is_rejected_and_the_model_told_why(tmp_path, monkeypatch):
+    """The invented-stub shortcut must die at the compile-fix round.
+
+    The model's way to make a unit link is to DEFINE the callee it is missing.
+    That header must never reach a build, and the next prompt must say why --
+    assigning prompt_errors directly would not survive, since it is recomputed
+    from build_error at the top of every iteration.
+    """
+    monkeypatch.delenv("OGHIDRA_PORT_LIVENESS_PATH", raising=False)
+    repo = _write_repo(tmp_path)
+    builds: list[str] = []
+
+    def flaky_build(workdir, exports, extra=None):
+        builds.append((workdir / "gnt4_shim.h").read_text())
+        if len(builds) == 1:
+            return False, "error: implicit declaration of function 'zz_0000001_'"
+        (workdir / "unit.wasm").write_bytes(b"\x00asm")
+        return True, ""
+
+    prompts: list[str] = []
+
+    class StubLLM:
+        default_model = "fake-27b"
+
+        def generate(self, **kwargs):
+            prompts.append(str(kwargs))
+            if len(prompts) == 1:
+                return "```c\nvoid zz_0000001_(void) { }\n```"
+            return "```c\nextern int zz_0000001_(int);\n```"
+
+    driver = _driver(repo, build_runner=flaky_build, llm=StubLLM())
+    driver.run()
+
+    assert not any("void zz_0000001_(void) { }" in text for text in builds), (
+        "a header defining a function must never reach a build"
+    )
+    assert len(prompts) >= 2, "the rejected round must be re-asked"
+    assert "must DECLARE, never DEFINE" in prompts[1]
+    assert "zz_0000001_" in prompts[1]
