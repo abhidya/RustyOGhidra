@@ -479,6 +479,69 @@ def resolve_bash() -> str:
 
 
 
+_OPERATOR_ONLY_BINDINGS = ("transition_id", "previous_record_sha256", "previous_commit")
+
+
+def revoked_lifecycle_is_eligible(revoked: object, candidate_tier: str) -> bool:
+    """May this unit's installed artifact be REPLACED by a rebuilt candidate?
+
+    Replacing an artifact that is already installed is only allowed against a
+    recorded revocation, so a rebuild can never silently overwrite a promoted
+    unit. Two issuers can produce one, and they carry different evidence:
+
+    `revoke-unit` -- the operator command. It computes a deterministic
+    `transition_id`, hashes the record it superseded and names the commit that
+    record was at, so every binding is required and must be well formed.
+
+    `d5-migrate` -- the D5-6 migration, which revoked artifacts predating the
+    `d5-fp-reinterpret` transform and requeued them for rebuild. It is a real,
+    system-issued, reasoned revocation, but it never computed the operator
+    bindings. Demanding them made 12 units permanently uninstallable: they
+    rebuild, pass the N=5 assembly gate, and are refused at the last step, so
+    every retry burns a full LLM generation plus gate on a unit that cannot
+    succeed. Its own evidence is `transform_sites`, the count of rewritable
+    idiom sites that justified the revocation.
+
+    Backfilling the three missing bindings was rejected deliberately: they
+    describe a transition that happened on 2026-08-21 and inventing them now
+    would be fabricating evidence about the past. A `d5-migrate` record that
+    DOES carry them is therefore refused too -- genuine ones cannot have them,
+    so their presence means the record was hand-written.
+    """
+    if not isinstance(revoked, dict):
+        return False
+    if revoked.get("previous_status") != "green":
+        return False
+    if revoked.get("previous_tier") != candidate_tier:
+        return False
+    reason = revoked.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return False
+
+    via = revoked.get("via")
+    if via == "revoke-unit":
+        return (
+            re.fullmatch(
+                r"verdict-revoke-[0-9a-f]{64}", str(revoked.get("transition_id") or ""), re.I
+            )
+            is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}", str(revoked.get("previous_record_sha256") or ""), re.I
+            )
+            is not None
+            and re.fullmatch(
+                r"[0-9a-f]{7,64}", str(revoked.get("previous_commit") or ""), re.I
+            )
+            is not None
+        )
+    if via == "d5-migrate":
+        sites = revoked.get("transform_sites")
+        if isinstance(sites, bool) or not isinstance(sites, int) or sites <= 0:
+            return False
+        return all(revoked.get(name) is None for name in _OPERATOR_ONLY_BINDINGS)
+    return False
+
+
 def summarise_build_error(output: str, budget: int = 1200) -> str:
     """Keep the compiler's diagnosis, discard the invocation it echoes.
 
@@ -2812,26 +2875,7 @@ class WasmUnitDriver:
         if (
             canonical.get("status") != "porting"
             or int(canonical.get("attempts", 0)) != int(marker.get("attempt", -1))
-            or not isinstance(revoked, dict)
-            or revoked.get("via") != "revoke-unit"
-            or revoked.get("previous_status") != "green"
-            or revoked.get("previous_tier") != transaction.candidate.tier
-            or not isinstance(revoked.get("reason"), str)
-            or not revoked.get("reason", "").strip()
-            or re.fullmatch(
-                r"verdict-revoke-[0-9a-f]{64}",
-                str(revoked.get("transition_id") or ""),
-                re.I,
-            )
-            is None
-            or re.fullmatch(
-                r"[0-9a-f]{64}", str(revoked.get("previous_record_sha256") or ""), re.I
-            )
-            is None
-            or re.fullmatch(
-                r"[0-9a-f]{7,64}", str(revoked.get("previous_commit") or ""), re.I
-            )
-            is None
+            or not revoked_lifecycle_is_eligible(revoked, transaction.candidate.tier)
         ):
             raise RuntimeError("artifact preimage has no eligible revoked lifecycle")
         destination = transaction.destination
