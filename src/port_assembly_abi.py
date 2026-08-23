@@ -2779,6 +2779,103 @@ def _every_call_discards_the_result(data: bytes, symbol: str) -> bool:
     return True
 
 
+# wasm32 value class per C type spelling. Ghidra spells the same machine type
+# many ways -- `int`/`uint`/`undefined4` are one i32, `undefined8` is i64,
+# `double` is f64 -- and a pointer is i32. Anything not listed is UNKNOWN and
+# must fail closed rather than be guessed at.
+_WASM_I32_TYPES = frozenset({
+    "int", "uint", "long", "ulong", "undefined4", "dword", "code", "undefined",
+    "char", "uchar", "undefined1", "byte", "bool", "_Bool",
+    "short", "ushort", "undefined2", "word",
+})
+_WASM_CLASS_BY_TYPE = {
+    **{name: "i32" for name in _WASM_I32_TYPES},
+    "undefined8": "i64", "longlong": "i64", "ulonglong": "i64",
+    "float": "f32",
+    "double": "f64",
+}
+
+
+def _wasm_value_class(spelling: str) -> str | None:
+    """The wasm32 value type a C SCALAR spelling lowers to, or None when unknown.
+
+    Pointers deliberately return None. Every pointer is a 32-bit address, so
+    lowering them all to i32 would make `const int *` and `float *` compare
+    equal and quietly erase the pointee-qualifier distinction the plan refuses
+    on purpose. Two pointer parameters are only ever treated as agreeing when
+    they are spelled identically, which is handled by the caller.
+    """
+    text = " ".join(spelling.split())
+    if not text or "*" in text or "[" in text:
+        return None
+    words = [w for w in text.split() if w not in {"const", "volatile", "signed", "struct", "union", "enum"}]
+    if words == ["unsigned"] or words == ["long", "long"]:
+        return "i32" if words == ["unsigned"] else "i64"
+    if len(words) == 2 and words[0] == "unsigned":
+        words = [words[1]]
+    if len(words) != 1:
+        return None
+    return _WASM_CLASS_BY_TYPE.get(words[0])
+
+
+def _parameters_are_abi_equivalent(owner: AbiTuple, variant: AbiTuple) -> bool:
+    """True when two parameter lists lower to the identical wasm signature.
+
+    Ghidra disagrees with itself about type SPELLING far more often than about
+    machine type: a caller writes `int` where the owner records `uint`, or
+    `undefined4` where the owner records `int`. Those are one i32 and the call
+    is byte-identical either way, so the disagreement carries no ABI evidence
+    and the owner's record supersedes it -- the same argument
+    `_import_safe_prototype` already makes for unprototyped placeholders.
+
+    Fails closed on anything it cannot prove equal: differing arity, variadic
+    mismatch, an unrecognised spelling, or a genuine class change such as
+    `double` against `undefined8` (f64 against i64) or a widening. Those are
+    real contradictions and must keep contesting the window.
+    """
+    if owner.variadic != variant.variadic:
+        return False
+    if owner.arity != variant.arity:
+        return False
+    if owner.prototype_kind == "unspecified" or variant.prototype_kind == "unspecified":
+        return False  # no parameter evidence to compare; the placeholder path owns this
+    for owner_type, variant_type in zip(owner.parameter_types, variant.parameter_types):
+        if " ".join(owner_type.split()) == " ".join(variant_type.split()):
+            continue  # spelled identically: nothing to reconcile, pointers included
+        owner_class = _wasm_value_class(owner_type)
+        variant_class = _wasm_value_class(variant_type)
+        if owner_class is None or variant_class is None or owner_class != variant_class:
+            return False
+    return True
+
+
+def _QUALIFIERS() -> frozenset[str]:
+    return frozenset({"const", "volatile", "signed", "struct", "union", "enum"})
+
+
+def _base_spelling(spelling: str) -> str:
+    """A type spelling with qualifiers removed, for base-type comparison."""
+    return " ".join(w for w in spelling.split() if w not in _QUALIFIERS())
+
+
+def _probe_would_contest(owner: AbiTuple, variant: AbiTuple) -> bool:
+    """True when the two differ somewhere Clang treats as incompatible.
+
+    A TOP-LEVEL qualifier difference (`const int` against `int`) is compatible
+    in C and the probe accepts it, so those must keep flowing through the probe
+    and producing their compatibility evidence -- superseding them would delete
+    a record the plan is required to carry. Only a differing base type or a
+    differing return type actually makes the probe contest the window, and only
+    those need the spelling-equivalence escape.
+    """
+    if _base_spelling(owner.return_type) != _base_spelling(variant.return_type):
+        return True
+    return any(
+        _base_spelling(a) != _base_spelling(b)
+        for a, b in zip(owner.parameter_types, variant.parameter_types)
+    )
+
+
 def _import_safe_prototype(owner: OwnerBinding) -> str | None:
     """Owner parameters with a value-returning result, for an IMPORTED callee.
 
@@ -3037,13 +3134,43 @@ def plan_canonicalization(
             owner_defined_here = any(
                 item.unit == owner.unit for item in bundle.translation_units
             )
+            # A DECLARATION of an IMPORTED callee whose parameters lower to the
+            # owner's exact wasm signature carries no ABI evidence either: it
+            # disagrees only about spelling (int/uint, int/undefined4) and/or the
+            # return type, neither of which can change an instruction when the
+            # definition is not being linked. That is the same argument
+            # _import_safe_prototype already makes for placeholders, and it was
+            # simply never extended past them.
+            #
+            # Deliberately NOT applied when the owner is defined in this bundle:
+            # there the definition IS linked, its return type is binding, and a
+            # declaration that contradicts it must still contest. Nor to
+            # definition sites, which are the authority rather than a claim.
+            # Measured on this corpus: every specific refusal observed
+            # (zz_0006dc8_, zz_00c74ec_, FUN_80047aa4, FUN_80083874,
+            # zz_00097b4_, zz_0007030_) was an imported callee whose parameters
+            # were ABI-equivalent to its owner. Genuine class changes, arity
+            # changes and unknown spellings still fail closed inside
+            # _parameters_are_abi_equivalent.
+            spelling_only = (
+                not placeholder
+                and site.kind == "declaration"
+                and not owner_defined_here
+                and _probe_would_contest(
+                    owner.projection.abi_tuple, variant.abi_tuple
+                )
+                and _parameters_are_abi_equivalent(
+                    owner.projection.abi_tuple, variant.abi_tuple
+                )
+            )
+            supersede = placeholder or spelling_only
             substitute: str | None = owner.normalized_prototype
-            if placeholder and owner.projection.abi_tuple.return_type == "void" and not result_unused:
+            if supersede and owner.projection.abi_tuple.return_type == "void" and not result_unused:
                 # A body consumes a void owner's result. If the owner is being
                 # linked in, that is a real contradiction and must contest; if it
                 # is an import, only the bundle's declarations need to agree.
                 substitute = None if owner_defined_here else _import_safe_prototype(owner)
-            if placeholder and substitute is not None:
+            if supersede and substitute is not None:
                 # Supersede rather than probe. Clang would call `int f()`
                 # incompatible with `void f(int,uint)` and contest the window,
                 # but the placeholder never claimed anything to conflict with.

@@ -3006,3 +3006,66 @@ def test_keywords_are_never_declaration_sites(keyword: str):
     """`typedef void (code)();` made the scanner treat `void` as a callee."""
     data = b"typedef void (code)();\n"
     assert abi._site_for_token(data, keyword, 0, len(keyword), 0) is None
+
+
+# --- spelling-equivalent imported declarations (live-corpus regression) -------
+# Ghidra disagrees with itself about type SPELLING far more often than about
+# machine type. For an IMPORTED callee those disagreements carry no ABI
+# evidence, so they supersede instead of contesting the window. Every pair below
+# is a refusal actually observed on the staged corpus on 2026-08-23.
+
+def _abi(ret, params, kind="prototype", variadic=False):
+    return abi.AbiTuple(ret, tuple(params), kind, variadic)
+
+
+@pytest.mark.parametrize(
+    "symbol,owner,variant",
+    [
+        ("zz_00097b4_", _abi("void", ["int", "uint"]), _abi("void", ["int", "int"])),
+        ("zz_0007030_", _abi("void", ["undefined8", "int"]), _abi("undefined8", ["undefined8", "undefined4"])),
+        ("zz_0006dc8_", _abi("int *", ["int"]), _abi("int", ["int"])),
+        ("zz_00c74ec_", _abi("undefined1 *", ["int", "int"]), _abi("void", ["int", "int"])),
+        ("FUN_80047aa4", _abi("void", ["int"]), _abi("int", ["int"])),
+        ("FUN_80083874", _abi("uint", ["double", "int"]), _abi("int", ["double", "int"])),
+    ],
+)
+def test_spelling_only_disagreements_supersede_instead_of_contesting(symbol, owner, variant):
+    assert abi._probe_would_contest(owner, variant), symbol
+    assert abi._parameters_are_abi_equivalent(owner, variant), symbol
+
+
+@pytest.mark.parametrize(
+    "why,owner,variant",
+    [
+        ("f64 against i64", _abi("void", ["double"]), _abi("void", ["undefined8"])),
+        ("f64 against f32", _abi("void", ["double"]), _abi("void", ["float"])),
+        ("arity", _abi("void", ["int"]), _abi("void", ["int", "int"])),
+        ("unknown spelling", _abi("void", ["weird_t"]), _abi("void", ["int"])),
+        ("pointee differs", _abi("void", ["const int *"]), _abi("void", ["float *"])),
+        ("pointer against scalar", _abi("void", ["int *"]), _abi("void", ["int"])),
+        ("variadic mismatch", _abi("void", ["int"], variadic=True), _abi("void", ["int"])),
+        ("unprototyped variant", _abi("void", ["int"]), _abi("int", [], kind="unspecified")),
+    ],
+)
+def test_genuine_abi_contradictions_are_never_spelling_equivalent(why, owner, variant):
+    assert not abi._parameters_are_abi_equivalent(owner, variant), why
+
+
+def test_top_level_qualifier_difference_still_reaches_the_probe():
+    # `const int` against `int` is compatible in C and the probe accepts it, so
+    # it must keep producing compatibility evidence rather than being superseded.
+    owner, variant = _abi("void", ["int"]), _abi("void", ["const int"])
+    assert not abi._probe_would_contest(owner, variant)
+
+
+def test_pointers_have_no_wasm_scalar_class():
+    # Collapsing every pointer to i32 would erase the pointee distinction the
+    # plan refuses on purpose.
+    assert abi._wasm_value_class("int *") is None
+    assert abi._wasm_value_class("const char *") is None
+    assert abi._wasm_value_class("int") == "i32"
+    assert abi._wasm_value_class("uint") == "i32"
+    assert abi._wasm_value_class("undefined4") == "i32"
+    assert abi._wasm_value_class("undefined8") == "i64"
+    assert abi._wasm_value_class("double") == "f64"
+    assert abi._wasm_value_class("float") == "f32"
