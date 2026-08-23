@@ -39,6 +39,15 @@ GLOBAL_REF = re.compile(
     r"\b((?:PTR_PTR|PTR_DAT|PTR_FUN|DOUBLE|FLOAT|DAT|UNK)_[0-9a-f]{8})\b"
 )
 CALLEE = re.compile(r"\b((?:zz_[0-9a-f]+_|FUN_[0-9a-f]{8}))\s*\(")
+# A ROM symbol referenced WITHOUT being called -- its address taken and stored
+# into a vtable/dispatch slot, e.g. `*(code **)(puVar1 + 0xc) = zz_01a4e90_;`.
+# CALLEE cannot see these (it requires a following `(`), yet they become
+# undefined wasm imports exactly like a direct callee does. Leaving them out of
+# allowed_extra_imports makes the link gate demand the model DEFINE them in
+# gnt4_shim.h; the model can only answer with a prototype, so the diagnostics
+# repeat verbatim and the stuck detector reds the unit. Confirmed on
+# auto-c0050-005 and auto-c0050-007.
+ADDR_TAKEN = re.compile(r"\b((?:zz_[0-9a-f]+_|FUN_[0-9a-f]{8}))\b(?!\s*\()")
 QUEUE_DEFAULT = "research/decomp/generated/finish-game-port/wasm-units.json"
 HEADER_DIR = "research/decomp/generated/finish-game-port/headers"
 # Generator's OWN seed: integer undefined8/CONCAT44, matching the driver's
@@ -140,6 +149,10 @@ def build_unit(
         for callee in CALLEE.findall(b["text"]):
             if callee not in included:
                 callees_external.add(callee)
+        # Address-taken externals import identically; whitelist them the same way.
+        for referenced in ADDR_TAKEN.findall(b["text"]):
+            if referenced not in included:
+                callees_external.add(referenced)
 
     core = (repo_root / CORE_SEED).read_text(encoding="utf-8")
     known = set(re.findall(r"#define\s+(\w+)", core))
