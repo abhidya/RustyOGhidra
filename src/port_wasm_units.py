@@ -3288,7 +3288,16 @@ class WasmUnitDriver:
                         }
                         for c in (result.get("conflicts") or [])[:20]
                     ],
-                    detail=(result.get("detail") or "")[:600],
+                    # Keep the TAIL, not the head. A link-stage detail is the
+                    # emcc failure output, which opens with several hundred
+                    # characters of wasm-ld command line and puts the actual
+                    # diagnostic ("undefined symbol: ...") at the END -- so
+                    # head-truncation recorded the boilerplate and discarded the
+                    # only informative part. Observed on auto-c0011-004, whose
+                    # 600-char detail was entirely command line. Canonicalize
+                    # details are short and start with their message, so they
+                    # are unaffected (a string under the cap is kept whole).
+                    detail=(result.get("detail") or "")[-600:],
                 )
         except Exception as error:  # noqa: BLE001 - fail the candidate closed
             self.events.emit(
