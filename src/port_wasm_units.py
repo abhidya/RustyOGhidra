@@ -3859,14 +3859,31 @@ class WasmUnitDriver:
             # only after the whole compile-fix loop has been paid for. Reject it
             # here and hand the model the reason. `static` helpers are fine --
             # the seed carries two.
-            invented = header_defines_external_functions(fixed)
+            # Only SDK/runtime symbols may not be defined here. This is the exact
+            # complement of the import gate's rule, and the two must stay
+            # complementary or they livelock: that gate tells the model a
+            # non-gnt4_ symbol which became an undefined wasm import "must be
+            # DEFINED in gnt4_shim.h", so rejecting THAT definition leaves the
+            # model no legal move -- the header is not applied, the next
+            # iteration rebuilds identical input, diagnostics repeat, and the
+            # stuck detector reds the unit. Measured: every unit this guard
+            # fired on went red (auto-c0035-004, auto-c0035-007, auto-c0050-005).
+            # A gnt4_ symbol is different: it is always provided elsewhere, so a
+            # local definition is a real duplicate. Ownerless ROM symbols are
+            # left to canonicalization at the assembly gate, which is where the
+            # registry-owner check actually lives.
+            invented = [
+                symbol
+                for symbol in header_defines_external_functions(fixed)
+                if symbol.startswith("gnt4_") or symbol.startswith("__gnt4_")
+            ]
             if invented:
                 header_guard_note = (
-                    'gnt4_shim.h must DECLARE, never DEFINE. Your reply defined '
-                    + ', '.join(invented[:6])
-                    + ". A definition here creates a real symbol and replaces the "
-                    'ROM function with that body. Replace each with a declaration '
-                    "ending in ';'. A `static` helper is the only definition allowed."
+                    'gnt4_shim.h must DECLARE, never DEFINE, an SDK symbol. Your '
+                    'reply defined ' + ', '.join(invented[:6])
+                    + ". The SDK provides that symbol at link time, so a definition "
+                    'here is a duplicate. Replace each with a declaration ending in '
+                    "';'. A `static` helper is the only definition allowed."
                 )
                 self.events.emit(
                     'wasm_unit_header_defines_symbol',
