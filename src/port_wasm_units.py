@@ -3288,16 +3288,17 @@ class WasmUnitDriver:
                         }
                         for c in (result.get("conflicts") or [])[:20]
                     ],
-                    # Keep the TAIL, not the head. A link-stage detail is the
-                    # emcc failure output, which opens with several hundred
-                    # characters of wasm-ld command line and puts the actual
-                    # diagnostic ("undefined symbol: ...") at the END -- so
-                    # head-truncation recorded the boilerplate and discarded the
-                    # only informative part. Observed on auto-c0011-004, whose
-                    # 600-char detail was entirely command line. Canonicalize
-                    # details are short and start with their message, so they
-                    # are unaffected (a string under the cap is kept whole).
-                    detail=(result.get("detail") or "")[-600:],
+                    # Summarise, do not slice. A link-stage detail is emcc's
+                    # failure output, whose echoed invocation is longer than any
+                    # sane cap at BOTH ends -- head-slicing recorded the wasm-ld
+                    # flags (auto-c0011-004) and tail-slicing recorded the -l
+                    # library flags and "failed (returned 1)" (auto-c0019-000),
+                    # with the real `undefined symbol:` line stranded in the
+                    # middle either way. summarise_build_error already solves
+                    # exactly this for per-unit builds -- its docstring cites the
+                    # same bug -- so reuse it rather than inventing a worse rule
+                    # here. Short canonicalize details are returned unchanged.
+                    detail=summarise_build_error(result.get("detail") or ""),
                 )
         except Exception as error:  # noqa: BLE001 - fail the candidate closed
             self.events.emit(
