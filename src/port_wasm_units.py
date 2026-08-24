@@ -479,6 +479,65 @@ def resolve_bash() -> str:
 
 
 
+# The generator's CORE_SEED, repeated rather than imported so this module keeps
+# no dependency on port_unit_generator. A drift between the two is caught by
+# test_seed_path_matches_the_generator.
+CORE_SEED_RELPATH = "research/decomp/generated/finish-game-port/gnt4_shim_seed.h"
+
+_SEED_SDK_DECL = re.compile(
+    r"^[ \t]*extern[ \t]+(?P<decl>[^;]*?\b(?P<symbol>(?:__)?gnt4_\w+)[ \t]*\([^;]*\))[ \t]*;",
+    re.M,
+)
+
+
+def _sdk_declarations(header_text: str) -> dict[str, str]:
+    """Every `extern ... gnt4_NAME(...)` declaration, normalised for comparison.
+
+    Whitespace is collapsed and parameter NAMES are dropped, because C permits
+    renaming a parameter in a redeclaration and units legitimately do. Only the
+    return type and the parameter TYPES are compared -- those are what decide
+    the wasm import signature, and therefore what makes sibling units disagree
+    at link time.
+    """
+    found: dict[str, str] = {}
+    for match in _SEED_SDK_DECL.finditer(header_text):
+        symbol = match.group("symbol")
+        decl = " ".join(match.group("decl").split())
+        head, _, params = decl.partition("(")
+        stripped = []
+        for param in params.rstrip(")").split(","):
+            text = " ".join(param.split())
+            named = re.match(r"^(.*?[\*\s])[A-Za-z_]\w*$", text)
+            stripped.append(" ".join((named.group(1) if named else text).split()))
+        found[symbol] = (
+            head.replace(symbol, "").strip() + "(" + ",".join(stripped) + ")"
+        )
+    return found
+
+
+def seed_declarations_eroded(seed_text: str, reply_text: str) -> list[str]:
+    """SDK symbols whose seed declaration the reply removed or rewrote.
+
+    The seed is the single canonical source for `gnt4_*` signatures. When one
+    unit alters or drops a seed declaration, it disagrees with every sibling
+    that kept it, and the N-unit assembly link fails as `collision_stub` --
+    which is the largest live link-failure class: `gnt4_PSVECMag_bl` alone
+    accounted for six failures, `gnt4_PSQUATScale_bl` two,
+    `gnt4_PSMTXMultVec_bl` one, all with the declaration already IN the seed.
+
+    Only symbols the seed actually declares are protected; the reply stays free
+    to add declarations the seed lacks, which is how a unit covers an SDK
+    function that has no canonical signature yet.
+    """
+    seed = _sdk_declarations(seed_text)
+    reply = _sdk_declarations(reply_text)
+    return sorted(
+        symbol
+        for symbol, canonical in seed.items()
+        if symbol not in reply or reply[symbol] != canonical
+    )
+
+
 _OPERATOR_ONLY_BINDINGS = ("transition_id", "previous_record_sha256", "previous_commit")
 
 
@@ -3976,6 +4035,37 @@ class WasmUnitDriver:
             # local definition is a real duplicate. Ownerless ROM symbols are
             # left to canonicalization at the assembly gate, which is where the
             # registry-owner check actually lives.
+            # Seed erosion. The seed is the single canonical source for gnt4_
+            # signatures; a unit that rewrites or drops one disagrees with every
+            # sibling that kept it, and the N-unit link fails as collision_stub.
+            # Measured over one run: 8 of 11 link failures were erosion, six of
+            # them gnt4_PSVECMag_bl alone -- with the declaration already in the
+            # seed, so the seed-gap fix could not touch them. Adding NEW
+            # declarations stays allowed; only altering the seed's is refused.
+            # Compared against the header being EDITED, never against the seed
+            # on disk. A unit generated before a seed symbol was added does not
+            # carry that declaration, so seed-relative comparison reads its
+            # absence as removal -- measured at 171 units falsely flagged after
+            # the seed grew from 6 declarations to 64, which would have rejected
+            # nearly every header in the corpus.
+            eroded = seed_declarations_eroded(header_text, fixed)
+            if eroded:
+                header_guard_note = (
+                    "gnt4_shim.h must keep the seed's SDK declarations EXACTLY as "
+                    "given. Your reply changed or removed " + ", ".join(eroded[:6])
+                    + ". Every unit shares those signatures, so altering one makes "
+                    "this unit disagree with the others and the multi-unit link "
+                    "fails. Restore them verbatim; you may still ADD declarations "
+                    "the seed does not have."
+                )
+                self.events.emit(
+                    "wasm_unit_header_eroded_seed_decl",
+                    unit=name,
+                    iteration=iteration,
+                    symbols=eroded[:6],
+                )
+                header_applied = False
+                continue
             invented = [
                 symbol
                 for symbol in header_defines_external_functions(fixed)
