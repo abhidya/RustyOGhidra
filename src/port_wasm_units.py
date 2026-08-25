@@ -488,7 +488,12 @@ def resolve_bash() -> str:
 
 
 
-_OPERATOR_ONLY_BINDINGS = ("transition_id", "previous_record_sha256", "previous_commit")
+_OPERATOR_ONLY_BINDINGS = (
+    "transition_id",
+    "previous_record_sha256",
+    "previous_commit",
+    "previous_candidate_sha256",
+)
 
 
 def revoked_lifecycle_is_eligible(revoked: object, candidate_tier: str) -> bool:
@@ -511,11 +516,14 @@ def revoked_lifecycle_is_eligible(revoked: object, candidate_tier: str) -> bool:
     succeed. Its own evidence is `transform_sites`, the count of rewritable
     idiom sites that justified the revocation.
 
-    Backfilling the three missing bindings was rejected deliberately: they
-    describe a transition that happened on 2026-08-21 and inventing them now
-    would be fabricating evidence about the past. A `d5-migrate` record that
-    DOES carry them is therefore refused too -- genuine ones cannot have them,
-    so their presence means the record was hand-written.
+    Backfilling the missing bindings was rejected deliberately: they describe
+    a transition that happened on 2026-08-21 and inventing them now would be
+    fabricating evidence about the past. A `d5-migrate` record that DOES
+    carry any of them is therefore refused too -- genuine ones cannot have
+    them, so their presence means the record was hand-written. That includes
+    `previous_candidate_sha256`: a migration record carrying it would take
+    the digest-only replacement branch (disk digest vs self-declared digest,
+    no commit-tree proof), which is exactly the forgery this refusal closes.
     """
     if not isinstance(revoked, dict):
         return False
@@ -539,7 +547,9 @@ def revoked_lifecycle_is_eligible(revoked: object, candidate_tier: str) -> bool:
             )
             is not None
             and re.fullmatch(
-                r"[0-9a-f]{7,64}", str(revoked.get("previous_commit") or ""), re.I
+                # Full 40-hex commit SHAs only: a prefix cannot be resolved
+                # against the publication lineage without ambiguity.
+                r"[0-9a-f]{40}", str(revoked.get("previous_commit") or ""), re.I
             )
             is not None
         )

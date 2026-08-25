@@ -259,7 +259,7 @@ def _canonical_snapshot(tmp_path: Path, records: dict[str, dict] | list[str]):
         records = {
             name: {
                 "status": "green", "tier": "compile_only",
-                "commit": f"deadbee{index:x}", "pushed": True,
+                "commit": f"deadbee{index:033x}", "pushed": True,
             }
             for index, name in enumerate(records)
         }
@@ -513,18 +513,18 @@ def test_selection_uses_canonical_lifecycle_not_artifact_mtime(tmp_path):
     records = {
         "verified": {
             "status": "green", "tier": "oracle_green",
-            "commit": "abc1234", "pushed": True,
+            "commit": "abc1234" + "0" * 33, "pushed": True,
         },
         "staged": {
             "status": "green", "tier": "compile_only",
-            "commit": "abc1235", "pushed": True,
+            "commit": "abc1235" + "0" * 33, "pushed": True,
         },
     }
     for index, (name, status) in enumerate(statuses.items(), start=6):
         records[name] = {
             "status": status,
             "tier": "compile_only",
-            "commit": f"abc123{index:x}",
+            "commit": f"abc123{index:x}" + "0" * 33,
             "pushed": True,
         }
     records["revoked"]["revoked"] = {
@@ -556,7 +556,7 @@ def test_verified_root_shadow_is_fail_closed_before_name_dedup(tmp_path):
     snapshot = _canonical_snapshot(tmp_path, {
         "auto-x": {
             "status": "green", "tier": "compile_only",
-            "commit": "abc1234", "pushed": True,
+            "commit": "abc1234" + "0" * 33, "pushed": True,
         }
     })
 
@@ -577,9 +577,11 @@ def test_stale_revocation_from_prior_lifecycle_does_not_poison_green(tmp_path):
     snapshot = _canonical_snapshot(tmp_path, {
         "rebuilt": {
             "status": "green", "tier": "compile_only",
-            "commit": "bbb2222", "pushed": True,
+            "commit": "bbb2222" + "0" * 33, "pushed": True,
             "candidate_sha256": artifact.sha256,
-            "revoked": {"previous_commit": "aaa1111", "reason": "old verdict"},
+            "revoked": {
+                "previous_commit": "aaa1111" + "0" * 33, "reason": "old verdict",
+            },
         }
     })
 
@@ -590,6 +592,57 @@ def test_stale_revocation_from_prior_lifecycle_does_not_poison_green(tmp_path):
     assert [unit.name for unit in picked] == ["rebuilt"]
     assert picked[0].canonical["stale_revocation_ignored"] is True
     assert excluded == {}
+
+
+def test_abbreviated_canonical_commit_is_refused_with_a_clear_reason(tmp_path):
+    """Short commit prefixes are no longer proof-grade identity: a record
+    carrying one is excluded as canonical-commit-missing, never selected."""
+    root = tmp_path / "port-units-staging"
+    directory = _write_artifact(root, "short-commit", "2026-08-20T00:00:00Z")
+    artifact = load_unit_artifact(directory)
+    assert artifact is not None
+    snapshot = _canonical_snapshot(tmp_path, {
+        "short-commit": {
+            "status": "green", "tier": "compile_only",
+            "commit": "1022b6c9", "pushed": True,
+            "candidate_sha256": artifact.sha256,
+        }
+    })
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot
+    )
+
+    assert picked == []
+    assert excluded == {"short-commit": "canonical-commit-missing"}
+
+
+def test_legacy_proof_refuses_an_abbreviated_commit(tmp_path):
+    repo, root, record, _snapshot = _legacy_commit_fixture(tmp_path)
+    record["commit"] = record["commit"][:12]
+    state_path = repo / "state.json"
+    state_path.write_text(json.dumps({
+        "state_schema": 1, "units": {"legacy": record}
+    }), encoding="utf-8")
+    snapshot = load_canonical_state_snapshot(state_path)
+
+    picked, excluded = select_recent_green_units(
+        [root], None, canonical_snapshot=snapshot,
+        legacy_verifier=_legacy_verifier(repo),
+    )
+    assert picked == []
+    assert excluded == {"legacy": "canonical-commit-missing"}
+
+    # The commit-tree proof itself refuses the prefix as well, so the gate
+    # exclusion is not the only line of defense.
+    artifact = load_unit_artifact(root / "legacy")
+    assert artifact is not None
+    proof, reason = prove_legacy_artifact_commit_tree(
+        artifact, record,
+        repo_root=repo, git_runner=lambda *args: _git(repo, *args),
+    )
+    assert proof is None
+    assert reason == "legacy-commit-invalid"
 
 
 def test_canonical_snapshot_rejects_non_object_state(tmp_path):
