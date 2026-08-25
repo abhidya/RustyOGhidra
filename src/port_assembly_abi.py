@@ -2811,11 +2811,6 @@ def _wasm_value_class(spelling: str) -> str | None:
     words = [w for w in text.split() if w not in {"const", "volatile", "signed", "struct", "union", "enum"}]
     if words == ["unsigned"] or words == ["long", "long"]:
         return "i32" if words == ["unsigned"] else "i64"
-    if words == ["unsigned", "long", "long"]:
-        # The pinned Clang's DESUGARED spelling of undefined8/ulonglong. The
-        # two-word unsigned rule below cannot reach it, and the SDK canon
-        # comparison sees desugared tuples, not Ghidra spellings.
-        return "i64"
     if len(words) == 2 and words[0] == "unsigned":
         words = [words[1]]
     if len(words) != 1:
@@ -2854,6 +2849,23 @@ def _parameters_are_abi_equivalent(owner: AbiTuple, variant: AbiTuple) -> bool:
     return True
 
 
+def _sdk_wasm_value_class(spelling: str) -> str | None:
+    """_wasm_value_class plus the pinned Clang's DESUGARED i64 spelling.
+
+    The SDK canon comparison sees desugared tuples ("unsigned long long"),
+    not Ghidra spellings ("undefined8"/"ulonglong"). Deliberately a SEPARATE
+    function: extending _wasm_value_class itself would leak into
+    _parameters_are_abi_equivalent and flip owner-path longlong/ulonglong
+    parameter disagreements from Clang-probe refusal to supersede -- the
+    owner path must stay byte-identical.
+    """
+    text = " ".join(spelling.split())
+    words = [w for w in text.split() if w not in {"const", "volatile", "struct", "union", "enum"}]
+    if words == ["unsigned", "long", "long"]:
+        return "i64"
+    return _wasm_value_class(spelling)
+
+
 def _sdk_return_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: bool) -> bool:
     """True when rewriting a divergent gnt4_* DECLARATION's return to canon is safe.
 
@@ -2871,9 +2883,12 @@ def _sdk_return_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: 
       bundle provably discards the result -- rewriting under a consuming call
       would either miscompile or silently reinterpret, so that fails closed;
     - both value-returning: only when both spellings lower to the SAME wasm
-      value class (int/uint/undefined4 are one i32). A class change
-      (undefined4 vs undefined8, double vs undefined8) alters what a consuming
-      call site reads and must keep contesting.
+      value class (int/uint/undefined4 are one i32) AND every call in the
+      bundle discards the result. A class change (undefined4 vs undefined8,
+      double vs undefined8) alters what a consuming call site reads; and even
+      a same-class signedness flip (unsigned long long vs long long) changes
+      the C semantics of a CONSUMING site (`if (f() < 0)`), which would
+      recompile clean and silently diverge -- so consumption fails closed.
     """
     canon_return = " ".join(canon.return_type.split())
     variant_return = " ".join(variant.return_type.split())
@@ -2887,9 +2902,9 @@ def _sdk_return_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: 
         return True
     if canon_void:
         return result_unused
-    canon_class = _wasm_value_class(canon_return)
-    variant_class = _wasm_value_class(variant_return)
-    return canon_class is not None and canon_class == variant_class
+    canon_class = _sdk_wasm_value_class(canon_return)
+    variant_class = _sdk_wasm_value_class(variant_return)
+    return result_unused and canon_class is not None and canon_class == variant_class
 
 
 def _sdk_variant_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: bool) -> bool:

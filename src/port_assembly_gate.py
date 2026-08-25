@@ -1697,6 +1697,18 @@ def _canonicalize_window(
 
         seed_text = seed_bytes.decode("utf-8-sig", errors="replace")
         sdk_canon = canonical_sdk_declarations(seed_text)
+        if not sdk_canon:
+            # The driver rewrites this file, so torn/garbled/format-drifted
+            # content is a real failure mode. A configured seed that parses to
+            # ZERO declarations must not silently disable the SDK pass.
+            _canonicalization_refusal(
+                result,
+                names,
+                "sdk_canon_unavailable",
+                f"configured SDK canon seed {request.sdk_seed_path} yielded "
+                "no gnt4_* declarations",
+            )
+            return None
         sdk_evidence = {
             "seed_path": str(request.sdk_seed_path),
             "seed_sha256": hashlib.sha256(seed_bytes).hexdigest(),

@@ -3069,10 +3069,25 @@ def test_pointers_have_no_wasm_scalar_class():
     assert abi._wasm_value_class("undefined8") == "i64"
     assert abi._wasm_value_class("double") == "f64"
     assert abi._wasm_value_class("float") == "f32"
-    # The pinned Clang's DESUGARED spelling of undefined8/ulonglong: the SDK
-    # canon comparison sees desugared tuples, not Ghidra spellings.
-    assert abi._wasm_value_class("unsigned long long") == "i64"
+    # The desugared "unsigned long long" mapping is SCOPED to the SDK return
+    # comparison; the shared class function stays byte-identical so the owner
+    # path's equivalence semantics do not move.
+    assert abi._wasm_value_class("unsigned long long") is None
     assert abi._wasm_value_class("long long") == "i64"
+    assert abi._sdk_wasm_value_class("unsigned long long") == "i64"
+    assert abi._sdk_wasm_value_class("long long") == "i64"
+    assert abi._sdk_wasm_value_class("int *") is None
+
+
+def test_owner_path_still_refuses_desugared_i64_parameter_spelling_mismatch():
+    # Regression pin for the D2 review finding: the SDK-scoped i64 spelling
+    # must NOT leak into _parameters_are_abi_equivalent -- an owner/variant
+    # longlong-vs-ulonglong parameter disagreement keeps failing closed to the
+    # Clang probe exactly as before this change.
+    owner = _abi("void", ["unsigned long long"])
+    variant = _abi("void", ["long long"])
+    assert not abi._parameters_are_abi_equivalent(owner, variant)
+    assert not abi._parameters_are_abi_equivalent(variant, owner)
 
 
 # --- SDK (gnt4_*) canonicalization against the seed canon --------------------
@@ -3108,9 +3123,18 @@ def test_sdk_return_class_change_beyond_widening_fails_closed():
     variant = _sdk_abi("undefined4", ["int"])
     assert not abi._sdk_variant_is_unifiable(canon, variant, True)
     assert not abi._sdk_variant_is_unifiable(variant, canon, True)
-    # Same class, different spelling: nothing to reconcile.
+    # Same class, different spelling: safe ONLY when every call discards the
+    # result. A signedness flip under a consuming site (`if (f() < 0)`) would
+    # recompile clean and silently diverge (review D1).
     assert abi._sdk_variant_is_unifiable(
+        _sdk_abi("unsigned long long", ["int"]), _sdk_abi("undefined8", ["int"]), True
+    )
+    assert not abi._sdk_variant_is_unifiable(
         _sdk_abi("unsigned long long", ["int"]), _sdk_abi("undefined8", ["int"]), False
+    )
+    # Identical spelling short-circuits regardless of consumption.
+    assert abi._sdk_variant_is_unifiable(
+        _sdk_abi("undefined8", ["int"]), _sdk_abi("undefined8", ["uint"]), False
     )
 
 

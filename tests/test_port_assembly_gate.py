@@ -2189,3 +2189,49 @@ def test_sdk_seed_configured_but_unreadable_fails_closed(
     assert result["stage"] == "canonicalize"
     assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
     assert "sdk_canon_unavailable" in result["detail"]
+
+
+@requires_toolchain
+def test_sdk_seed_with_zero_declarations_fails_closed(
+    tmp_path: Path, smoke_script: Path
+):
+    """A configured seed that READS but parses to zero gnt4_* declarations is
+    torn/garbled/format-drifted content (the driver rewrites this file), not a
+    licence to silently disable the SDK pass (review D3)."""
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = tmp_path / "product-seed" / "gnt4_shim_seed.h"
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    seed.write_text(
+        "/* torn write: the declarations never made it */\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    staging = tmp_path / "staging"
+    _write_unit(staging / "unit-a", "unit-a", SDK_CANON_DECL)
+    _write_unit(staging / "unit-b", "unit-b", SDK_CANON_DECL)
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("an empty canon must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "canonicalize"
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    assert "sdk_canon_unavailable" in result["detail"]
+    assert "no gnt4_* declarations" in result["detail"]
