@@ -2866,6 +2866,46 @@ def _sdk_wasm_value_class(spelling: str) -> str | None:
     return _wasm_value_class(spelling)
 
 
+def dispatch_value_class(spelling: str) -> str | None:
+    """The uniform-dispatch MARSHALLING class for one C spelling, or None.
+
+    The H3 dispatch seam (docs/playable-port-design.md, V4 H3) marshals every
+    argument through a fixed shared-memory frame, so it needs the wasm32 value
+    class of each parameter -- the same machinery as _wasm_value_class -- with
+    two deliberate extensions that would be WRONG for declaration comparison
+    but are exactly right for marshalling:
+
+    - Pointers and arrays return "i32" here. _wasm_value_class returns None
+      for pointers because comparing `const int *` against `float *` as equal
+      would erase a distinction canonicalization refuses on purpose. The
+      dispatch frame carries no such distinction: every pointer is one 32-bit
+      linear-memory address moving through an i32 slot.
+    - The pinned Clang's desugared i64 spelling ("unsigned long long") is
+      recognized, exactly as _sdk_wasm_value_class does.
+
+    `void` still returns None: a void RETURN is the caller's special case
+    (class code 0 in the frame header), and a void PARAMETER list is arity
+    zero, not a slot.
+    """
+    text = " ".join(spelling.split())
+    if not text:
+        return None
+    if "*" in text or "[" in text:
+        return "i32"
+    return _sdk_wasm_value_class(text)
+
+
+def symbol_gc_address(name: str) -> str | None:
+    """The 8-hex GC code address encoded in a zz_/FUN_ symbol name, or None.
+
+    Exactly the registry's own derivation (_encoded_address): zz_XXXXXXX_
+    labels encode the low 7 hex digits of a 0x8XXXXXXX address, FUN_XXXXXXXX
+    carries all 8. Renamed symbols encode nothing and return None -- their
+    address must come from a chunk marker or the owner registry.
+    """
+    return _encoded_address(name)
+
+
 def _sdk_return_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: bool) -> bool:
     """True when rewriting a divergent gnt4_* DECLARATION's return to canon is safe.
 
