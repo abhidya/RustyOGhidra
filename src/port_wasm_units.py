@@ -108,6 +108,10 @@ from src.port_driver import (
     DriverLock,
 )
 from src.port_model_config import resolve_port_model_config
+from src.port_sdk_decl_injection import (
+    inject_sdk_declarations,
+    sync_sdk_declarations,
+)
 from src.port_progress import (
     RESULT_DEFERRED,
     RESULT_GATE_FAILED,
@@ -3583,6 +3587,48 @@ class WasmUnitDriver:
                 state, record, name, f"header seed: {error}",
                 stage="header-seed", result=RESULT_RETRYABLE,
             )
+        # 2a. canonical SDK declaration sync (v2/v3 design step 1). The
+        # per-unit seeds are snapshots taken before the corpus-validated
+        # gnt4_* canon landed in gnt4_shim_seed.h, so on every (re)attempt
+        # the seed is synchronised with the canon -- ONLY for the gnt4_*
+        # symbols this unit's verbatim .c references (injected when absent,
+        # superseded in place when divergent, untouched when identical;
+        # idempotent, atomic seed write). Same trust class as the transform:
+        # deterministic, never a model decision. Any fault degrades to the
+        # unsynced seed + event -- canon warmth is optional, the attempt is
+        # not blocked on it.
+        record["sdk_decl_sync"] = {"injected": [], "superseded": [], "unresolved": []}
+        try:
+            sdk_sync = sync_sdk_declarations(
+                header_seed,
+                unit_c,
+                self.run_root / "gnt4_shim_seed.h",
+                header_text=header,
+            )
+            header = sdk_sync.header_text
+            record["sdk_decl_sync"] = {
+                "injected": sdk_sync.injected,
+                "superseded": sdk_sync.superseded,
+                "unresolved": sdk_sync.unresolved,
+            }
+            if sdk_sync.changed or sdk_sync.unresolved:
+                self.events.emit(
+                    "sdk_decl_sync",
+                    unit=name,
+                    injected=sdk_sync.injected,
+                    superseded=sdk_sync.superseded,
+                    unresolved=sdk_sync.unresolved,
+                )
+            if sdk_sync.write_error:
+                self.events.emit(
+                    "sdk_decl_sync_error",
+                    unit=name,
+                    error=f"seed write: {sdk_sync.write_error}"[:400],
+                )
+        except Exception as error:  # noqa: BLE001 - canon warmth is optional
+            self.events.emit(
+                "sdk_decl_sync_error", unit=name, error=str(error)[:400]
+            )
         # D5: generated per-unit headers are seed SNAPSHOTS taken before the
         # helper landed in gnt4_shim_seed.h, so a transformed unit's header
         # must gain the seed-tier helper deterministically here (same trust
@@ -5997,6 +6043,18 @@ class WasmUnitDriver:
         unit_c = materialized.unit_c
         (workdir / "unit.c").write_text(unit_c, encoding="utf-8", newline="\n")
         header = (self.repo_root / unit["header_seed"]).read_text(encoding="utf-8")
+        # Canonical SDK declaration sync, IN MEMORY ONLY: the replay must see
+        # the same canon-synced starting header the live attempt path builds,
+        # but replays never write state -- so the pure pass, never the
+        # file-level sync.
+        try:
+            header = inject_sdk_declarations(
+                header,
+                unit_c,
+                (self.run_root / "gnt4_shim_seed.h").read_text(encoding="utf-8"),
+            ).header_text
+        except Exception:  # noqa: BLE001 - canon warmth is optional in replay too
+            pass
         if materialized.transform["sites"]:
             header = ensure_bitcast_helper(header)
         exports = unit["exported_functions"]
