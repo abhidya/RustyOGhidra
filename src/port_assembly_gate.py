@@ -1085,7 +1085,9 @@ def canonical_artifact_evidence(
     if artifact.tier != tier:
         return None, f"artifact-tier-mismatch:{artifact.tier}"
     commit = record.get("commit")
-    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{7,40}", commit, re.I) is None:
+    # Full 40-hex commit SHAs only: a short prefix is not proof-grade
+    # identity (it can resolve to several objects, or to none).
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit, re.I) is None:
         return None, "canonical-commit-missing"
     if record.get("pushed") is not True:
         return None, "canonical-push-unconfirmed"
@@ -1189,7 +1191,9 @@ def prove_legacy_artifact_commit_tree(
     commit = record.get("commit")
     if (
         not isinstance(commit, str)
-        or re.fullmatch(r"[0-9a-f]{7,40}", commit, re.I) is None
+        # Full 40-hex commit SHAs only -- the proof must name exactly one
+        # object; abbreviated prefixes are refused.
+        or re.fullmatch(r"[0-9a-f]{40}", commit, re.I) is None
     ):
         return None, "legacy-commit-invalid"
     try:

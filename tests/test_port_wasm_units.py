@@ -159,9 +159,9 @@ def test_green_unit_commits_artifacts_and_completes(tmp_path, monkeypatch):
         "units": {
             "unit-a": {
                 "status": "pending", "attempts": 1,
-                "tier": "compile_only", "commit": "deadcafe", "pushed": True,
+                "tier": "compile_only", "commit": "deadcafe" * 5, "pushed": True,
                 "revoked": {
-                    "previous_commit": "deadcafe",
+                    "previous_commit": "deadcafe" * 5,
                     "reason": "superseded historical verdict",
                 },
             }
@@ -1166,7 +1166,7 @@ def test_revoke_unit_backs_up_journals_projected_pending_and_is_idempotent(
                         "attempts": 1,
                         "tier": "compile_only",
                         "oracle_summary": "compile-only (UNVERIFIED)",
-                        "commit": "badc0ffee",
+                        "commit": ("badc0ffee" + "0" * 31),
                         "pushed": True,
                         "candidate_sha256": "c" * 64,
                         "world_version": {"driver_rev": "old"},
@@ -1182,7 +1182,7 @@ def test_revoke_unit_backs_up_journals_projected_pending_and_is_idempotent(
 
     result = driver.revoke_unit("unit-a", reason)
     assert result["previous_status"] == "green"
-    assert result["previous_commit"] == "badc0ffee"
+    assert result["previous_commit"] == ("badc0ffee" + "0" * 31)
     assert result["backup"] and result["backup"].startswith(
         "wasm-units-state.json.settle-backup-"
     )
@@ -1201,7 +1201,7 @@ def test_revoke_unit_backs_up_journals_projected_pending_and_is_idempotent(
     assert checkpoint["machine"].context_length is None
     assert transition.result == "deferred"
     assert transition.stage == "manual-revoke"
-    assert transition.extra["previous_commit"] == "badc0ffee"
+    assert transition.extra["previous_commit"] == ("badc0ffee" + "0" * 31)
     assert transition.extra["transition_id"] == result["transition_id"]
 
     record = _state(repo)["units"]["unit-a"]
@@ -1258,7 +1258,7 @@ def test_revoke_unit_replays_same_transition_after_state_save_crash(
                         "status": "green",
                         "attempts": 1,
                         "tier": "compile_only",
-                        "commit": "badc0ffee",
+                        "commit": ("badc0ffee" + "0" * 31),
                     }
                 },
             }
@@ -1337,7 +1337,7 @@ def test_revoke_unit_real_progress_push_is_idempotent_across_crash(
                         "attempts": 1,
                         "tier": "compile_only",
                         "oracle_summary": "compile-only (UNVERIFIED)",
-                        "commit": "badc0ffee",
+                        "commit": ("badc0ffee" + "0" * 31),
                         "pushed": True,
                         "push_detail": "legacy ordering",
                         "world_version": {"driver_rev": "old", "registry_version": "4"},
@@ -1522,7 +1522,7 @@ def test_revoke_unit_journal_failure_leaves_state_registry_artifact_and_git_unto
                         "status": "green",
                         "attempts": 1,
                         "tier": "compile_only",
-                        "commit": "badc0ffee",
+                        "commit": ("badc0ffee" + "0" * 31),
                     }
                 },
             }
@@ -1878,7 +1878,7 @@ def _seed_green_artifact(
             "status": "green",
             "attempts": 1,
             "tier": "oracle_green",
-            "commit": "deadbeef",
+            "commit": "deadbeef" * 5,
             "pushed": True,
             "last_stage": "commit",
             "candidate_sha256": unit_artifact_sha256(directory),
@@ -2639,7 +2639,7 @@ def _seed_revoked_replacement(repo: Path) -> tuple[Path, str]:
                     "reason": "reviewed rebuild required",
                     "previous_status": "green",
                     "previous_tier": "oracle_green",
-                    "previous_commit": "1022b6c9",
+                    "previous_commit": "1022b6c9" * 5,
                     "previous_candidate_sha256": old_digest,
                     "previous_record_sha256": "a" * 64,
                     "transition_id": "verdict-revoke-" + "b" * 64,
@@ -2887,6 +2887,25 @@ def test_operator_revocations_never_borrow_the_record_commit(tmp_path):
         driver._install_promotion_candidate(
             transaction, state["units"]["unit-a"]
         )
+
+
+def test_forged_d5_record_with_candidate_digest_cannot_skip_the_commit_proof(
+    tmp_path,
+):
+    """A hand-edited d5-migrate record carrying previous_candidate_sha256 must
+    be refused as forged, never allowed to take the digest-only replacement
+    branch (disk digest vs self-declared digest, proof commit None)."""
+    repo, driver, _journal, artifact, _commit = _seed_d5_migrate_replacement(tmp_path)
+    old_digest = unit_artifact_sha256(artifact)
+    state = _state(repo)
+    state["units"]["unit-a"]["revoked"]["previous_candidate_sha256"] = old_digest
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    transaction = _d5_promotion_transaction(tmp_path, driver, artifact)
+    with pytest.raises(RuntimeError, match="no eligible revoked lifecycle"):
+        driver._install_promotion_candidate(
+            transaction, state["units"]["unit-a"]
+        )
+    assert unit_artifact_sha256(artifact) == old_digest
 
 
 def test_revoked_replacement_registry_phase_crash_restores_artifact_and_registry_preimages(

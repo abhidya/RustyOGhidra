@@ -39,17 +39,44 @@ def test_operator_lifecycle_still_requires_every_binding(field):
 
 @pytest.mark.parametrize(
     "field,value",
-    [("transition_id", "verdict-revoke-nope"), ("previous_record_sha256", "b" * 63), ("previous_commit", "zz")],
+    [
+        ("transition_id", "verdict-revoke-nope"),
+        ("previous_record_sha256", "b" * 63),
+        ("previous_commit", "zz"),
+        # Abbreviated commit prefixes are no longer proof-grade identity.
+        ("previous_commit", "1022b6c9"),
+        ("previous_commit", "c" * 39),
+        ("previous_commit", "c" * 64),
+    ],
 )
 def test_operator_bindings_must_be_well_formed(field, value):
     assert not eligible({**OPERATOR, field: value}, "compile_only")
+
+
+def test_operator_lifecycle_may_carry_its_candidate_digest():
+    # revoke-unit records the revoked lifecycle's candidate_sha256; carrying
+    # it is genuine operator evidence, not forgery.
+    assert eligible(
+        {**OPERATOR, "previous_candidate_sha256": "d" * 64}, "compile_only"
+    )
 
 
 def test_migration_lifecycle_is_eligible_on_its_own_evidence():
     assert eligible(MIGRATION, "compile_only")
 
 
-@pytest.mark.parametrize("field", ["transition_id", "previous_record_sha256", "previous_commit"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "transition_id",
+        "previous_record_sha256",
+        "previous_commit",
+        # A digest here would take the digest-only replacement branch (disk
+        # digest vs self-declared digest, no commit-tree proof), so a
+        # migration record carrying it is refused as forged.
+        "previous_candidate_sha256",
+    ],
+)
 def test_a_migration_record_carrying_operator_bindings_is_forged(field):
     # A genuine d5-migrate record cannot have these -- the migration never
     # computed them -- so their presence means the record was hand-written.
