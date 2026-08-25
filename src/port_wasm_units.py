@@ -3260,6 +3260,12 @@ class WasmUnitDriver:
             candidate=candidate,
             selection_evidence=selection_evidence,
             canonicalization=self._canonicalization_request(units, gate_workdir),
+            # G2/H3 dispatch companion (src/port_dispatch_companion.py):
+            # env-gated opt-in so the live gate stays byte-identical until the
+            # owner deliberately enables the address-keyed dispatch artifact.
+            dispatch_companion=(
+                os.getenv("OGHIDRA_PORT_DISPATCH_COMPANION", "") == "1"
+            ),
         )
         if not verify_canonical_state_snapshot(snapshot):
             result["passed"] = False

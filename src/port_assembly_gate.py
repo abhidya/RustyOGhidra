@@ -352,6 +352,12 @@ CLASS_DECL_DIVERGENCE = "declaration_divergence"
 CLASS_CANONICALIZATION_REFUSED = "canonicalization_refused"
 CLASS_LINK_FAILURE = "link_failure"
 CLASS_INSTANTIATION_FAILURE = "instantiation_failure"
+# G2/H3 dispatch companion (src/port_dispatch_companion.py): the window's
+# address-keyed uniform-ABI table could not be derived, compiled, or linked.
+# Always a loud refusal -- a window whose companion fails must never pass
+# silently without its dispatch table (design V4 H3: misses are DEFINED
+# behavior; an absent table is not).
+CLASS_DISPATCH_COMPANION_FAILED = "dispatch_companion_failed"
 
 # Statements that look like `name (...) {` but are control flow, not
 # function definitions.
@@ -1467,12 +1473,20 @@ def run_assembly_gate(
     candidate: UnitArtifact | None = None,
     selection_evidence: dict[str, Any] | None = None,
     canonicalization: "CanonicalizationRequest | None" = None,
+    dispatch_companion: bool = False,
 ) -> dict[str, Any]:
     """Run one N-unit assembly-gate pass. Pure orchestration: emcc and node
     arrive as injected runners.
 
     link_runner(workdir, c_file_names, exports, allowed_extra) -> (ok, error)
     smoke_runner(wasm_path) -> (ok, log)
+
+    ``dispatch_companion`` opts the window into the G2/H3 address-keyed
+    uniform-ABI dispatch companion (src/port_dispatch_companion.py): an
+    additional gate-derived translation unit in the same link, exporting
+    __gf_dispatch and declaring the __gf_dispatch_miss host import. Default
+    False keeps the live gate byte-identical until the driver deliberately
+    opts in (the same introduction discipline as CanonicalizationRequest).
     """
     names = [unit.name for unit in units]
     result: dict[str, Any] = {
@@ -1560,7 +1574,15 @@ def run_assembly_gate(
         c_files, canonical_evidence = canonical
         result["canonicalization"] = canonical_evidence
         return _link_and_smoke(
-            result, units, names, workdir, c_files, link_runner, smoke_runner, candidate
+            result,
+            units,
+            names,
+            workdir,
+            c_files,
+            link_runner,
+            smoke_runner,
+            candidate,
+            dispatch_companion=dispatch_companion,
         )
 
     headers = [
@@ -1601,7 +1623,15 @@ def run_assembly_gate(
         c_files.append(file_name)
 
     return _link_and_smoke(
-        result, units, names, workdir, c_files, link_runner, smoke_runner, candidate
+        result,
+        units,
+        names,
+        workdir,
+        c_files,
+        link_runner,
+        smoke_runner,
+        candidate,
+        dispatch_companion=dispatch_companion,
     )
 
 
@@ -1746,6 +1776,12 @@ def _canonicalize_window(
         "registry_sha256": plan.receipt.registry_sha256,
         "tool_world_sha256": plan.receipt.tool_world_sha256,
         "owners": [item.public_dict() for item in plan.owner_bindings],
+        # symbol -> 8-hex GC address, from the owner registry's address field.
+        # The dispatch companion (G2/H3) uses this as its last-resort address
+        # authority for renamed symbols whose final source lost its marker.
+        "owner_addresses": {
+            item.symbol: item.address for item in plan.owner_bindings
+        },
         "compatibility_checks": [item.to_dict() for item in plan.compatibility_checks],
         "discarded_variants": [item.to_dict() for item in plan.discarded_variants],
         "sdk_canon": sdk_evidence,
@@ -1754,6 +1790,102 @@ def _canonicalize_window(
         "behavior_claim": None,
     }
     return c_files, evidence
+
+
+def _emit_dispatch_companion(
+    result: dict[str, Any],
+    units: list[UnitArtifact],
+    names: list[str],
+    workdir: Path,
+    c_files: list[str],
+) -> bool:
+    """Derive + write the G2/H3 dispatch companion for this window.
+
+    Reads the FINAL written sources (post-canonicalization when that path
+    ran), derives one adapter thunk per (unit, exported symbol), and writes
+    the frame-ABI header + companion translation unit into the workdir,
+    appending the companion to ``c_files``. Any derivation problem populates
+    ``result`` as a loud `dispatch_companion_failed` refusal and returns
+    False -- a defined function is never silently skipped (it would become a
+    wrong-behavior miss, not a defined one).
+    """
+    from src.port_dispatch_companion import (
+        COMPANION_FILENAME,
+        FRAME_HEADER_FILENAME,
+        FRAME_HEADER_TEXT,
+        companion_evidence,
+        derive_window_signatures,
+        emit_companion_source,
+    )
+
+    result["stage"] = "dispatch-companion"
+    source_by_unit: dict[str, str] = {}
+    for c_file in c_files:
+        parts = Path(c_file).parts
+        unit_name = parts[0] if len(parts) > 1 else Path(c_file).stem
+        source_by_unit[unit_name] = c_file
+    window: list[tuple[str, str, list[str]]] = []
+    for unit in units:
+        c_file = source_by_unit.get(unit.name)
+        if c_file is None:
+            result["conflicts"] = [
+                _conflict_record(
+                    None,
+                    CLASS_DISPATCH_COMPANION_FAILED,
+                    names,
+                    {},
+                    f"no written source maps to unit {unit.name}",
+                )
+            ]
+            result["detail"] = (
+                f"dispatch companion refused: no written source for {unit.name}"
+            )
+            return False
+        try:
+            source_text = (workdir / c_file).read_text(encoding="utf-8-sig")
+        except OSError as error:
+            result["conflicts"] = [
+                _conflict_record(
+                    None,
+                    CLASS_DISPATCH_COMPANION_FAILED,
+                    names,
+                    {},
+                    f"cannot read written source {c_file}: {error}",
+                )
+            ]
+            result["detail"] = f"dispatch companion refused: unreadable {c_file}"
+            return False
+        window.append((unit.name, source_text, list(unit.exports)))
+    canonicalization = result.get("canonicalization") or {}
+    owner_addresses = canonicalization.get("owner_addresses") or {}
+    derived = derive_window_signatures(window, owner_addresses)
+    if derived.problems:
+        result["conflicts"] = [
+            _conflict_record(
+                problem.symbol,
+                CLASS_DISPATCH_COMPANION_FAILED,
+                [problem.unit],
+                {},
+                f"{problem.code}: {problem.detail}",
+            )
+            for problem in derived.problems
+        ]
+        result["detail"] = (
+            "dispatch companion refused: "
+            f"{len(derived.problems)} underivable symbol(s); the address-keyed "
+            "table must cover every defined function (design V4 H3)"
+        )
+        return False
+    companion_text = emit_companion_source(derived.signatures)
+    (workdir / FRAME_HEADER_FILENAME).write_text(
+        FRAME_HEADER_TEXT, encoding="utf-8", newline="\n"
+    )
+    (workdir / COMPANION_FILENAME).write_text(
+        companion_text, encoding="utf-8", newline="\n"
+    )
+    c_files.append(COMPANION_FILENAME)
+    result["dispatch"] = companion_evidence(derived.signatures, companion_text)
+    return True
 
 
 def _link_and_smoke(
@@ -1765,6 +1897,7 @@ def _link_and_smoke(
     link_runner: Callable[[Path, list[str], list[str], list[str]], tuple[bool, str]],
     smoke_runner: Callable[[Path], tuple[bool, str]] | None,
     candidate: UnitArtifact | None,
+    dispatch_companion: bool = False,
 ) -> dict[str, Any]:
     """Link, smoke, and re-verify artifact integrity.
 
@@ -1772,6 +1905,13 @@ def _link_and_smoke(
     canonicalization path so both compose under identical settings -- the gate
     must never pass under laxer conditions on one route than the other.
     """
+    if dispatch_companion:
+        # G2/H3: emit the address-keyed uniform-ABI dispatch companion as an
+        # additional derived translation unit in the SAME link. Additive: the
+        # existing merge/canonicalize/link semantics are untouched; companion
+        # failure is its own loud refusal class.
+        if not _emit_dispatch_companion(result, units, names, workdir, c_files):
+            return result
     exports = sorted(
         {
             export
@@ -1783,10 +1923,33 @@ def _link_and_smoke(
     allowed_extra = sorted(
         {extra for unit in units for extra in unit.allowed_extra_imports}
     )
+    if dispatch_companion:
+        from src.port_dispatch_companion import DISPATCH_EXPORT, MISS_IMPORT
+
+        exports.append(DISPATCH_EXPORT)
+        allowed_extra.append(MISS_IMPORT)
     result["stage"] = "link"
     ok, error_text = link_runner(workdir, c_files, exports, allowed_extra)
     if not ok:
-        result["conflicts"] = conflicts_from_link_error(error_text, names)
+        conflicts = conflicts_from_link_error(error_text, names)
+        if dispatch_companion and "gf_dispatch_companion" in (error_text or ""):
+            from src.port_dispatch_companion import COMPANION_FILENAME
+
+            # The companion is gate-derived, so a compile/link diagnostic that
+            # names it is a companion failure, not a unit conflict: file it
+            # under the dispatch class so the refusal is attributable.
+            conflicts.insert(
+                0,
+                _conflict_record(
+                    None,
+                    CLASS_DISPATCH_COMPANION_FAILED,
+                    names,
+                    {},
+                    f"{COMPANION_FILENAME} implicated in link failure: "
+                    + (error_text or "").strip()[-400:],
+                ),
+            )
+        result["conflicts"] = conflicts
         result["detail"] = (error_text or "").strip()[-1200:]
         return result
 
