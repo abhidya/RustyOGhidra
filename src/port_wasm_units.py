@@ -3292,6 +3292,12 @@ class WasmUnitDriver:
                 attempt=attempt,
                 behavior_tier="compile_only",
                 smoke_script=smoke_script,
+                # The same canon seed every (re)attempt already syncs per-unit
+                # headers from (see sync_sdk_declarations); the gate reads it
+                # fresh so stale gnt4_* declarations in already-staged window
+                # units unify to the current canon instead of contesting every
+                # new candidate at wasm-ld.
+                sdk_seed_path=self.run_root / "gnt4_shim_seed.h",
             )
             self.events.emit(
                 "assembly_canonicalization_ready",

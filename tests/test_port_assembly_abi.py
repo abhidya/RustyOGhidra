@@ -3069,3 +3069,114 @@ def test_pointers_have_no_wasm_scalar_class():
     assert abi._wasm_value_class("undefined8") == "i64"
     assert abi._wasm_value_class("double") == "f64"
     assert abi._wasm_value_class("float") == "f32"
+    # The desugared "unsigned long long" mapping is SCOPED to the SDK return
+    # comparison; the shared class function stays byte-identical so the owner
+    # path's equivalence semantics do not move.
+    assert abi._wasm_value_class("unsigned long long") is None
+    assert abi._wasm_value_class("long long") == "i64"
+    assert abi._sdk_wasm_value_class("unsigned long long") == "i64"
+    assert abi._sdk_wasm_value_class("long long") == "i64"
+    assert abi._sdk_wasm_value_class("int *") is None
+
+
+def test_owner_path_still_refuses_desugared_i64_parameter_spelling_mismatch():
+    # Regression pin for the D2 review finding: the SDK-scoped i64 spelling
+    # must NOT leak into _parameters_are_abi_equivalent -- an owner/variant
+    # longlong-vs-ulonglong parameter disagreement keeps failing closed to the
+    # Clang probe exactly as before this change.
+    owner = _abi("void", ["unsigned long long"])
+    variant = _abi("void", ["long long"])
+    assert not abi._parameters_are_abi_equivalent(owner, variant)
+    assert not abi._parameters_are_abi_equivalent(variant, owner)
+
+
+# --- SDK (gnt4_*) canonicalization against the seed canon --------------------
+# The safety matrix for unifying a divergent gnt4_* DECLARATION to the canon:
+# spelling-equivalent parameters plus a return divergence that cannot change a
+# call site's meaning. The stale-seed direction that blocked the window --
+# `void` caller under an `undefined8` canon -- is safe unconditionally; the
+# reverse is safe only when every call in the bundle discards the result.
+
+
+def _sdk_abi(ret, params):
+    return abi.AbiTuple(ret, tuple(params), "prototype" if params else "void", False)
+
+
+def test_sdk_stale_void_caller_under_value_canon_is_unifiable():
+    canon = _sdk_abi("undefined8", ["double", "float *", "float *"])
+    variant = _sdk_abi("void", ["double", "float *", "float *"])
+    assert abi._sdk_variant_is_unifiable(canon, variant, False)
+    assert abi._sdk_variant_is_unifiable(canon, variant, True)
+
+
+def test_sdk_value_caller_under_void_canon_requires_discarded_results():
+    canon = _sdk_abi("void", ["int"])
+    variant = _sdk_abi("undefined8", ["int"])
+    assert abi._sdk_variant_is_unifiable(canon, variant, True)
+    assert not abi._sdk_variant_is_unifiable(canon, variant, False)
+
+
+def test_sdk_return_class_change_beyond_widening_fails_closed():
+    # i32 -> i64 across two VALUE-returning declarations alters what a
+    # consuming call site reads; both directions must contest.
+    canon = _sdk_abi("undefined8", ["int"])
+    variant = _sdk_abi("undefined4", ["int"])
+    assert not abi._sdk_variant_is_unifiable(canon, variant, True)
+    assert not abi._sdk_variant_is_unifiable(variant, canon, True)
+    # Same class, different spelling: safe ONLY when every call discards the
+    # result. A signedness flip under a consuming site (`if (f() < 0)`) would
+    # recompile clean and silently diverge (review D1).
+    assert abi._sdk_variant_is_unifiable(
+        _sdk_abi("unsigned long long", ["int"]), _sdk_abi("undefined8", ["int"]), True
+    )
+    assert not abi._sdk_variant_is_unifiable(
+        _sdk_abi("unsigned long long", ["int"]), _sdk_abi("undefined8", ["int"]), False
+    )
+    # Identical spelling short-circuits regardless of consumption.
+    assert abi._sdk_variant_is_unifiable(
+        _sdk_abi("undefined8", ["int"]), _sdk_abi("undefined8", ["uint"]), False
+    )
+
+
+def test_sdk_parameter_class_change_fails_closed_regardless_of_return():
+    canon = _sdk_abi("undefined8", ["double", "float *", "float *"])
+    variant = _sdk_abi("undefined8", ["int"])
+    assert not abi._sdk_variant_is_unifiable(canon, variant, True)
+    mismatched = _sdk_abi("undefined8", ["double", "float *", "int *"])
+    assert not abi._sdk_variant_is_unifiable(canon, mismatched, True)
+
+
+def test_plan_sdk_canon_is_inert_when_empty_or_unreferenced(tmp_path: Path):
+    snapshot = _load_snapshot(tmp_path.resolve())
+    bundle = _bundle()
+    base = abi.plan_canonicalization(bundle, snapshot)
+    empty = abi.plan_canonicalization(bundle, snapshot, sdk_canon={})
+    unreferenced = abi.plan_canonicalization(
+        bundle,
+        snapshot,
+        sdk_canon={"gnt4_Unreferenced_bl": "extern void gnt4_Unreferenced_bl(int a);"},
+    )
+    assert isinstance(base, abi.CanonicalizationPlan)
+    assert isinstance(empty, abi.CanonicalizationPlan)
+    assert isinstance(unreferenced, abi.CanonicalizationPlan)
+    # ROM-symbol canonicalization is byte-identical with the SDK path armed:
+    # derived bundles, receipts, and evidence do not move.
+    assert base.receipt.sha256 == empty.receipt.sha256 == unreferenced.receipt.sha256
+    assert base.translation_units == empty.translation_units == unreferenced.translation_units
+    assert base.discarded_variants == unreferenced.discarded_variants
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        {"zz_00262b4_": "extern void zz_00262b4_(int);"},  # not an SDK symbol
+        {"gnt4_bad symbol": "extern void gnt4_x(int);"},
+        {"gnt4_ok_bl": ""},
+        "not-a-mapping",
+    ],
+)
+def test_plan_refuses_malformed_sdk_canon(tmp_path: Path, mapping):
+    snapshot = _load_snapshot(tmp_path.resolve())
+    refusal = abi.plan_canonicalization(_bundle(), snapshot, sdk_canon=mapping)
+    assert isinstance(refusal, abi.AssemblyAbiRefusal)
+    assert refusal.code == "sdk_canon_invalid"

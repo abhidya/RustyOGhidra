@@ -2849,6 +2849,78 @@ def _parameters_are_abi_equivalent(owner: AbiTuple, variant: AbiTuple) -> bool:
     return True
 
 
+def _sdk_wasm_value_class(spelling: str) -> str | None:
+    """_wasm_value_class plus the pinned Clang's DESUGARED i64 spelling.
+
+    The SDK canon comparison sees desugared tuples ("unsigned long long"),
+    not Ghidra spellings ("undefined8"/"ulonglong"). Deliberately a SEPARATE
+    function: extending _wasm_value_class itself would leak into
+    _parameters_are_abi_equivalent and flip owner-path longlong/ulonglong
+    parameter disagreements from Clang-probe refusal to supersede -- the
+    owner path must stay byte-identical.
+    """
+    text = " ".join(spelling.split())
+    words = [w for w in text.split() if w not in {"const", "volatile", "struct", "union", "enum"}]
+    if words == ["unsigned", "long", "long"]:
+        return "i64"
+    return _wasm_value_class(spelling)
+
+
+def _sdk_return_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: bool) -> bool:
+    """True when rewriting a divergent gnt4_* DECLARATION's return to canon is safe.
+
+    The canon seed (gnt4_shim_seed.h) is the owner authority for SDK symbols,
+    exactly as the registry is for ROM symbols. A caller's declaration that
+    diverges from it only in the return value can be unified when no call site's
+    meaning changes:
+
+    - identical spelling (or the void/code spelling pair): nothing to reconcile;
+    - variant void, canon value-returning: a void-declared caller cannot have
+      consumed the result (the unit compiled green against its own header), and
+      a call site that ignores an i64/f64 result is byte-identical either way --
+      this is the stale-seed direction that blocked the window;
+    - variant value-returning, canon void: safe ONLY when every call in the
+      bundle provably discards the result -- rewriting under a consuming call
+      would either miscompile or silently reinterpret, so that fails closed;
+    - both value-returning: only when both spellings lower to the SAME wasm
+      value class (int/uint/undefined4 are one i32) AND every call in the
+      bundle discards the result. A class change (undefined4 vs undefined8,
+      double vs undefined8) alters what a consuming call site reads; and even
+      a same-class signedness flip (unsigned long long vs long long) changes
+      the C semantics of a CONSUMING site (`if (f() < 0)`), which would
+      recompile clean and silently diverge -- so consumption fails closed.
+    """
+    canon_return = " ".join(canon.return_type.split())
+    variant_return = " ".join(variant.return_type.split())
+    if canon_return == variant_return:
+        return True
+    canon_void = canon_return in {"void", "code"}
+    variant_void = variant_return in {"void", "code"}
+    if canon_void and variant_void:
+        return True
+    if variant_void:
+        return True
+    if canon_void:
+        return result_unused
+    canon_class = _sdk_wasm_value_class(canon_return)
+    variant_class = _sdk_wasm_value_class(variant_return)
+    return result_unused and canon_class is not None and canon_class == variant_class
+
+
+def _sdk_variant_is_unifiable(canon: AbiTuple, variant: AbiTuple, result_unused: bool) -> bool:
+    """True when a divergent gnt4_* declaration safely unifies to the canon.
+
+    Parameters must lower to the identical wasm signature
+    (_parameters_are_abi_equivalent fails closed on arity, variadic, unknown
+    spellings, and genuine class changes), and the return divergence must be in
+    the safe set above. Anything else falls through to the Clang
+    canon/variant probe, whose refusal is `sdk_variant_abi_incompatible`.
+    """
+    if not _parameters_are_abi_equivalent(canon, variant):
+        return False
+    return _sdk_return_is_unifiable(canon, variant, result_unused)
+
+
 def _QUALIFIERS() -> frozenset[str]:
     return frozenset({"const", "volatile", "signed", "struct", "union", "enum"})
 
@@ -2969,12 +3041,35 @@ def _apply_replacements(data: bytes, replacements: Sequence[tuple[int, int, byte
 def plan_canonicalization(
     bundle: AssemblyBundle,
     owners: OwnerSnapshot,
+    *,
+    sdk_canon: Mapping[str, str] | None = None,
 ) -> CanonicalizationPlan | AssemblyAbiRefusal:
-    """Purely plan whole-bundle owner canonicalization or refuse atomically."""
+    """Purely plan whole-bundle owner canonicalization or refuse atomically.
+
+    ``sdk_canon`` optionally maps gnt4_* SDK symbols to their canonical
+    declaration text (the gate reads it fresh from gnt4_shim_seed.h). When
+    supplied, divergent gnt4_* declarations in the bundle's headers are
+    unified to the canon in the DERIVED headers, or the plan refuses with
+    ``sdk_variant_abi_incompatible``. ``None`` keeps prior behaviour exactly:
+    gnt4_* declarations pass through untouched.
+    """
 
     invalid = _validate_bundle(bundle)
     if invalid is not None:
         return invalid
+    if sdk_canon is not None and (
+        not isinstance(sdk_canon, Mapping)
+        or not all(
+            isinstance(symbol, str)
+            and symbol.startswith("gnt4_")
+            and _IDENTIFIER_RE.fullmatch(symbol) is not None
+            and _nonempty_string(text)
+            for symbol, text in sdk_canon.items()
+        )
+    ):
+        return AssemblyAbiRefusal(
+            "sdk_canon_invalid", "owner", "SDK canon mapping is malformed"
+        )
     if (
         not isinstance(owners, OwnerSnapshot)
         or not _parser_identity_is_valid(owners.parser_identity)
@@ -3231,6 +3326,102 @@ def plan_canonicalization(
                     discarded.append(DiscardedVariant(*discard_key))
                 replacements.setdefault((site.ordinal, site.container), []).append(
                     (site.start, site.end, owner.normalized_prototype.encode("utf-8"))
+                )
+        # SDK (gnt4_*) canonicalization against the owner seed. The
+        # _EXTERNAL_PREFIXES skip above deliberately keeps gnt4_* out of the
+        # registry paths, so before this pass a divergent SDK declaration went
+        # straight to wasm-ld -- and after the canon seed moved (void ->
+        # undefined8 returns), every stale green in the window contested every
+        # new candidate with `function signature mismatch`. Only DERIVED
+        # headers are rewritten: gnt4_* declarations live in gnt4_shim.h
+        # (verified across the staged corpus), verbatim unit.c bytes and the
+        # staged artifacts stay untouched, and symbols absent from the canon
+        # keep current behaviour.
+        if sdk_canon:
+            sdk_projection: dict[str, DeclaratorProjection] = {}
+            sdk_prototype: dict[str, str] = {}
+            sdk_result_unused: dict[str, bool] = {}
+            for site in sorted(sites, key=lambda item: (item.symbol, item.relpath, item.start, item.kind)):
+                if site.symbol not in sdk_canon or site.symbol in selected:
+                    # An owner-registry symbol is canonicalized by the owner
+                    # loop above; letting both loops rewrite one site would
+                    # refuse as canonicalization_overlap.
+                    continue
+                if site.kind != "declaration" or site.container != "header":
+                    continue  # definitions (seed inline helpers) are authority
+                canon = sdk_projection.get(site.symbol)
+                if canon is None:
+                    canon_text = " ".join(sdk_canon[site.symbol].split())
+                    if not canon_text.endswith(";"):
+                        canon_text += ";"
+                    canon = parser.parse_declaration(canon_text.encode("utf-8"), site.symbol)
+                    if not _declarator_projection_is_valid(canon, site.symbol):
+                        return AssemblyAbiRefusal(
+                            "declarator_parser_fault",
+                            "canonicalize",
+                            f"parser returned malformed projection for SDK canon {site.symbol}",
+                        )
+                    sdk_projection[site.symbol] = canon
+                    sdk_prototype[site.symbol] = canon_text
+                variant = parser.parse_declaration(site.fragment, site.symbol)
+                if not _declarator_projection_is_valid(variant, site.symbol):
+                    return AssemblyAbiRefusal(
+                        "declarator_parser_fault",
+                        "canonicalize",
+                        f"parser returned malformed projection for {site.symbol}",
+                    )
+                if variant.canonical_prototype == canon.canonical_prototype:
+                    continue  # already the canon: untouched
+                if site.symbol not in sdk_result_unused:
+                    sdk_result_unused[site.symbol] = all(
+                        _every_call_discards_the_result(item.source, site.symbol)
+                        for item in bundle.translation_units
+                    )
+                result_unused = sdk_result_unused[site.symbol]
+                if _is_unprototyped_placeholder(variant):
+                    # The absence of a claim, exactly as in the owner path --
+                    # but a void canon under a consuming call site cannot be
+                    # substituted, and there is no import-safe fallback here:
+                    # the canon IS the import contract the JS host implements.
+                    canon_void = " ".join(canon.abi_tuple.return_type.split()) in {"void", "code"}
+                    if canon_void and not result_unused:
+                        return AssemblyAbiRefusal(
+                            "sdk_variant_abi_incompatible",
+                            "canonicalize",
+                            f"a call site consumes {site.symbol} while the SDK canon returns void"
+                            f" (placeholder declaration at {site.relpath})",
+                            symbol=site.symbol,
+                        )
+                elif not _sdk_variant_is_unifiable(
+                    canon.abi_tuple, variant.abi_tuple, result_unused
+                ):
+                    # Same Clang owner/variant-pair validation as the registry
+                    # path. Its evidence is NOT recorded in
+                    # compatibility_checks: the receipt binds those to owner
+                    # registry bindings, which SDK symbols do not have.
+                    probe = parser.compatibility(canon, variant)
+                    if not _compatibility_probe_is_valid(
+                        probe, canon, variant, owners.parser_identity.sha256
+                    ):
+                        return AssemblyAbiRefusal(
+                            "declarator_parser_fault",
+                            "canonicalize",
+                            f"parser returned malformed compatibility probe for {site.symbol}",
+                        )
+                    if not probe.compatible:
+                        return AssemblyAbiRefusal(
+                            "sdk_variant_abi_incompatible",
+                            "canonicalize",
+                            f"Clang rejected {site.symbol} SDK canon/variant pair at {site.relpath}",
+                            probe.source_sha256,
+                            symbol=site.symbol,
+                        )
+                discard_key = (site.symbol, site.relpath, variant.canonical_prototype_sha256)
+                if discard_key not in seen_discarded:
+                    seen_discarded.add(discard_key)
+                    discarded.append(DiscardedVariant(*discard_key))
+                replacements.setdefault((site.ordinal, site.container), []).append(
+                    (site.start, site.end, sdk_prototype[site.symbol].encode("utf-8"))
                 )
     except AssemblyAbiError as exc:
         return replace(exc.refusal, stage="canonicalize")
