@@ -2907,6 +2907,18 @@ class WasmUnitDriver:
             raise RuntimeError("revoked artifact preimage changed before authorization")
 
         previous_digest = revoked.get("previous_candidate_sha256")
+        # ``revoke-unit`` records name the revoked lifecycle's publication
+        # commit itself.  ``d5-migrate`` never recorded that binding -- it is
+        # operator-only, and revoked_lifecycle_is_eligible treats its presence
+        # on a migration record as forgery -- but the migration also never
+        # touched the record's own ``commit`` field, which still names the
+        # commit the revoked green was published at.  Proving the on-disk
+        # preimage against that commit on the authoritative publication
+        # lineage is the same evidence the operator path carries, so use it;
+        # nothing is written back to the revocation record.
+        legacy_commit = revoked.get("previous_commit")
+        if legacy_commit is None and revoked.get("via") == "d5-migrate":
+            legacy_commit = canonical.get("commit")
         proof: dict[str, Any]
         if previous_digest is not None:
             if previous_digest != existing.sha256:
@@ -2921,12 +2933,13 @@ class WasmUnitDriver:
             if (
                 isinstance(backfill, dict)
                 and backfill.get("artifact_sha256") == existing.sha256
-                and backfill.get("commit") == revoked.get("previous_commit")
+                and legacy_commit is not None
+                and backfill.get("commit") == legacy_commit
             ):
                 proof = {
                     "binding": "revocation-journaled-backfill",
                     "artifact_sha256": existing.sha256,
-                    "commit": revoked.get("previous_commit"),
+                    "commit": legacy_commit,
                     "backfill_transition_id": backfill.get("transition_id"),
                 }
             else:
@@ -2937,7 +2950,7 @@ class WasmUnitDriver:
                     )
                 proof, proof_error = prove_legacy_artifact_commit_tree(
                     existing,
-                    {"commit": revoked.get("previous_commit")},
+                    {"commit": legacy_commit},
                     repo_root=self.repo_root,
                     git_runner=self._git_runner,
                     publication_ref="refs/heads/port-staging",

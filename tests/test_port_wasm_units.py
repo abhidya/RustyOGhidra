@@ -2768,6 +2768,127 @@ def test_revoked_replacement_restart_restores_exact_preimage_from_both_rename_ga
     assert load_unit_artifact(quarantined[0] / "candidate") is not None
 
 
+def _seed_d5_migrate_replacement(tmp_path):
+    """A committed legacy staged artifact whose green was revoked by d5-migrate.
+
+    The migration record carries only its own evidence (transform_sites); the
+    operator bindings -- previous_commit included -- are absent by design.
+    The record's own ``commit`` still names the revoked green's publication
+    commit, exactly as ``d5_migrate`` leaves it.
+    """
+    repo, driver, journal, artifact = _legacy_backfill_fixture(tmp_path)
+    commit = _state(repo)["units"]["unit-a"]["commit"]
+    _state_path(repo).write_text(json.dumps({
+        "state_schema": 1,
+        "units": {
+            "unit-a": {
+                "status": "porting",
+                "attempts": 3,
+                "commit": commit,
+                "pushed": True,
+                "last_stage": "d5-migrate",
+                "revoked": {
+                    "via": "d5-migrate",
+                    "at": "2026-08-21T13:27:00Z",
+                    "reason": "D5-6 migration: artifact predates the "
+                    "d5-fp-reinterpret transform",
+                    "previous_status": "green",
+                    "previous_tier": "compile_only",
+                    "transform_sites": 2,
+                },
+            }
+        },
+    }), encoding="utf-8")
+    return repo, driver, journal, artifact, commit
+
+
+def _d5_promotion_transaction(tmp_path, driver, artifact):
+    workdir = tmp_path / "d5-replacement-source"
+    workdir.mkdir()
+    (workdir / "unit.c").write_text("int zz_test_(void) { return 9; }\n")
+    (workdir / "gnt4_shim.h").write_text("/* d5 rebuild */\n")
+    (workdir / "unit.wasm").write_bytes(b"\x00asm-d5")
+    (workdir / "oracle.log").write_text("PASS d5 rebuild\n")
+    return driver._create_promotion_attempt(
+        name="unit-a",
+        attempt=3,
+        workdir=workdir,
+        provenance={
+            "unit": "unit-a",
+            "generated_at": "2026-08-25T00:00:00Z",
+            "exported_functions": ["zz_test_"],
+            "allowed_extra_imports": [],
+            "tier": "compile_only",
+        },
+        destination=artifact,
+    )
+
+
+def test_d5_migrate_preimage_is_proved_against_its_recorded_publication_commit(
+    tmp_path,
+):
+    repo, driver, _journal, artifact, commit = _seed_d5_migrate_replacement(tmp_path)
+    old_digest = unit_artifact_sha256(artifact)
+    state = _state(repo)
+    transaction = _d5_promotion_transaction(tmp_path, driver, artifact)
+    result = driver._install_promotion_candidate(
+        transaction, state["units"]["unit-a"]
+    )
+    assert result == "revoked-preimage-replaced"
+    assert unit_artifact_sha256(artifact) == transaction.candidate.sha256
+    marker = driver._promotion_marker(transaction.attempt_dir)
+    authorization = marker["replacement_authorization"]
+    proof = authorization["proof"]
+    assert proof["binding"] == "legacy-git-tree"
+    assert proof["commit"] == commit
+    assert proof["artifact_sha256"] == old_digest
+    assert proof["uncommitted_files"] == ["oracle.log"]
+    # The revocation record itself is untouched: the migration still carries
+    # no operator-only bindings, so eligibility semantics are preserved.
+    record = _state(repo)["units"]["unit-a"]
+    assert record["revoked"].get("previous_commit") is None
+    backup = transaction.attempt_dir / authorization["backup"]
+    assert unit_artifact_sha256(backup) == old_digest
+
+
+def test_d5_migrate_preimage_without_a_recorded_commit_is_still_refused(
+    tmp_path,
+):
+    repo, driver, _journal, artifact, _commit = _seed_d5_migrate_replacement(tmp_path)
+    state = _state(repo)
+    state["units"]["unit-a"].pop("commit")
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    transaction = _d5_promotion_transaction(tmp_path, driver, artifact)
+    with pytest.raises(RuntimeError, match="legacy-commit-invalid"):
+        driver._install_promotion_candidate(
+            transaction, state["units"]["unit-a"]
+        )
+
+
+def test_operator_revocations_never_borrow_the_record_commit(tmp_path):
+    """A revoke-unit lifecycle whose previous_commit went missing must not
+    fall back to the record's own commit: the borrow is d5-migrate-only."""
+    repo, driver, _journal, artifact, commit = _seed_d5_migrate_replacement(tmp_path)
+    state = _state(repo)
+    old_digest = unit_artifact_sha256(artifact)
+    state["units"]["unit-a"]["revoked"] = {
+        "via": "revoke-unit",
+        "at": "2026-08-21T13:27:00Z",
+        "reason": "operator revocation missing its commit binding",
+        "previous_status": "green",
+        "previous_tier": "compile_only",
+        "previous_candidate_sha256": old_digest,
+        "previous_record_sha256": "a" * 64,
+        "transition_id": "verdict-revoke-" + "b" * 64,
+    }
+    _state_path(repo).write_text(json.dumps(state), encoding="utf-8")
+    transaction = _d5_promotion_transaction(tmp_path, driver, artifact)
+    with pytest.raises(RuntimeError, match="no eligible revoked lifecycle"):
+        driver._install_promotion_candidate(
+            transaction, state["units"]["unit-a"]
+        )
+
+
 def test_revoked_replacement_registry_phase_crash_restores_artifact_and_registry_preimages(
     tmp_path, monkeypatch
 ):
