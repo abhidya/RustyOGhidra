@@ -108,6 +108,11 @@ from src.port_driver import (
     DriverLock,
 )
 from src.port_model_config import resolve_port_model_config
+from src.port_owner_decl_injection import (
+    inject_owner_declarations,
+    load_owner_prototypes,
+    sync_owner_declarations,
+)
 from src.port_sdk_decl_injection import (
     inject_sdk_declarations,
     sync_sdk_declarations,
@@ -3648,6 +3653,52 @@ class WasmUnitDriver:
             self.events.emit(
                 "sdk_decl_sync_error", unit=name, error=str(error)[:400]
             )
+        # 2a'. owner prototype sync (zz_*/FUN_*), same shape as 2a. Units red
+        # out with owner_variant_abi_incompatible because the compile-fix
+        # model invents zz_*/FUN_* prototypes from call-site rendering (the
+        # Ghidra register-class fork: double where the corpus-anchored owner
+        # says undefined8) -- the gate enforces the ORACLE-REGISTRY owner at
+        # canonicalization, but nothing fed those prototypes into the seed,
+        # so the model could only guess. This pass feeds INFORMATION only: it
+        # injects/supersedes seed declarations for referenced symbols with an
+        # owner prototype (excluding this unit's own definitions and gnt4_*,
+        # which the SDK sync owns); it creates no new authority, and the
+        # gate's contest machinery is untouched. Any fault degrades to the
+        # unsynced seed + event -- warmth is optional, the attempt is not
+        # blocked on it.
+        record["owner_decl_sync"] = {"injected": [], "superseded": [], "unresolved": []}
+        try:
+            owner_sync = sync_owner_declarations(
+                header_seed,
+                unit_c,
+                self.repo_root / "research/decomp/data/oracle-registry.json",
+                unit_name=name,
+                header_text=header,
+            )
+            header = owner_sync.header_text
+            record["owner_decl_sync"] = {
+                "injected": owner_sync.injected,
+                "superseded": owner_sync.superseded,
+                "unresolved": owner_sync.unresolved,
+            }
+            if owner_sync.changed or owner_sync.unresolved:
+                self.events.emit(
+                    "owner_decl_sync",
+                    unit=name,
+                    injected=owner_sync.injected,
+                    superseded=owner_sync.superseded,
+                    unresolved=owner_sync.unresolved,
+                )
+            if owner_sync.write_error:
+                self.events.emit(
+                    "owner_decl_sync_error",
+                    unit=name,
+                    error=f"seed write: {owner_sync.write_error}"[:400],
+                )
+        except Exception as error:  # noqa: BLE001 - owner warmth is optional
+            self.events.emit(
+                "owner_decl_sync_error", unit=name, error=str(error)[:400]
+            )
         # D5: generated per-unit headers are seed SNAPSHOTS taken before the
         # helper landed in gnt4_shim_seed.h, so a transformed unit's header
         # must gain the seed-tier helper deterministically here (same trust
@@ -6073,6 +6124,20 @@ class WasmUnitDriver:
                 (self.run_root / "gnt4_shim_seed.h").read_text(encoding="utf-8"),
             ).header_text
         except Exception:  # noqa: BLE001 - canon warmth is optional in replay too
+            pass
+        # Owner prototype sync (zz_*/FUN_*), IN MEMORY ONLY: same rule as the
+        # SDK sync above -- the replay sees the same owner-synced starting
+        # header the live attempt path builds, but never writes state.
+        try:
+            header = inject_owner_declarations(
+                header,
+                unit_c,
+                load_owner_prototypes(
+                    self.repo_root / "research/decomp/data/oracle-registry.json"
+                ),
+                unit_name=name,
+            ).header_text
+        except Exception:  # noqa: BLE001 - owner warmth is optional in replay too
             pass
         if materialized.transform["sites"]:
             header = ensure_bitcast_helper(header)
