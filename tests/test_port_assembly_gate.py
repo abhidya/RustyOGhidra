@@ -201,6 +201,31 @@ def test_unparseable_link_error_still_files_one_conflict():
     assert conflicts[0]["symbol"] is None
 
 
+def test_link_error_captures_wasm_ld_attribution_lines():
+    """wasm-ld names WHICH objects disagree on the '>>> defined as' lines.
+
+    The one-line match alone filed 'function signature mismatch: <sym>' while
+    the result `detail` kept only the tail of stderr (the echoed link
+    command), so the per-object signatures needed a scratch reproduction to
+    recover. They belong in the conflict record.
+    """
+    error = (
+        "wasm-ld: error: function signature mismatch: gnt4_PSQUATScale_bl\n"
+        ">>> defined as (f64, i32, i32) -> void in unit_2.o\n"
+        ">>> defined as (f64, i32, i32) -> i64 in unit_4.o\n"
+        "emcc: error: wasm-ld failed (returned 1)\n"
+    )
+    conflicts = conflicts_from_link_error(error, ["unit-a", "unit-b"])
+    assert len(conflicts) == 1
+    detail = conflicts[0]["detail"]
+    assert conflicts[0]["symbol"] == "gnt4_PSQUATScale_bl"
+    assert conflicts[0]["class"] == CLASS_COLLISION_STUB
+    assert "(f64, i32, i32) -> void in unit_2.o" in detail
+    assert "(f64, i32, i32) -> i64 in unit_4.o" in detail
+    # The unrelated trailing emcc line is not attribution and stays out.
+    assert "returned 1" not in detail
+
+
 # -------------------------------------------------------------- unit selection
 
 
@@ -1769,3 +1794,398 @@ def test_the_real_seed_header_defines_nothing_external():
     if not seed.is_file():
         pytest.skip("seed header not present in this checkout")
     assert header_defines_external_functions(seed.read_text(encoding="utf-8-sig")) == []
+
+
+# ------------------------------------------- SDK (gnt4_*) canonicalization
+#
+# The gate canonicalizes ROM symbols against the owner registry, but
+# _EXTERNAL_PREFIXES kept gnt4_* out entirely: after the canon seed flipped
+# gnt4_PSQUATScale_bl (and friends) from `void` to `undefined8` returns, every
+# staged green baselined on the old seed contested every new candidate at
+# wasm-ld ("function signature mismatch: ... ->void vs ->i64"). These exercise
+# the gate-time unification against a FRESH seed read, with the real pinned
+# Clang validating canon/variant pairs.
+
+SDK_SYMBOL = "gnt4_PSQUATScale_bl"
+SDK_CANON_DECL = f"extern undefined8 {SDK_SYMBOL}(double s, float *v, float *out);"
+SDK_STALE_DECL = f"extern void   {SDK_SYMBOL}(double s, float *v, float *out);"
+SDK_VOID_SYMBOL = "gnt4_VoidRet_bl"
+SDK_VOID_CANON_DECL = f"extern void {SDK_VOID_SYMBOL}(int a);"
+
+
+def _write_sdk_seed(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#ifndef GNT4_SHIM_SEED_H\n"
+        "#define GNT4_SHIM_SEED_H\n"
+        "typedef unsigned long long undefined8;\n"
+        f"{SDK_CANON_DECL}\n"
+        f"{SDK_VOID_CANON_DECL}\n"
+        "#endif\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path
+
+
+def _sdk_request(snapshot, smoke_script: Path, seed: Path):
+    from src.port_assembly_gate import CanonicalizationRequest
+
+    return CanonicalizationRequest(
+        repo_root=PRODUCT_ROOT,
+        owner_snapshot=snapshot,
+        attempt=1,
+        behavior_tier="compile_only",
+        smoke_script=smoke_script,
+        sdk_seed_path=seed,
+    )
+
+
+@requires_toolchain
+def test_stale_void_sdk_declaration_is_unified_to_the_fresh_canon(
+    tmp_path: Path, smoke_script: Path
+):
+    """The exact outage shape: a window green baselined on the old seed
+    declares `void gnt4_PSQUATScale_bl(...)` while the candidate carries the
+    current `undefined8` canon. Both derived headers must reach the linker
+    with the canon prototype (one wasm signature), owner (ROM) symbols must
+    keep canonicalizing exactly as before, and no SDK evidence may leak into
+    the receipt's owner-bound compatibility checks.
+    """
+    import re as _re
+
+    from src.port_assembly_gate import run_assembly_gate
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = _write_sdk_seed(tmp_path / "product-seed" / "gnt4_shim_seed.h")
+    staging = tmp_path / "staging"
+    # Window unit: stale seed baseline. Its body CALLS the symbol in statement
+    # position (result discarded), which is why the void declaration compiled
+    # green in isolation.
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern void {OWNED_SYMBOL}(int value);\n" + SDK_STALE_DECL,
+        body=f"{OWNED_SYMBOL}(1); {SDK_SYMBOL}(1.0, 0, 0);",
+    )
+    # Candidate: current canon, plus a top-level-qualifier owner variant so
+    # the pre-existing owner probe path runs in the same window.
+    _write_unit(
+        staging / "unit-b",
+        "unit-b",
+        f"extern void {OWNED_SYMBOL}(const int value);\n" + SDK_CANON_DECL,
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    linked: dict[str, Any] = {}
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        linked["c_files"] = list(c_files)
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is True, result["detail"]
+    assert result["conflicts"] == []
+    canon_normal = " ".join(SDK_CANON_DECL.split())
+    for name in ("unit-a", "unit-b"):
+        header = (tmp_path / "work" / name / "gnt4_shim.h").read_text(encoding="utf-8")
+        assert canon_normal in header
+        assert _re.search(rf"void\s+{SDK_SYMBOL}", header) is None
+        assert OWNED_SYMBOL in header  # owner path still canonicalizes
+    evidence = result["canonicalization"]
+    assert evidence["sdk_canon"]["declarations"] == 2
+    assert evidence["sdk_canon"]["seed_path"] == str(seed)
+    assert any(item["symbol"] == SDK_SYMBOL for item in evidence["discarded_variants"])
+    # SDK pairs are validated but never recorded as owner-bound evidence.
+    assert all(
+        item["symbol"] == OWNED_SYMBOL for item in evidence["compatibility_checks"]
+    )
+
+
+@requires_toolchain
+def test_sdk_parameter_class_divergence_refuses_loudly(
+    tmp_path: Path, smoke_script: Path
+):
+    """A gnt4_* declaration whose PARAMETERS disagree with the canon beyond
+    spelling is a real contradiction: Clang rejects the pair and the gate
+    stops before compile with `sdk_variant_abi_incompatible`, surfaced exactly
+    like `owner_variant_abi_incompatible`.
+    """
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = _write_sdk_seed(tmp_path / "product-seed" / "gnt4_shim_seed.h")
+    staging = tmp_path / "staging"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern void {SDK_SYMBOL}(int a);",
+        body=f"{SDK_SYMBOL}(1);",
+    )
+    _write_unit(
+        staging / "unit-b",
+        "unit-b",
+        SDK_CANON_DECL,
+        body=f"{SDK_SYMBOL}(1.0, 0, 0);",
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("a contested window must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "canonicalize"
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    assert result["conflicts"][0]["symbol"] == SDK_SYMBOL
+    assert "sdk_variant_abi_incompatible" in result["detail"]
+
+
+@requires_toolchain
+def test_sdk_symbol_absent_from_canon_is_untouched(
+    tmp_path: Path, smoke_script: Path
+):
+    from src.port_assembly_gate import run_assembly_gate
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = _write_sdk_seed(tmp_path / "product-seed" / "gnt4_shim_seed.h")
+    staging = tmp_path / "staging"
+    absent = "extern void gnt4_NotInSeed_bl(int a);"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        absent,
+        body="gnt4_NotInSeed_bl(1);",
+    )
+    _write_unit(
+        staging / "unit-b",
+        "unit-b",
+        SDK_CANON_DECL,
+        body=f"{SDK_SYMBOL}(1.0, 0, 0);",
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is True, result["detail"]
+    header = (tmp_path / "work" / "unit-a" / "gnt4_shim.h").read_text(encoding="utf-8")
+    assert absent in header  # byte-for-byte: no canon exists, no rewrite
+
+
+@requires_toolchain
+def test_sdk_consuming_call_under_a_void_canon_refuses(
+    tmp_path: Path, smoke_script: Path
+):
+    """The unsafe direction: the caller declared a value and CONSUMES it, but
+    the canon says void. Rewriting would miscompile or silently reinterpret,
+    so the gate must refuse, not unify.
+    """
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = _write_sdk_seed(tmp_path / "product-seed" / "gnt4_shim_seed.h")
+    staging = tmp_path / "staging"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern undefined8 {SDK_VOID_SYMBOL}(int a);",
+        body=f"int taken = {SDK_VOID_SYMBOL}(1); (void)taken;",
+    )
+    _write_unit(
+        staging / "unit-b",
+        "unit-b",
+        SDK_VOID_CANON_DECL,
+        body=f"{SDK_VOID_SYMBOL}(2);",
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("a contested window must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "canonicalize"
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    assert result["conflicts"][0]["symbol"] == SDK_VOID_SYMBOL
+    assert "sdk_variant_abi_incompatible" in result["detail"]
+
+
+@requires_toolchain
+def test_sdk_discarded_result_unifies_to_a_void_canon(
+    tmp_path: Path, smoke_script: Path
+):
+    """Same divergence, but every call in the bundle discards the result, so
+    unifying to the void canon cannot change any call site's meaning."""
+    import re as _re
+
+    from src.port_assembly_gate import run_assembly_gate
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = _write_sdk_seed(tmp_path / "product-seed" / "gnt4_shim_seed.h")
+    staging = tmp_path / "staging"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern undefined8 {SDK_VOID_SYMBOL}(int a);",
+        body=f"{SDK_VOID_SYMBOL}(1);",
+    )
+    _write_unit(
+        staging / "unit-b",
+        "unit-b",
+        SDK_VOID_CANON_DECL,
+        body=f"{SDK_VOID_SYMBOL}(2);",
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        return True, ""
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is True, result["detail"]
+    header = (tmp_path / "work" / "unit-a" / "gnt4_shim.h").read_text(encoding="utf-8")
+    assert " ".join(SDK_VOID_CANON_DECL.split()) in header
+    assert _re.search(rf"undefined8\s+{SDK_VOID_SYMBOL}", header) is None
+
+
+@requires_toolchain
+def test_sdk_placeholder_under_a_consumed_void_canon_refuses_without_a_probe(
+    tmp_path: Path, smoke_script: Path
+):
+    """Ghidra's `extern int NAME();` placeholder claims nothing, but when the
+    canon returns void and a body consumes the call there is no import-safe
+    fallback: the canon IS the import contract. Refuse loudly."""
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    seed = _write_sdk_seed(tmp_path / "product-seed" / "gnt4_shim_seed.h")
+    staging = tmp_path / "staging"
+    _write_unit(
+        staging / "unit-a",
+        "unit-a",
+        f"extern int {SDK_VOID_SYMBOL}();",
+        body=f"int taken = {SDK_VOID_SYMBOL}(1); (void)taken;",
+    )
+    _write_unit(
+        staging / "unit-b",
+        "unit-b",
+        SDK_VOID_CANON_DECL,
+        body=f"{SDK_VOID_SYMBOL}(2);",
+    )
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("a contested window must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(snapshot, smoke_script, seed),
+    )
+
+    assert result["passed"] is False
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    assert result["conflicts"][0]["symbol"] == SDK_VOID_SYMBOL
+    assert "sdk_variant_abi_incompatible" in result["detail"]
+
+
+@requires_toolchain
+def test_sdk_seed_configured_but_unreadable_fails_closed(
+    tmp_path: Path, smoke_script: Path
+):
+    from src.port_assembly_gate import (
+        CLASS_CANONICALIZATION_REFUSED,
+        run_assembly_gate,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    staging = tmp_path / "staging"
+    _write_unit(staging / "unit-a", "unit-a", SDK_CANON_DECL)
+    _write_unit(staging / "unit-b", "unit-b", SDK_CANON_DECL)
+    units = [
+        _artifact(staging / "unit-a", "unit-a"),
+        _artifact(staging / "unit-b", "unit-b"),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("an unreadable canon must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=_sdk_request(
+            snapshot, smoke_script, tmp_path / "absent" / "gnt4_shim_seed.h"
+        ),
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "canonicalize"
+    assert result["conflicts"][0]["class"] == CLASS_CANONICALIZATION_REFUSED
+    assert "sdk_canon_unavailable" in result["detail"]

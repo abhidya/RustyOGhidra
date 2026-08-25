@@ -941,7 +941,8 @@ _LINK_PATTERNS = [
 def conflicts_from_link_error(error_text: str, units: list[str]) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    for line in (error_text or "").splitlines():
+    lines = (error_text or "").splitlines()
+    for index, line in enumerate(lines):
         for pattern, conflict_class in _LINK_PATTERNS:
             match = pattern.search(line)
             if not match:
@@ -950,9 +951,19 @@ def conflicts_from_link_error(error_text: str, units: list[str]) -> list[dict[st
             if key in seen:
                 continue
             seen.add(key)
+            # wasm-ld attributes a signature/duplicate diagnostic on the
+            # following ">>> defined as (f64, i32) -> void in unit_2.o" lines.
+            # The ledger `detail` elsewhere keeps only the tail of stderr (the
+            # echoed link command), so unless captured here the attribution is
+            # lost and diagnosis needs a scratch link reproduction.
+            detail = line.strip()
+            for follow in lines[index + 1 : index + 7]:
+                if not follow.lstrip().startswith(">>>"):
+                    break
+                detail += "\n" + follow.strip()
             conflicts.append(
                 _conflict_record(
-                    match.group(1), conflict_class, units, {}, line.strip()
+                    match.group(1), conflict_class, units, {}, detail
                 )
             )
     if not conflicts:
@@ -1606,6 +1617,11 @@ class CanonicalizationRequest:
     behavior_tier: str
     smoke_script: Path
     environment: tuple[tuple[str, str], ...] = ()
+    # The canonical SDK seed (gnt4_shim_seed.h). When set, the gate reads it
+    # FRESH at gate time and unifies divergent gnt4_* declarations in the
+    # derived headers to the seed's canon (or refuses loudly). None keeps
+    # gnt4_* declarations passing through untouched, exactly as before.
+    sdk_seed_path: Path | None = None
 
 
 def _canonicalization_refusal(
@@ -1657,7 +1673,37 @@ def _canonicalize_window(
         )
         return None
 
-    plan = plan_canonicalization(bundle, request.owner_snapshot)
+    sdk_canon = None
+    sdk_evidence: dict[str, Any] | None = None
+    if request.sdk_seed_path is not None:
+        # Read fresh every gate run: the seed is the owner authority for SDK
+        # (gnt4_*) declarations, and a stale in-process copy would silently
+        # re-create the divergence this pass exists to close. Fail closed --
+        # a configured-but-unreadable seed must not degrade to the old
+        # pass-through behaviour.
+        try:
+            seed_bytes = Path(request.sdk_seed_path).read_bytes()
+        except OSError as error:
+            _canonicalization_refusal(
+                result,
+                names,
+                "sdk_canon_unavailable",
+                f"cannot read SDK canon seed {request.sdk_seed_path}: {error}",
+            )
+            return None
+        # Function-level import: port_sdk_decl_injection imports this module
+        # at module level, so importing it at the top would be circular.
+        from src.port_sdk_decl_injection import canonical_sdk_declarations
+
+        seed_text = seed_bytes.decode("utf-8-sig", errors="replace")
+        sdk_canon = canonical_sdk_declarations(seed_text)
+        sdk_evidence = {
+            "seed_path": str(request.sdk_seed_path),
+            "seed_sha256": hashlib.sha256(seed_bytes).hexdigest(),
+            "declarations": len(sdk_canon),
+        }
+
+    plan = plan_canonicalization(bundle, request.owner_snapshot, sdk_canon=sdk_canon)
     if not isinstance(plan, CanonicalizationPlan):
         # Zero or several owners, an owner/catalog contradiction, or a
         # Clang-incompatible declaration variant. All are contested: the gate
@@ -1686,6 +1732,7 @@ def _canonicalize_window(
         "owners": [item.public_dict() for item in plan.owner_bindings],
         "compatibility_checks": [item.to_dict() for item in plan.compatibility_checks],
         "discarded_variants": [item.to_dict() for item in plan.discarded_variants],
+        "sdk_canon": sdk_evidence,
         # Structural ABI evidence only. This makes no behavioural claim and
         # never raises a unit's verification tier.
         "behavior_claim": None,
