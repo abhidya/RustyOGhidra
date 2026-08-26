@@ -1567,7 +1567,12 @@ def run_assembly_gate(
         # canonicalized against the unique verified owner definition, so the
         # linker sees one ABI per symbol instead of one per caller guess.
         canonical = _canonicalize_window(
-            units, workdir, candidate, canonicalization, result
+            units,
+            workdir,
+            candidate,
+            canonicalization,
+            result,
+            dispatch_companion=dispatch_companion,
         )
         if canonical is None:
             return result
@@ -1680,6 +1685,7 @@ def _canonicalize_window(
     candidate: UnitArtifact | None,
     request: CanonicalizationRequest,
     result: dict[str, Any],
+    dispatch_companion: bool = False,
 ) -> tuple[list[str], dict[str, Any]] | None:
     """Plan and materialize the owner-canonicalized bundle.
 
@@ -1776,12 +1782,6 @@ def _canonicalize_window(
         "registry_sha256": plan.receipt.registry_sha256,
         "tool_world_sha256": plan.receipt.tool_world_sha256,
         "owners": [item.public_dict() for item in plan.owner_bindings],
-        # symbol -> 8-hex GC address, from the owner registry's address field.
-        # The dispatch companion (G2/H3) uses this as its last-resort address
-        # authority for renamed symbols whose final source lost its marker.
-        "owner_addresses": {
-            item.symbol: item.address for item in plan.owner_bindings
-        },
         "compatibility_checks": [item.to_dict() for item in plan.compatibility_checks],
         "discarded_variants": [item.to_dict() for item in plan.discarded_variants],
         "sdk_canon": sdk_evidence,
@@ -1789,6 +1789,18 @@ def _canonicalize_window(
         # never raises a unit's verification tier.
         "behavior_claim": None,
     }
+    if dispatch_companion:
+        # symbol -> 8-hex GC address, from the owner registry's address field
+        # (normalized: the registry spells it 0x-prefixed, the companion's
+        # address grammar is bare 8-hex). The dispatch companion (G2/H3) uses
+        # this as its last-resort address authority for renamed symbols whose
+        # final source lost its marker, and as an independent cross-check on
+        # marker/name-derived addresses. Emitted ONLY when the companion is
+        # requested so the OFF-shape evidence stays byte-identical (review F5).
+        evidence["owner_addresses"] = {
+            item.symbol: str(item.address).lower().removeprefix("0x")
+            for item in plan.owner_bindings
+        }
     return c_files, evidence
 
 
@@ -1924,9 +1936,14 @@ def _link_and_smoke(
         {extra for unit in units for extra in unit.allowed_extra_imports}
     )
     if dispatch_companion:
-        from src.port_dispatch_companion import DISPATCH_EXPORT, MISS_IMPORT
+        from src.port_dispatch_companion import (
+            ARITY_EXPORT,
+            DISPATCH_EXPORT,
+            MISS_IMPORT,
+        )
 
         exports.append(DISPATCH_EXPORT)
+        exports.append(ARITY_EXPORT)
         allowed_extra.append(MISS_IMPORT)
     result["stage"] = "link"
     ok, error_text = link_runner(workdir, c_files, exports, allowed_extra)
