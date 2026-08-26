@@ -1550,6 +1550,9 @@ def test_canonicalization_replaces_a_compatible_variant_and_links(
     assert len(evidence["receipt_sha256"]) == 64
     assert any(item["symbol"] == OWNED_SYMBOL for item in evidence["owners"])
     assert evidence["compatibility_checks"]
+    # Review F5: companion-only evidence appears ONLY when the companion is
+    # requested -- the OFF shape stays strictly identical to pre-companion.
+    assert "owner_addresses" not in evidence
 
 
 @requires_toolchain
@@ -1803,6 +1806,193 @@ def test_omitting_canonicalization_leaves_the_merge_path_unchanged(tmp_path: Pat
     assert result["stage"] == "merge"
     assert result["conflicts"]
     assert "canonicalization" not in result
+
+
+def _canon_companion_unit(
+    staging: Path, name: str, declaration: str, source_body: str, exports: list[str]
+):
+    """A staged-shaped unit with its own header declaration, a marker-carrying
+    source, and a real export list (the fixtures above export nothing)."""
+    from src.port_assembly_gate import UnitArtifact, unit_artifact_sha256
+
+    directory = staging / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gnt4_shim.h").write_text(
+        declaration + "\n", encoding="utf-8", newline="\n"
+    )
+    (directory / "unit.c").write_text(source_body, encoding="utf-8", newline="\n")
+    return UnitArtifact(
+        name, directory, unit_artifact_sha256(directory), "", exports, [], "compile_only"
+    )
+
+
+@requires_toolchain
+def test_companion_composes_with_canonicalization_and_owner_addresses(
+    tmp_path: Path, smoke_script: Path
+):
+    """Review F3: the ENABLED configuration -- CanonicalizationRequest AND
+    dispatch_companion=True -- had never been composed in one gate run: the
+    companion's nested {unit}/unit.c relpath mapping and the owner_addresses
+    plumbing were unexercised. This composes both: the companion must derive
+    from the FINAL canonicalized sources (nested relpaths), and the owner
+    registry's addresses must arrive in derivation.
+    """
+    from src.port_assembly_gate import CanonicalizationRequest, run_assembly_gate
+    from src.port_dispatch_companion import (
+        ARITY_EXPORT,
+        COMPANION_FILENAME,
+        DISPATCH_EXPORT,
+        MISS_IMPORT,
+    )
+
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    staging = tmp_path / "staging"
+    # The same compatible-variant divergence the canonicalization pass exists
+    # to close (top-level qualifier), so the run does real owner work.
+    units = [
+        _canon_companion_unit(
+            staging,
+            "unit-a",
+            f"extern void {OWNED_SYMBOL}(int value);",
+            "// ==== 80003100  gf_canon_a ====\n"
+            f"int gf_canon_a(int a)\n{{\n  {OWNED_SYMBOL}(a);\n  return a + 1;\n}}\n",
+            ["gf_canon_a"],
+        ),
+        _canon_companion_unit(
+            staging,
+            "unit-b",
+            f"extern void {OWNED_SYMBOL}(const int value);",
+            "// ==== 80004200  gf_canon_b ====\n"
+            f"int gf_canon_b(int b)\n{{\n  {OWNED_SYMBOL}(b);\n  return b - 1;\n}}\n",
+            ["gf_canon_b"],
+        ),
+    ]
+
+    captured: dict[str, Any] = {}
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        captured.update(
+            c_files=list(c_files),
+            exports=list(exports),
+            allowed_extra=list(allowed_extra),
+        )
+        return True, ""
+
+    workdir = tmp_path / "work"
+    result = run_assembly_gate(
+        units,
+        workdir,
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+        dispatch_companion=True,
+    )
+
+    assert result["passed"] is True, result["detail"]
+    # The canonicalized bundle links NESTED {unit}/unit.c relpaths and the
+    # companion joins the SAME link, appended last.
+    assert captured["c_files"] == [
+        "unit-a/unit.c",
+        "unit-b/unit.c",
+        COMPANION_FILENAME,
+    ]
+    assert DISPATCH_EXPORT in captured["exports"]
+    assert ARITY_EXPORT in captured["exports"]
+    assert MISS_IMPORT in captured["allowed_extra"]
+    assert (workdir / COMPANION_FILENAME).is_file()
+    # The companion derived from the FINAL written sources: both exported
+    # definitions found through the nested mapping, addresses from their
+    # markers in the canonicalized bundle.
+    dispatch = result["dispatch"]
+    assert [entry["symbol"] for entry in dispatch["table"]] == [
+        "gf_canon_a",
+        "gf_canon_b",
+    ]
+    assert [entry["gc_address"] for entry in dispatch["table"]] == [
+        "80003100",
+        "80004200",
+    ]
+    assert [entry["address_source"] for entry in dispatch["table"]] == [
+        "marker",
+        "marker",
+    ]
+    # The owner registry's addresses arrived through the canonicalization
+    # evidence, normalized to the bare-8-hex grammar derivation validates.
+    owner_addresses = result["canonicalization"]["owner_addresses"]
+    assert owner_addresses[OWNED_SYMBOL] == "80026250"
+
+
+@requires_toolchain
+def test_companion_uses_the_arrived_owner_addresses_in_derivation(
+    tmp_path: Path, smoke_script: Path
+):
+    """The other half of the F3 arrival proof, via the F2 cross-check: a
+    window unit (the registry's own owner unit) defines and exports an owned
+    symbol whose name-encoded address disagrees with the registry's address
+    field (the fixture is marker-wins by construction). If owner_addresses
+    did NOT reach derivation the name encoding would resolve silently -- the
+    exact consistent-but-wrong shape F2 closes -- so the loud contradiction
+    refusal here proves the plumbing end to end.
+    """
+    from src.port_assembly_gate import (
+        CLASS_DISPATCH_COMPANION_FAILED,
+        CanonicalizationRequest,
+        run_assembly_gate,
+    )
+
+    contradicted = "zz_00c3484_"  # registry 0x800c2d4c; the name encodes 800c3484
+    snapshot = _synthetic_snapshot(tmp_path / "product")
+    owner_unit = snapshot.owner_index[contradicted][0].unit
+    staging = tmp_path / "staging"
+    units = [
+        _canon_companion_unit(
+            staging,
+            "unit-a",
+            f"extern void {OWNED_SYMBOL}(int value);",
+            "// ==== 80003100  gf_canon_a ====\n"
+            f"int gf_canon_a(int a)\n{{\n  {OWNED_SYMBOL}(a);\n  return a + 1;\n}}\n",
+            ["gf_canon_a"],
+        ),
+        _canon_companion_unit(
+            staging,
+            owner_unit,
+            f"extern void {contradicted}(int value);",
+            f"void {contradicted}(int value)\n{{\n  (void)value;\n}}\n",
+            [contradicted],
+        ),
+    ]
+
+    def link_runner(workdir, c_files, exports, allowed_extra):
+        raise AssertionError("a contradicted companion must never reach the linker")
+
+    result = run_assembly_gate(
+        units,
+        tmp_path / "work",
+        link_runner=link_runner,
+        candidate=units[-1],
+        canonicalization=CanonicalizationRequest(
+            repo_root=PRODUCT_ROOT,
+            owner_snapshot=snapshot,
+            attempt=1,
+            behavior_tier="compile_only",
+            smoke_script=smoke_script,
+        ),
+        dispatch_companion=True,
+    )
+
+    assert result["passed"] is False
+    assert result["stage"] == "dispatch-companion"
+    (conflict,) = result["conflicts"]
+    assert conflict["class"] == CLASS_DISPATCH_COMPANION_FAILED
+    assert conflict["symbol"] == contradicted
+    assert "owner registry" in conflict["detail"]
+    assert "800c2d4c" in conflict["detail"] and "800c3484" in conflict["detail"]
 
 
 # ------------------------------------------- header must declare, never define
