@@ -129,6 +129,22 @@ from src.port_progress import (
     journal_for,
 )
 from src.port_run_controller import find_gotyaforce_root
+from src.port_trace_verify import (
+    CAPTURE_TOOL_RELPATH,
+    CORPORA_RELPATH,
+    HARNESS_CWD_RELPATH,
+    HARNESS_ENTRY,
+    RESULTS_RELPATH,
+    VerifySkip,
+    build_sidecar_entry,
+    dolphin_contended,
+    eligible_for_oracle_green,
+    load_registry_functions,
+    oracle_state_block,
+    plan_path,
+    refresh_plans,
+    select_scenario,
+)
 
 # Windows: this process may run under pythonw.exe (no console), and every
 # console child then allocates a NEW console window that flashes on the owner's
@@ -1659,6 +1675,12 @@ class WasmUnitDriver:
                 "units_integrated": greens,
                 "units_verified": verified,
                 "units_staged": greens - verified,
+                # Task 3 (trace verification): FAILed trace oracles flag the
+                # unit oracle_divergent -- surfaced here so divergence is
+                # visible in progress reporting without any automatic revoke.
+                "units_oracle_divergent": sum(
+                    1 for record in units.values() if record.get("oracle_divergent")
+                ),
                 "units_known": len(units),
                 "model_requests_total": sum(
                     record.get("model_requests", 0) for record in units.values()
@@ -6046,6 +6068,467 @@ class WasmUnitDriver:
         finally:
             self.lock.release()
 
+    # ----------------------------- trace verification (Stage B at scale; see
+    # src.port_trace_verify for the design contract, supervisor-integration
+    # decision, and the fail-closed tier rule)
+
+    def _staged_wasm_sha(self, name: str) -> str | None:
+        try:
+            return hashlib.sha256(
+                (self.staging_root / name / "unit.wasm").read_bytes()
+            ).hexdigest()
+        except OSError:
+            return None
+
+    def _trace_registry_fns(self) -> dict[str, dict[str, Any]]:
+        """oracle-registry.json functions by name, loaded once per process
+        (the file is ~8 MB; a sweep must not re-read it per unit)."""
+        cached = getattr(self, "_trace_registry_cache", None)
+        if cached is None:
+            cached = load_registry_functions(self.repo_root)
+            self._trace_registry_cache = cached
+        return cached
+
+    def _trace_capture(
+        self,
+        name: str,
+        plans: list[tuple[str, Path]],
+        scenario: str,
+        cases: int,
+    ) -> dict[str, Any]:
+        """Default capture runner: for each export with a plan, one full
+        Dolphin boot (launch -> capture -> stop). One boot PER export is the
+        stub's one-connection rule (capture_oracle.py docstring), not waste.
+        A crash mid-export records that export's error and moves on."""
+        captured: dict[str, Any] = {}
+        tool = self.repo_root / CAPTURE_TOOL_RELPATH
+        corpora = self.repo_root / CORPORA_RELPATH
+        python_exe = sys.executable
+        for fn, plan_file in plans:
+            out_path = corpora / f"{name}.{fn}.dolphin-trace.jsonl"
+            try:
+                launch = subprocess.run(
+                    [python_exe, str(tool), "launch", "--scenario", scenario,
+                     "--wait", "120"],
+                    capture_output=True, text=True, timeout=200,
+                    cwd=str(self.repo_root), creationflags=NO_WINDOW,
+                )
+                if launch.returncode != 0:
+                    captured[fn] = {
+                        "error": f"launch failed: {(launch.stdout + launch.stderr)[-300:]}"
+                    }
+                    continue
+                capture = subprocess.run(
+                    [python_exe, str(tool), "capture", "--plan", str(plan_file),
+                     "--n", str(cases), "--scenario", scenario,
+                     "--out", str(out_path)],
+                    capture_output=True, text=True,
+                    timeout=ORACLE_TIMEOUT_SECONDS + 120,
+                    cwd=str(self.repo_root), creationflags=NO_WINDOW,
+                )
+                got = self._fixture_case_count(out_path)
+                entry: dict[str, Any] = {
+                    "cases": got,
+                    "fixture": f"{CORPORA_RELPATH}/{out_path.name}",
+                }
+                if capture.returncode != 0 and got == 0:
+                    entry["error"] = (
+                        f"capture exit {capture.returncode}: "
+                        f"{(capture.stdout + capture.stderr)[-300:]}"
+                    )
+                captured[fn] = entry
+                # Refresh the spec-bound corpus in place IFF it exists and
+                # replays this same function (the pilot convention names it
+                # corpora/<unit>.dolphin-trace.jsonl).
+                spec_corpus = corpora / f"{name}.dolphin-trace.jsonl"
+                if (
+                    got > 0
+                    and spec_corpus.is_file()
+                    and self._fixture_fn(spec_corpus) == fn
+                ):
+                    shutil.copyfile(out_path, spec_corpus)
+                    entry["spec_corpus_refreshed"] = True
+            except (OSError, subprocess.SubprocessError) as error:
+                captured[fn] = {"error": str(error)[:300]}
+            finally:
+                try:
+                    subprocess.run(
+                        [python_exe, str(tool), "stop"],
+                        capture_output=True, text=True, timeout=60,
+                        cwd=str(self.repo_root), creationflags=NO_WINDOW,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass  # stop is best-effort; the pid-file guard reports leftovers
+        return captured
+
+    @staticmethod
+    def _fixture_case_count(path: Path) -> int:
+        try:
+            with path.open(encoding="utf-8") as handle:
+                header = json.loads(handle.readline())
+            return int((header.get("counts") or {}).get("case", 0))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _fixture_fn(path: Path) -> str | None:
+        try:
+            with path.open(encoding="utf-8") as handle:
+                return json.loads(handle.readline()).get("fn")
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _trace_harness(
+        self, name: str, wasm_path: Path
+    ) -> tuple[int, str, dict[str, Any] | None]:
+        """Default harness runner: run-unit.mjs on the staged wasm; returns
+        (exit_code, log, result_payload). The result artifact under
+        research/decomp/data/oracle-results/ is the canonical evidence."""
+        env = dict(os.environ)
+        env["ORACLE_WASM"] = str(wasm_path)
+        completed = subprocess.run(
+            [resolve_node_exe(), HARNESS_ENTRY, "--unit", name],
+            cwd=str(self.repo_root / HARNESS_CWD_RELPATH),
+            env=env, capture_output=True, text=True,
+            timeout=ORACLE_TIMEOUT_SECONDS, creationflags=NO_WINDOW,
+        )
+        log = completed.stdout + (
+            "\n--- stderr ---\n" + completed.stderr if completed.stderr else ""
+        )
+        payload: dict[str, Any] | None = None
+        result_path = self.repo_root / RESULTS_RELPATH / f"{name}.json"
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            payload = None
+        return completed.returncode, log, payload
+
+    def _write_sidecar_entry(
+        self, name: str, exports: list[str], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Publish the unit's oracle-commands.json entry (the handoff onto the
+        driver's existing verification lane). Only callable for a
+        full-coverage PASS; the entry must satisfy validate_oracle_entry."""
+        entry = build_sidecar_entry(name, exports, payload, exports_sha256(exports))
+        problems = validate_oracle_entry(name, entry, exports=exports)
+        if problems:
+            raise ValueError(f"{name}: generated sidecar entry invalid: {problems[:3]}")
+        try:
+            sidecar = json.loads(
+                self.oracle_sidecar_path.read_text(encoding="utf-8-sig")
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            sidecar = {"spec_schema": ORACLE_SIDECAR_SCHEMA, "units": {}}
+        if sidecar.get("spec_schema") != ORACLE_SIDECAR_SCHEMA:
+            raise ValueError(
+                f"oracle-commands.json spec_schema != {ORACLE_SIDECAR_SCHEMA}; "
+                "refusing to rewrite a foreign sidecar"
+            )
+        sidecar.setdefault("units", {})[name] = entry
+        atomic_write_json(self.oracle_sidecar_path, sidecar)
+        self._oracle_sidecar_cache = None  # mtime moved; force re-read
+        self.events.emit("oracle_sidecar_published", unit=name)
+        return entry
+
+    def _verify_unit_inner(
+        self,
+        name: str,
+        state: dict[str, Any],
+        *,
+        capture: bool = True,
+        exports: list[str] | None = None,
+        scenario: str | None = None,
+        cases: int = 120,
+        promote: bool = True,
+        capture_runner: Any | None = None,
+        harness_runner: Any | None = None,
+    ) -> dict[str, Any]:
+        record = self._unit_state(state, name)
+        provenance = self._staged_provenance(name)
+        if provenance is None:
+            raise VerifySkip(f"{name}: no readable staged provenance.json")
+        unit_exports = provenance.get("exported_functions") or []
+        wasm_path = self.staging_root / name / "unit.wasm"
+        if not wasm_path.is_file():
+            raise VerifySkip(f"{name}: no staged unit.wasm")
+        wasm_sha = self._staged_wasm_sha(name)
+        scenario_name = scenario or select_scenario(name)
+        self._heartbeat(f"wasm_units:{name}:trace_verify")
+        self.events.emit(
+            "wasm_unit_verify_started",
+            unit=name, scenario=scenario_name, capture=capture,
+        )
+        plans_summary = refresh_plans(
+            self.repo_root, name, unit_exports, self._trace_registry_fns()
+        )
+        captured: dict[str, Any] = {}
+        if capture:
+            reason = dolphin_contended(self.repo_root)
+            if reason:
+                raise VerifySkip(f"dolphin_contended: {reason}")
+            targets = [
+                fn for fn in unit_exports if exports is None or fn in exports
+            ]
+            plan_files = [
+                (fn, plan_path(self.repo_root, name, fn))
+                for fn in targets
+                if plan_path(self.repo_root, name, fn).is_file()
+            ]
+            runner = capture_runner or self._trace_capture
+            captured = runner(name, plan_files, scenario_name, cases)
+        rc, log, payload = (harness_runner or self._trace_harness)(name, wasm_path)
+        status_override = None
+        if payload is None:
+            status_override = (
+                "NO_SPEC" if "no spec module" in log else "ERROR"
+            )
+        result_rel = f"{RESULTS_RELPATH}/{name}.json"
+        if not (self.repo_root / RESULTS_RELPATH / f"{name}.json").is_file():
+            result_rel = None
+        corpus_files = sorted(
+            {
+                entry.get("fixture")
+                for entry in captured.values()
+                if isinstance(entry, dict) and entry.get("fixture")
+            }
+            | (
+                {(payload.get("corpus") or {}).get("file")}
+                if isinstance(payload, dict)
+                and (payload.get("corpus") or {}).get("file")
+                else set()
+            )
+        )
+        block = oracle_state_block(
+            payload,
+            wasm_sha256=wasm_sha or "",
+            scenario=scenario_name,
+            captured=captured,
+            corpus_files=corpus_files,
+            result_relpath=result_rel,
+            run_id=self.run_id,
+            at=utc_now(),
+            status=status_override,
+        )
+        record["oracle"] = block
+        verdict = block["verdict"]
+        if verdict == "FAIL":
+            # Task 3: flag, never revoke -- divergence is visible in progress
+            # reporting and fixed through the driver's sanctioned compile path.
+            record["oracle_divergent"] = True
+        elif verdict == "PASS":
+            record["oracle_divergent"] = False
+        self._save_state(state)
+        self.events.emit(
+            "wasm_unit_trace_verify",
+            unit=name, verdict=verdict, cases=block["cases"],
+            byte_exact=block["byte_exact"],
+            exports_covered=block["exports_covered"],
+            exports_total=block["exports_total"],
+            divergent=bool(record.get("oracle_divergent")),
+        )
+        result: dict[str, Any] = {
+            "unit": name,
+            "verdict": verdict,
+            "cases": block["cases"],
+            "byte_exact": block["byte_exact"],
+            "exports_covered": block["exports_covered"],
+            "exports_total": block["exports_total"],
+            "scenario": scenario_name,
+            "plans": plans_summary,
+            "captured": captured,
+            "result_path": result_rel,
+            "promoted": False,
+        }
+        if verdict == "FAIL":
+            result["divergence_evidence"] = block.get("divergence_evidence")
+        ok, reasons = eligible_for_oracle_green(payload)
+        if ok:
+            # The EXISTING tier rule, and only it: publish the sidecar entry,
+            # then (unless deferred) the journaled reverify promotion path.
+            # With promote=False the entry alone puts the unit on the driver's
+            # own verification lane -- the supervisor-scheduled driver
+            # promotes it on its next pass with zero model calls.
+            self._write_sidecar_entry(name, unit_exports, payload)
+            if promote:
+                promotion = self._reverify_unit_inner(name, state)
+                result["promoted"] = bool(promotion.get("promoted"))
+                result["promotion"] = promotion
+            else:
+                result["promotion"] = "deferred_to_driver_verification_lane"
+        else:
+            result["not_promoted_reasons"] = reasons[:6]
+        return result
+
+    def verify_unit(
+        self,
+        unit_name: str,
+        *,
+        capture: bool = True,
+        exports: list[str] | None = None,
+        scenario: str | None = None,
+        cases: int = 120,
+        promote: bool = True,
+        capture_runner: Any | None = None,
+        harness_runner: Any | None = None,
+    ) -> dict[str, Any]:
+        """CLI entry: trace-verify one staged compile-only green. Takes the
+        driver lock (never concurrent with a running driver's Dolphin/GPU/
+        model use) and records the verdict in canonical state; the tier moves
+        only through the existing sidecar + reverify promotion path."""
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "trace verification would contend for its Dolphin/GPU use"
+            )
+        try:
+            state = self._load_state()
+            if unit_name not in state.get("units", {}):
+                raise ValueError(f"unknown unit {unit_name!r}: not in the state file")
+            record = state["units"][unit_name]
+            if record.get("status") != "green":
+                raise ValueError(
+                    f"{unit_name} is not green (status={record.get('status')!r})"
+                )
+            if record.get("tier") == "oracle_green":
+                return {"unit": unit_name, "skipped": "already oracle_green"}
+            if record.get("tier") != "compile_only":
+                raise ValueError(
+                    f"{unit_name} is not a staged compile-only green "
+                    f"(tier={record.get('tier')!r})"
+                )
+            return self._verify_unit_inner(
+                unit_name, state,
+                capture=capture, exports=exports, scenario=scenario,
+                cases=cases, promote=promote,
+                capture_runner=capture_runner, harness_runner=harness_runner,
+            )
+        finally:
+            self.lock.release()
+
+    def _sweep_skip_reason(
+        self, record: dict[str, Any], name: str, retry_divergent: bool
+    ) -> str | None:
+        if not (self.staging_root / name / "unit.wasm").is_file():
+            return "no staged unit.wasm"
+        block = record.get("oracle")
+        if not isinstance(block, dict):
+            return None
+        sha = self._staged_wasm_sha(name)
+        if sha is None or block.get("wasm_sha256") != sha:
+            return None  # staged bytes changed since the attempt: re-verify
+        if record.get("oracle_divergent") and retry_divergent:
+            return None
+        return f"already attempted for these bytes (verdict {block.get('verdict')})"
+
+    def verify_sweep(
+        self,
+        *,
+        max_units: int = 3,
+        max_seconds: float = 3600.0,
+        capture: bool = True,
+        retry_divergent: bool = False,
+        cases: int = 120,
+        promote: bool = True,
+        capture_runner: Any | None = None,
+        harness_runner: Any | None = None,
+    ) -> dict[str, Any]:
+        """Budgeted batch verification over staged compile-only greens,
+        product-priority first. Resilient: a Dolphin/stub crash records the
+        attempt and moves on; Dolphin contention stops the sweep (never fight
+        another process for the savestate). Operator-run (see
+        src.port_trace_verify docstring for the supervisor decision)."""
+        if not self.lock.acquire():
+            raise RuntimeError(
+                "another wasm-units driver holds wasm-units.lock; "
+                "a sweep would contend for its Dolphin/GPU use"
+            )
+        try:
+            state = self._load_state()
+            deadline = time.monotonic() + max(0.0, max_seconds)
+            report: dict[str, Any] = {
+                "attempted": [],
+                "skipped": {},
+                "budget": {"max_units": max_units, "max_seconds": max_seconds},
+                "stopped": "queue_exhausted",
+            }
+            candidates = sorted(
+                (
+                    name
+                    for name, record in state.get("units", {}).items()
+                    if record.get("status") == "green"
+                    and record.get("tier") == "compile_only"
+                ),
+                key=lambda name: (-self._unit_priority(name), name),
+            )
+            for name in candidates:
+                if len(report["attempted"]) >= max_units:
+                    report["stopped"] = "max_units"
+                    break
+                if time.monotonic() >= deadline:
+                    report["stopped"] = "max_seconds"
+                    break
+                record = self._unit_state(state, name)
+                skip = self._sweep_skip_reason(record, name, retry_divergent)
+                if skip:
+                    report["skipped"][name] = skip
+                    continue
+                try:
+                    result = self._verify_unit_inner(
+                        name, state,
+                        capture=capture, exports=None, scenario=None,
+                        cases=cases, promote=promote,
+                        capture_runner=capture_runner,
+                        harness_runner=harness_runner,
+                    )
+                except VerifySkip as skip_error:
+                    report["skipped"][name] = str(skip_error)
+                    if "dolphin_contended" in str(skip_error):
+                        report["stopped"] = "dolphin_contended"
+                        break
+                    continue
+                except Exception as error:  # noqa: BLE001 - resilience rule:
+                    # a crash marks the unit attempted (sha-bound) and the
+                    # sweep moves on; it never takes the whole sweep down.
+                    record["oracle"] = oracle_state_block(
+                        None,
+                        wasm_sha256=self._staged_wasm_sha(name) or "",
+                        scenario=select_scenario(name),
+                        captured={},
+                        corpus_files=[],
+                        result_relpath=None,
+                        run_id=self.run_id,
+                        at=utc_now(),
+                        status="ERROR",
+                    )
+                    record["oracle"]["error"] = str(error)[:400]
+                    self._save_state(state)
+                    self.events.emit(
+                        "wasm_unit_trace_verify_error",
+                        unit=name, error=str(error)[:400],
+                    )
+                    report["attempted"].append(
+                        {"unit": name, "verdict": "ERROR", "error": str(error)[:300]}
+                    )
+                    continue
+                report["attempted"].append(
+                    {
+                        key: result.get(key)
+                        for key in (
+                            "unit", "verdict", "cases", "byte_exact",
+                            "exports_covered", "exports_total", "promoted",
+                        )
+                    }
+                )
+            self.events.emit(
+                "wasm_unit_verify_sweep",
+                attempted=len(report["attempted"]),
+                skipped=len(report["skipped"]),
+                stopped=report["stopped"],
+            )
+            return report
+        finally:
+            self.lock.release()
+
     # ------------------------------------------------- F4 recheck (section 2.7)
 
     def f4_recheck(self, sample_size: int = 5) -> dict[str, Any]:
@@ -6720,6 +7203,66 @@ def main(argv: list[str] | None = None) -> int:
     )
     reverify.add_argument("--unit", required=True, help="staged unit name")
     reverify.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    verify = sub.add_parser(
+        "verify-unit",
+        help="trace-verify one staged compile-only green against the real "
+        "game: refresh capture plans (oracle-registry typing), capture per-"
+        "export cases in our own headless Null-backend Dolphin, replay "
+        "through run-unit.mjs, and record the verdict in canonical state. "
+        "A full-coverage PASS publishes the oracle-commands.json entry and "
+        "promotes through the EXISTING reverify path; PARTIAL/FAIL change no "
+        "tier (FAIL flags oracle_divergent). Takes the driver lock.",
+    )
+    verify.add_argument("--unit", required=True, help="staged unit name")
+    verify.add_argument(
+        "--no-capture", action="store_true",
+        help="skip Dolphin; replay the existing committed corpora only",
+    )
+    verify.add_argument(
+        "--exports", default=None,
+        help="comma-separated export subset to capture (default: all with plans)",
+    )
+    verify.add_argument(
+        "--scenario", default=None,
+        help="scenario name under research/tools/dolphin-trace/scenarios/ "
+        "(default: per-unit-family heuristic)",
+    )
+    verify.add_argument("--cases", type=int, default=120, help="cases per export")
+    verify.add_argument(
+        "--no-promote", action="store_true",
+        help="on a full-coverage PASS, publish the sidecar entry but leave "
+        "promotion to the driver's own verification lane",
+    )
+    verify.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
+    sweep = sub.add_parser(
+        "verify-sweep",
+        help="budgeted batch trace verification over staged compile-only "
+        "greens (product-priority first; skips artifacts already attempted "
+        "at their current bytes). OPERATOR-RUN: the rig supervisor's only "
+        "seam is port-contract start/stop, so this is not a supervisor-"
+        "rotated stage; the sidecar entries it publishes feed the driver's "
+        "existing verification lane. Takes the driver lock; refuses while a "
+        "driver is alive; stops rather than fight another Dolphin.",
+    )
+    sweep.add_argument("--max-units", type=int, default=3, help="unit budget")
+    sweep.add_argument(
+        "--max-seconds", type=float, default=3600.0, help="wall-clock budget"
+    )
+    sweep.add_argument(
+        "--no-capture", action="store_true",
+        help="skip Dolphin; replay existing corpora only",
+    )
+    sweep.add_argument(
+        "--retry-divergent", action="store_true",
+        help="re-attempt units flagged oracle_divergent at unchanged bytes",
+    )
+    sweep.add_argument("--cases", type=int, default=120, help="cases per export")
+    sweep.add_argument(
+        "--no-promote", action="store_true",
+        help="publish sidecar entries on PASS but defer promotion to the "
+        "driver's verification lane",
+    )
+    sweep.add_argument("--repo-root", default=None, help="GotYaForce checkout root")
     migrate = sub.add_parser(
         "d5-migrate",
         help="D5-6 migration steps 2-3: revoke-and-requeue (through the "
@@ -6779,6 +7322,40 @@ def main(argv: list[str] | None = None) -> int:
         result = driver.reverify_unit(args.unit)
         print(json.dumps(result, indent=2))
         return 0 if result.get("promoted") else 1
+    if args.command == "verify-unit":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        exports = (
+            [part for part in args.exports.split(",") if part]
+            if args.exports else None
+        )
+        try:
+            result = driver.verify_unit(
+                args.unit,
+                capture=not args.no_capture,
+                exports=exports,
+                scenario=args.scenario,
+                cases=args.cases,
+                promote=not args.no_promote,
+            )
+        except VerifySkip as skip:
+            print(json.dumps({"unit": args.unit, "skipped": str(skip)}, indent=2))
+            return 0
+        print(json.dumps(result, indent=2))
+        if result.get("skipped"):
+            return 0
+        return 0 if result.get("verdict") in ("PASS", "PARTIAL") else 1
+    if args.command == "verify-sweep":
+        driver = WasmUnitDriver(repo_root=args.repo_root)
+        result = driver.verify_sweep(
+            max_units=args.max_units,
+            max_seconds=args.max_seconds,
+            capture=not args.no_capture,
+            retry_divergent=args.retry_divergent,
+            cases=args.cases,
+            promote=not args.no_promote,
+        )
+        print(json.dumps(result, indent=2))
+        return 0
     if args.command == "d5-migrate":
         driver = WasmUnitDriver(repo_root=args.repo_root)
         deadline = time.monotonic() + max(0.0, args.wait_seconds)
