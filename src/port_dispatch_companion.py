@@ -46,6 +46,13 @@ FRAME_HEADER_FILENAME = "gf_dispatch_frame.h"
 COMPANION_FILENAME = "gf_dispatch_companion.c"
 DISPATCH_EXPORT = "__gf_dispatch"
 MISS_IMPORT = "__gf_dispatch_miss"
+# Arity ledger (design "flagged to the ledger"): a caller whose arg_count
+# differs from the callee's known arity still dispatches (PPC indirect calls
+# are signature-agnostic; the register-residue class is legitimate, V5 note
+# 1) but the event is counted in a module global the host reads through this
+# export. A counter costs one compare on the match path and no import
+# plumbing; it can never turn a legitimate cross-class call into a failure.
+ARITY_EXPORT = "__gf_dispatch_arity_mismatches"
 
 FRAME_ABI_VERSION = 1
 FRAME_MAX_ARGS = 16
@@ -102,9 +109,18 @@ FRAME_HEADER_TEXT = """/* gf_dispatch_frame.h -- GF uniform dispatch frame ABI, 
  *   sizeof(frame) == 0x90, alignment 8.
  *
  * Return convention: the thunk's i32 result is the i32 VIEW of the return
- * value (the value itself for i32 returns, the low 32 bits for i64, 0 for
- * f32/f64/void). The frame's ret slot + ret_class are the authoritative,
- * full-width return channel.
+ * value (the value itself for i32 returns, the LOW 32 bits for i64, 0 for
+ * f32/f64/void). NOTE the deliberate asymmetry with the source ABI: PPC32
+ * EABI returns an i64 in r3:r4 with r3 carrying the HIGH word, so for i64
+ * returns the thunk's i32 result is NOT an r3 image. Consumers MUST read
+ * the full 8-byte ret slot (+0x08) for i64/f32/f64 returns; the frame's
+ * ret slot + ret_class are the authoritative, full-width return channel,
+ * and the i32 result is a convenience view only.
+ *
+ * Argument convention: sub-i32 integer arguments (char/short) are supplied
+ * PPC-register-width pre-extended by the CALLER (caller-extends): the call
+ * site writes the already sign-/zero-extended 32-bit value into the low 4
+ * bytes of the slot, and thunks pass it through without re-extending.
  *
  * Pointer parameters and returns marshal as i32 (a 32-bit linear-memory
  * address); see dispatch_value_class in src/port_assembly_abi.py.
@@ -354,7 +370,12 @@ def resolve_gc_address(
 
     Authority order: the unit's own chunk marker (definitive, present per
     VERBATIM definition), the zz_/FUN_ name encoding, the owner registry's
-    address field. A marker/name contradiction is a problem, never a pick.
+    address field. A marker/name contradiction is a problem, never a pick;
+    likewise, when the owner registry INDEPENDENTLY carries the symbol and
+    disagrees with the resolved address, the pair is refused as a
+    contradiction -- a stale re-extraction yields marker and name that are
+    consistent with each other but wrong, and the registry is the only
+    evidence that can catch it.
     """
     encoded = symbol_gc_address(symbol)
     marker = markers.get(symbol)
@@ -362,16 +383,22 @@ def resolve_gc_address(
         return None, "contradiction", (
             f"chunk marker says {marker} but the symbol name encodes {encoded}"
         )
+    owner_raw = owner_addresses.get(symbol)
+    owner = str(owner_raw).lower() if owner_raw is not None else None
     for address, source in (
         (marker, "marker"),
         (encoded, "symbol_name"),
-        (owner_addresses.get(symbol), "owner_registry"),
+        (owner, "owner_registry"),
     ):
         if address is None:
             continue
         address = str(address).lower()
         if _ADDRESS_RE.fullmatch(address) is None:
             return None, source, f"{source} address {address!r} is not 8 hex digits"
+        if source != "owner_registry" and owner is not None and owner != address:
+            return None, "contradiction", (
+                f"{source} says {address} but the owner registry says {owner}"
+            )
         return address, source, None
     return None, "none", (
         "no GC address derivable: no chunk marker, name encodes no address, "
@@ -394,10 +421,34 @@ def derive_window_signatures(
     result = CompanionResult()
     by_address: dict[str, tuple[str, str]] = {}
     for unit_name, source_text, exports in units:
+        exports = list(exports)
         markers, contradictions = marker_addresses(source_text)
         for detail in contradictions:
             result.problems.append(
                 CompanionProblem(unit_name, None, "marker_contradiction", detail)
+            )
+        # Refusal gap (adversarial review F1): a function DEFINED in the unit
+        # but absent from the export registration would get no thunk and no
+        # problem record -- its GC address would route to the miss handler as
+        # a wrong-behavior bridge call, exactly what the module docstring
+        # forbids. Every marker symbol with a real definition head must be
+        # registered, or the window refuses.
+        registered = set(exports)
+        for symbol in sorted(markers):
+            if symbol in registered:
+                continue
+            if find_definition_head(source_text, symbol) is None:
+                continue
+            result.problems.append(
+                CompanionProblem(
+                    unit_name,
+                    symbol,
+                    "defined_not_registered",
+                    f"{symbol} is defined in {unit_name} (marker "
+                    f"{markers[symbol]}) but absent from the unit's exported "
+                    "functions; unregistered, its GC address would route to "
+                    "the miss handler as a wrong-behavior bridge call",
+                )
             )
         for symbol in exports:
             head = find_definition_head(source_text, symbol)
@@ -618,6 +669,18 @@ def emit_companion_source(signatures: list[ThunkSignature]) -> str:
     ]
     parts.extend(_thunk_definition(item) + "\n" for item in ordered)
     count = len(ordered)
+    parts += [
+        "/* Arity ledger: a caller whose arg_count differs from the callee's",
+        " * known arity still DISPATCHES (the register-residue class is",
+        " * legitimate, V5 note 1) but the event is counted here for the host",
+        " * to read. Ledger data only -- never a gate, never a trap. */",
+        "static unsigned int __gf_arity_mismatch_count = 0u;",
+        "",
+        f"unsigned int {ARITY_EXPORT}(void) {{",
+        "  return __gf_arity_mismatch_count;",
+        "}",
+        "",
+    ]
     if count:
         parts += [
             "typedef int (*__gf_thunk_fn)(int argptr);",
@@ -634,13 +697,28 @@ def emit_companion_source(signatures: list[ThunkSignature]) -> str:
         parts += [
             "};",
             "",
+            f"static const unsigned char __gf_dispatch_arity[{count}] = {{",
+        ]
+        parts.extend(
+            f"  {len(item.param_classes)}u, /* {item.symbol} */" for item in ordered
+        )
+        parts += [
+            "};",
+            "",
             f"int {DISPATCH_EXPORT}(unsigned int gc_addr, int argptr) {{",
             "  unsigned int lo = 0;",
             f"  unsigned int hi = {count}u;",
             "  while (lo < hi) {",
             "    unsigned int mid = lo + (hi - lo) / 2u;",
             "    unsigned int probe = __gf_dispatch_addrs[mid];",
-            "    if (probe == gc_addr) return __gf_dispatch_thunks[mid](argptr);",
+            "    if (probe == gc_addr) {",
+            "      const __gf_dispatch_frame *frame =",
+            "          (const __gf_dispatch_frame *)argptr;",
+            "      if (frame->arg_count != __gf_dispatch_arity[mid]) {",
+            "        __gf_arity_mismatch_count += 1u;",
+            "      }",
+            "      return __gf_dispatch_thunks[mid](argptr);",
+            "    }",
             "    if (probe < gc_addr) {",
             "      lo = mid + 1u;",
             "    } else {",
@@ -672,6 +750,7 @@ def companion_evidence(
         ).hexdigest(),
         "dispatch_export": DISPATCH_EXPORT,
         "miss_import": MISS_IMPORT,
+        "arity_export": ARITY_EXPORT,
         "functions": len(signatures),
         "table": [item.to_dict() for item in signatures],
     }

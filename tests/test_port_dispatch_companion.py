@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from src.port_dispatch_companion import (
+    ARITY_EXPORT,
     COMPANION_FILENAME,
     DISPATCH_EXPORT,
     FRAME_ABI_VERSION,
@@ -112,6 +113,68 @@ def test_resolve_gc_address_authority_order():
     assert address is None and "no GC address derivable" in detail
     address, source, detail = resolve_gc_address("renamed", {}, {"renamed": "0x80004200"})
     assert address is None and "not 8 hex digits" in detail
+
+
+def test_owner_registry_disagreement_is_a_contradiction():
+    """Review F2: the owner registry is an INDEPENDENT address authority.
+
+    A stale re-extraction can yield a marker and a name encoding that agree
+    with each other but are both wrong; the registry is the only evidence
+    that can catch the consistent-but-wrong pair. Agreement passes,
+    disagreement refuses -- never a silent pick of either side.
+    """
+    # Agreeing registry passes, marker authority first.
+    address, source, detail = resolve_gc_address(
+        "zz_0003100_", {"zz_0003100_": "80003100"}, {"zz_0003100_": "80003100"}
+    )
+    assert (address, source, detail) == ("80003100", "marker", None)
+    # Agreeing registry passes against the name encoding too.
+    address, source, detail = resolve_gc_address(
+        "zz_0003100_", {}, {"zz_0003100_": "80003100"}
+    )
+    assert (address, source, detail) == ("80003100", "symbol_name", None)
+    # Marker vs registry disagreement refuses (the empirical F2 shape:
+    # marker 80003100, registry 80999999 -- previously resolved silently).
+    address, source, detail = resolve_gc_address(
+        "gf_marked", {"gf_marked": "80003100"}, {"gf_marked": "80999999"}
+    )
+    assert address is None and source == "contradiction"
+    assert "80003100" in detail and "80999999" in detail
+    # Name-encoding vs registry disagreement refuses in the other direction.
+    address, source, detail = resolve_gc_address(
+        "zz_0003100_", {}, {"zz_0003100_": "80999999"}
+    )
+    assert address is None and source == "contradiction"
+    assert "owner registry" in detail
+
+
+def test_derivation_refuses_when_the_registry_contradicts_the_marker():
+    derived = derive_window_signatures(
+        [
+            (
+                "unit-a",
+                "// ==== 80003100  f ====\nint f(void)\n{\n  return 0;\n}\n",
+                ["f"],
+            )
+        ],
+        {"f": "80999999"},
+    )
+    assert [p.code for p in derived.problems] == ["address_underivable"]
+    assert "owner registry" in derived.problems[0].detail
+    # The identical window with an AGREEING registry derives cleanly.
+    derived = derive_window_signatures(
+        [
+            (
+                "unit-a",
+                "// ==== 80003100  f ====\nint f(void)\n{\n  return 0;\n}\n",
+                ["f"],
+            )
+        ],
+        {"f": "80003100"},
+    )
+    assert derived.problems == []
+    assert derived.signatures[0].gc_address == "80003100"
+    assert derived.signatures[0].address_source == "marker"
 
 
 # ------------------------------------------------------- definition parsing
@@ -235,6 +298,42 @@ def test_owner_registry_address_is_the_fallback_for_renamed_symbols():
     assert derived.signatures[0].address_source == "owner_registry"
 
 
+def test_defined_but_unregistered_function_is_a_refusal():
+    """Review F1: derivation iterated EXPORTS only, so a function defined in
+    the unit but absent from provenance.exported_functions got no thunk and
+    no problem record -- its GC address would route to the miss handler as a
+    wrong-behavior bridge call, violating the module docstring. Every marker
+    symbol with a real definition head must be registered."""
+    source = (
+        "// ==== 80003100  gf_add ====\n"
+        "int gf_add(int a, int b)\n{\n  return a + b;\n}\n"
+        "\n"
+        "// ==== 80003140  gf_orphan ====\n"
+        "int gf_orphan(void)\n{\n  return 7;\n}\n"
+    )
+    derived = _one_unit(source, ["gf_add"])
+    assert [p.code for p in derived.problems] == ["defined_not_registered"]
+    (problem,) = derived.problems
+    assert problem.symbol == "gf_orphan"
+    assert "80003140" in problem.detail and "miss handler" in problem.detail
+    # Registering both definitions derives cleanly -- the refusal is about
+    # the gap, not about multi-definition sources.
+    derived = _one_unit(source, ["gf_add", "gf_orphan"])
+    assert derived.problems == []
+    assert [s.symbol for s in derived.signatures] == ["gf_add", "gf_orphan"]
+    # A marker whose symbol has no definition head (declaration only) is not
+    # a defined function and raises nothing.
+    declared = (
+        "// ==== 80003100  gf_add ====\n"
+        "int gf_add(int a, int b)\n{\n  return a + b;\n}\n"
+        "\n"
+        "// ==== 80003140  gf_decl ====\n"
+        "int gf_decl(void);\n"
+    )
+    derived = _one_unit(declared, ["gf_add"])
+    assert derived.problems == []
+
+
 # ------------------------------------------------------------- frame ABI
 
 
@@ -253,6 +352,13 @@ def test_frame_abi_constants_are_consistent_and_documented():
         ("GF_DISPATCH_CLASS_F64", 4),
     ):
         assert f"#define {macro} {code}" in FRAME_HEADER_TEXT
+    # Review F4: the header states the i64 return asymmetry (the thunk's i32
+    # result is the LOW word; PPC32 EABI r3 carries the HIGH word; consumers
+    # read the 8-byte ret slot) and the caller-extends argument convention.
+    assert "LOW 32 bits" in FRAME_HEADER_TEXT
+    assert "HIGH word" in FRAME_HEADER_TEXT
+    assert "8-byte ret slot" in FRAME_HEADER_TEXT
+    assert "caller-extends" in FRAME_HEADER_TEXT
 
 
 def test_companion_emission_is_deterministic_and_address_sorted():
@@ -281,6 +387,15 @@ def test_companion_emission_is_deterministic_and_address_sorted():
     assert f"extern int {MISS_IMPORT}(unsigned int gc_addr, int argptr);" in text
     assert f"int {DISPATCH_EXPORT}(unsigned int gc_addr, int argptr)" in text
     assert "__gf_thunk_80003100" in text and "__gf_thunk_80004200" in text
+    # Arity ledger: per-entry known arity, a mismatch counter the host reads
+    # through the export, and dispatch that still proceeds on mismatch.
+    assert "__gf_dispatch_arity[2]" in text
+    assert "2u, /* gf_add */" in text and "1u, /* zz_0004200_ */" in text
+    assert f"unsigned int {ARITY_EXPORT}(void)" in text
+    assert "__gf_arity_mismatch_count += 1u;" in text
+    assert text.index("__gf_arity_mismatch_count += 1u;") < text.index(
+        "return __gf_dispatch_thunks[mid](argptr);"
+    )
     evidence = companion_evidence(derived.signatures, text)
     assert evidence["functions"] == 2
     assert evidence["frame_abi_version"] == FRAME_ABI_VERSION
@@ -291,6 +406,9 @@ def test_empty_window_companion_routes_everything_to_the_miss_handler():
     text = emit_companion_source([])
     assert f"return {MISS_IMPORT}(gc_addr, argptr);" in text
     assert "__gf_dispatch_addrs" not in text
+    # The arity-ledger export exists in the empty shape too, so the module
+    # interface does not change with table population.
+    assert f"unsigned int {ARITY_EXPORT}(void)" in text
 
 
 # ------------------------------------------------------------ gate wiring
@@ -334,6 +452,20 @@ def _pilot_units(root: Path):
     return [unit_a, unit_b]
 
 
+def _pilot_wide_unit(root: Path):
+    """An i64-returning callee (review F4): hi and lo words differ, so a
+    `return 0;` mutation -- or returning the PPC-r3-style HIGH word through
+    the i32 view -- cannot pass the pilot's assertions."""
+    return _write_gate_unit(
+        root / "unit-w",
+        "unit-w",
+        "// ==== 80005300  gf_pilot_wide ====\n"
+        "long long gf_pilot_wide(int x)\n"
+        "{\n  return ((long long)(x + 1) << 32) | 0x55667788u;\n}\n",
+        ["gf_pilot_wide"],
+    )
+
+
 def test_gate_emits_companion_exports_dispatch_and_allows_miss(tmp_path: Path):
     from src.port_assembly_gate import run_assembly_gate
 
@@ -352,6 +484,7 @@ def test_gate_emits_companion_exports_dispatch_and_allows_miss(tmp_path: Path):
     assert result["passed"] is True, result
     assert captured["c_files"][-1] == COMPANION_FILENAME
     assert DISPATCH_EXPORT in captured["exports"]
+    assert ARITY_EXPORT in captured["exports"]
     assert MISS_IMPORT in captured["allowed_extra"]
     assert (workdir / COMPANION_FILENAME).is_file()
     assert (workdir / FRAME_HEADER_FILENAME).read_text(encoding="utf-8") == FRAME_HEADER_TEXT
@@ -377,6 +510,7 @@ def test_gate_default_leaves_the_existing_link_byte_identical(tmp_path: Path):
     assert result["passed"] is True
     assert COMPANION_FILENAME not in captured["c_files"]
     assert DISPATCH_EXPORT not in captured["exports"]
+    assert ARITY_EXPORT not in captured["exports"]
     assert not (workdir / COMPANION_FILENAME).exists()
     assert "dispatch" not in result
 
@@ -506,8 +640,27 @@ out.f64 = {
   ret_class: view.getUint32(FRAME + 0x04, true),
 };
 
+// (d) i64 return (review F4): the FULL width lands in the ret slot and the
+// thunk's i32 view is the LOW word -- NOT a PPC r3 image (PPC32 EABI r3
+// carries the HIGH word; consumers must read the 8-byte slot). Distinct hi
+// and lo words make a `return 0;` mutation in the callee fail ret, slot,
+// and split alike.
+view.setUint32(FRAME + 0x00, 1, true);
+view.setInt32(FRAME + 0x10, 0x11223343, true);
+out.wide = {
+  ret: dispatch(0x80005300, FRAME) | 0,
+  slot_hex: view.getBigUint64(FRAME + 0x08, true).toString(16),
+  ret_class: view.getUint32(FRAME + 0x04, true),
+};
+
 // (c) table miss: unregistered address routes to the declared import.
 out.miss = { ret: dispatch(0x80999999, FRAME) | 0, ledger: missLedger };
+
+// (e) arity ledger: the cross-class call in (b) wrote arg_count=0 into a
+// two-parameter callee -- dispatched anyway, counted once. Every other call
+// matched its callee's arity, and a miss is never an arity event.
+out.arity_mismatches =
+  instance.exports.__gf_dispatch_arity_mismatches() >>> 0;
 
 console.log('PILOT_RESULT ' + JSON.stringify(out));
 """
@@ -572,6 +725,7 @@ def test_pilot_dispatch_matched_crossclass_and_miss(tmp_path: Path):
     from src.port_wasm_units import NO_WINDOW, resolve_node_exe
 
     units = _pilot_units(tmp_path / "staging")
+    units.append(_pilot_wide_unit(tmp_path / "staging"))
     workdir = tmp_path / "assembly"
     result = run_assembly_gate(
         units, workdir, _real_link_runner(), dispatch_companion=True
@@ -579,7 +733,7 @@ def test_pilot_dispatch_matched_crossclass_and_miss(tmp_path: Path):
     assert result["passed"] is True, result
     wasm_path = workdir / ASSEMBLY_WASM
     assert wasm_path.is_file()
-    assert result["dispatch"]["functions"] == 2
+    assert result["dispatch"]["functions"] == 3
 
     driver_path = workdir / "pilot-driver.cjs"
     driver_path.write_text(PILOT_DRIVER_JS, encoding="utf-8", newline="\n")
@@ -629,12 +783,25 @@ def test_pilot_dispatch_matched_crossclass_and_miss(tmp_path: Path):
     # i32 view is 0, full value in the frame slot, ret_class F64 == 4.
     assert out["f64"] == {"ret": 0, "slot": 5.0, "ret_class": 4}
 
+    # (d) i64 return through the real toolchain: full 64-bit value in the
+    # frame slot (hi word != lo word), ret_class I64 == 2, and the i32 view
+    # is the LOW word -- the F4 contract a `return 0;` mutation would fail.
+    assert out["wide"] == {
+        "ret": 0x55667788,
+        "slot_hex": "1122334455667788",
+        "ret_class": 2,
+    }
+
     # (c) table miss: routed to the declared import, address ledgered, the
     # handler's result propagated. Never a trap.
     assert out["miss"]["ret"] == 0x5150
     assert out["miss"]["ledger"] == [
         {"gc_addr": 0x80999999, "argptr": PILOT_FRAME_ADDRESS}
     ]
+
+    # (e) arity ledger: exactly the one deliberate mismatch -- the (b)
+    # cross-class call -- was counted, and it still dispatched.
+    assert out["arity_mismatches"] == 1
 
 
 @requires_toolchain
@@ -671,5 +838,6 @@ def test_pilot_dispatch_export_survives_the_real_link(tmp_path: Path):
     assert completed.returncode == 0, completed.stderr + completed.stdout
     shape = json.loads(completed.stdout.strip().splitlines()[-1])
     assert DISPATCH_EXPORT in shape["exports"]
+    assert ARITY_EXPORT in shape["exports"]
     assert "gf_pilot_add" in shape["exports"] and "zz_0004200_" in shape["exports"]
     assert MISS_IMPORT in shape["imports"]
