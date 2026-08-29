@@ -61,7 +61,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 # ---------------------------------------------------------------- repo layout
 
@@ -246,7 +246,67 @@ _TITLE_CHUNKS = {"0013"}
 _UNIT_CHUNK = re.compile(r"^auto-c(\d{4})-\d+$")
 
 
-def select_scenario(unit_name: str) -> str:
+def family_scenario_index(repo_root: Path) -> dict[str, str]:
+    """borg family constructor address -> the scenario that makes it live.
+
+    Built from the scenario library itself: every scenario states, in its own
+    measured ``live_families``, which families it brings up. So the routing and
+    the family gate read exactly the same field, and a scenario that has not
+    been measured (``live_families`` absent/null) routes nothing.
+
+    The entries that matter are the ones
+    ``research/tools/dolphin-trace/force_navigator.py cover`` writes: one
+    per blocked family, each re-loading the ROM's battle around a roster of
+    that family's borg. Before those existed every unit routed to
+    ``battle-2v2-circle``, whose single live family left 98 of 104 staged
+    units skipped as ``family_not_live`` forever.
+    """
+    index: dict[str, str] = {}
+    directory = Path(repo_root) / SCENARIOS_RELPATH
+    for path in sorted(directory.glob("*.json")):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict) or doc.get("scenario_schema") != 1:
+            continue
+        families = doc.get("live_families")
+        if not isinstance(families, list):
+            continue
+        name = str(doc.get("name") or path.stem)
+        for family in families:
+            try:
+                key = f"0x{int(str(family), 16):08x}"
+            except (TypeError, ValueError):
+                continue
+            index.setdefault(key, name)
+    return index
+
+
+def select_scenario(
+    unit_name: str,
+    repo_root: Path | None = None,
+    families: Iterable[str] | None = None,
+) -> str:
+    """Which scripted game state to verify this unit in.
+
+    Family routing is ADDITIVE and fails open: it only applies when the caller
+    supplies both a repo root and the unit's gating families, and only when
+    some scenario has actually measured one of them live. Everything else
+    keeps the v1 chunk heuristic, so a caller that has not been updated, a
+    unit with no gating family, and a family nobody has covered yet all behave
+    exactly as before.
+    """
+    if repo_root is not None and families:
+        index = family_scenario_index(Path(repo_root))
+        for family in sorted(families):
+            try:
+                key = f"0x{int(str(family), 16):08x}"
+            except (TypeError, ValueError):
+                continue
+            scenario = index.get(key)
+            if scenario:
+                return scenario
     match = _UNIT_CHUNK.match(unit_name)
     if match and match.group(1) in _TITLE_CHUNKS:
         return TITLE_SCENARIO

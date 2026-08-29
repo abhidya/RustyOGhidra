@@ -6097,6 +6097,16 @@ class WasmUnitDriver:
             self._trace_registry_cache = cached
         return cached
 
+    def _scenario_for_unit(self, name: str, exports: list[str]) -> str:
+        """The scenario to verify `name` in: the one measured to make its
+        gating borg family live, else the v1 chunk heuristic. Fails open —
+        no family index, no family, or no scenario covering it all fall back."""
+        index = self._family_index()
+        if index is None:
+            return select_scenario(name)
+        families = index.unit_families(exports, self._trace_registry_fns()).families
+        return select_scenario(name, repo_root=self.repo_root, families=families)
+
     def _family_index(self) -> FamilyIndex | None:
         """The borg-family address index (src/port_family_gate.py), loaded
         once per process. None when the coverage artifact is absent, which
@@ -6140,7 +6150,16 @@ class WasmUnitDriver:
         blocked: dict[str, GateDecision] = {}
         not_gated: dict[str, str] = {}
         for name in candidates:
-            scenario = select_scenario(name)
+            provenance = self._staged_provenance(name) or {}
+            exports = provenance.get("exported_functions") or []
+            unit_families = index.unit_families(exports, registry_fns)
+            # Route to the scenario that MAKES this unit's family live, when
+            # one has been measured (force_navigator.py cover writes them).
+            # Without this the gate correctly skipped 98 of 104 staged units
+            # for a family the default scenario could never bring up.
+            scenario = select_scenario(
+                name, repo_root=self.repo_root, families=unit_families.families
+            )
             liveness = liveness_cache.get(scenario)
             if liveness is None:
                 liveness = scenario_live_families(self.repo_root, scenario)
@@ -6152,11 +6171,7 @@ class WasmUnitDriver:
                     "known": liveness.known,
                     "basis": liveness.basis,
                 }
-            provenance = self._staged_provenance(name) or {}
-            exports = provenance.get("exported_functions") or []
-            decision = decide_family_gate(
-                index.unit_families(exports, registry_fns), liveness
-            )
+            decision = decide_family_gate(unit_families, liveness)
             if decision.selectable:
                 not_gated[name] = decision.reason
             else:
@@ -6340,7 +6355,7 @@ class WasmUnitDriver:
         if not wasm_path.is_file():
             raise VerifySkip(f"{name}: no staged unit.wasm")
         wasm_sha = self._staged_wasm_sha(name)
-        scenario_name = scenario or select_scenario(name)
+        scenario_name = scenario or self._scenario_for_unit(name, unit_exports)
         self._heartbeat(f"wasm_units:{name}:trace_verify")
         self.events.emit(
             "wasm_unit_verify_started",
