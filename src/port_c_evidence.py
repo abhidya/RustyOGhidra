@@ -178,6 +178,7 @@ class FunctionEvidence:
     params: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     indirect_calls: int = 0
+    early_return_lines: list[int] = field(default_factory=list)
 
     # ---- queries used by the validator -------------------------------------
 
@@ -209,13 +210,21 @@ class FunctionEvidence:
                 if a.kind == "param" and a.direction == "read" and a.param is not None]
 
     def unconditional_writes(self) -> list[Access]:
-        """Stores that run on EVERY call (brace depth 0). A read of memory such a
-        store already filled does not need to be seeded from the console -- the
-        gold plan for FUN_800c4308 omits the +0x180 read for exactly this
-        reason, because the function writes +0x180 unconditionally first."""
+        """Stores that run on EVERY call. A read of memory such a store already
+        filled does not need to be seeded from the console -- the gold plan for
+        FUN_800c4308 omits the +0x180 read for exactly this reason, because the
+        function writes +0x180 unconditionally first.
+
+        Brace depth 0 is NOT sufficient: a store at the top level of a body that
+        contains `if (...) { ...; return; }` above it is only reached on some
+        calls (zz_0014bc4_ is the worked example). Both conditions are required,
+        so this stays a strict under-approximation -- a store wrongly called
+        conditional only costs an extra declared read.
+        """
         return [a for a in self.accesses
                 if a.kind == "param" and a.direction == "write"
-                and a.param is not None and a.depth == 0]
+                and a.param is not None and a.depth == 0
+                and not any(line < a.line for line in self.early_return_lines)]
 
     def has_local_base_writes(self) -> bool:
         return any(a.kind == "local" and a.direction == "write" for a in self.accesses)
@@ -437,6 +446,14 @@ def analyse_function(name: str, body: str, params: Iterable[str] = ()) -> Functi
     # carry no address->wasm-table mapping (gnt4_shim.h). Counted separately so
     # tiering can refuse it.
     evidence.indirect_calls = len(_INDIRECT_CALL.findall(source))
+
+    # `return` inside any nested block is an EARLY return: everything after it
+    # at the top level runs only on some calls.
+    for match in re.finditer(r"\breturn\b", source):
+        index = match.start()
+        depth = source.count("{", 0, index) - source.count("}", 0, index) - 1
+        if depth >= 1:
+            evidence.early_return_lines.append(_line_of(source, index))
 
     for match in _CALL.finditer(source):
         callee = match.group(1)

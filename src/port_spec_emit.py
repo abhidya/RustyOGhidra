@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from src.port_c_evidence import FunctionEvidence
-from src.port_plan_derive import parse_addr, _reg_to_param
+from src.port_plan_derive import parse_addr, write_pre_state_gaps, _reg_to_param
 
 SPECS_RELPATH = "research/decomp/oracle-harness/specs"
 
@@ -173,6 +173,13 @@ def classify_export(fn: str, evidence: FunctionEvidence, plan: dict[str, Any],
         reasons.append(
             "no declared write set: a spec with nothing to compare passes every "
             "case, which is worse than no spec at all")
+    gaps = write_pre_state_gaps(plan, _reg_to_param(plan), evidence)
+    if gaps:
+        reasons.append(
+            f"declared write(s) {gaps[:4]} have no pre-state in the read set: on a "
+            f"call whose branch does not store there, the replay would compare its "
+            f"poisoned arena byte against the console's untouched value and blame "
+            f"the unit for the spec's gap")
     if plan.get("uncapturable_writes"):
         reasons.append(
             "the function stores through a non-argument base (allocator return / "

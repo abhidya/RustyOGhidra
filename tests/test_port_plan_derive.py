@@ -399,3 +399,89 @@ def test_prompt_demands_a_citation_and_forbids_param_syntax():
     assert "EXACT, COMPLETE source" in prompt
     assert "never `param_N`" in prompt
     assert "DECLARE EVERY DIRECT STORE" in prompt
+
+
+# ------------------------------------------------- conditional-write pre-state
+
+
+EARLY_RETURN_C = """// ==== 80014bc4  zz_0014bc4_ ====
+void zz_0014bc4_(int param_1)
+{
+  if (*(short *)(param_1 + 0x178) != 0) {
+    *(short *)(param_1 + 0x178) = *(short *)(param_1 + 0x178) + -1;
+    return;
+  }
+  *(undefined1 *)(param_1 + 0x170) = 1;
+  return;
+}
+"""
+
+
+def _early_return_evidence():
+    name = "zz_0014bc4_"
+    return analyse_function(name, split_unit_functions(EARLY_RETURN_C)[name],
+                            ["int param_1"])
+
+
+def test_top_level_store_after_an_early_return_is_not_unconditional():
+    """Brace depth 0 does not mean 'runs on every call' once the body has an
+    `if (...) { ...; return; }` above the store."""
+    evidence = _early_return_evidence()
+    unconditional = {(a.param, a.offset) for a in evidence.unconditional_writes()}
+    assert (1, 0x170) not in unconditional
+
+
+def test_conditional_write_without_pre_state_never_reaches_a_spec():
+    """The replay poisons its arena; on a call whose branch does not store, a
+    write with no captured pre-state compares poison against the console's
+    untouched bytes and blames the unit."""
+    payload = {
+        "reads": [{"id": "r178", "addr": "r3+0x178", "width": 2,
+                   "evidence": "if (*(short *)(param_1 + 0x178) != 0) {"}],
+        "writes": [
+            {"id": "w178", "addr": "r3+0x178", "width": 2,
+             "evidence": "*(short *)(param_1 + 0x178) = *(short *)(param_1 + 0x178) + -1;"},
+            {"id": "w170", "addr": "r3+0x170", "width": 1,
+             "evidence": "*(undefined1 *)(param_1 + 0x170) = 1;"},
+        ],
+    }
+    name = "zz_0014bc4_"
+    evidence = _early_return_evidence()
+    plan = assemble_plan("u", name, {**REGISTRY_ENTRY, "name": name}, payload)
+    tier = classify_export(name, evidence, plan, "validated")
+    assert tier.tier == "human"
+    assert any("pre-state" in reason for reason in tier.reasons)
+
+
+def test_unconditional_write_needs_no_pre_state():
+    """FUN_800c42bc stores +0x60 on every call, so the gold plan rightly omits a
+    +0x60 read -- the rule must not demand one."""
+    evidence = _evidence(PURE_C)
+    tier = classify_export("FUN_800c42bc", evidence, _plan(body=PURE_C), "validated")
+    assert tier.tier == "mechanical"
+
+
+def test_static_derivation_emits_pre_state_reads_for_every_write():
+    from src.port_plan_derive import derive_plan_statically
+
+    name = "zz_0014bc4_"
+    plan, why = derive_plan_statically("u", name, {**REGISTRY_ENTRY, "name": name},
+                                       _early_return_evidence())
+    assert plan is not None, why
+    read_addrs = {(e["addr"], e["width"]) for e in plan["reads"]}
+    for write in plan["writes"]:
+        assert (write["addr"], write["width"]) in read_addrs
+
+
+def test_static_derivation_refuses_indirect_dispatch():
+    from src.port_plan_derive import derive_plan_statically
+
+    body = EARLY_RETURN_C.replace(
+        "  *(undefined1 *)(param_1 + 0x170) = 1;",
+        "  (*(code *)(&PTR_FUN_8032e3b8)[*(char *)(param_1 + 0x540)])();")
+    name = "zz_0014bc4_"
+    evidence = analyse_function(name, split_unit_functions(body)[name],
+                                ["int param_1"])
+    plan, why = derive_plan_statically("u", name, {**REGISTRY_ENTRY, "name": name},
+                                       evidence)
+    assert plan is None and "function-pointer table" in why

@@ -288,6 +288,49 @@ def _covers(entries: list[dict[str, Any]], reg_param: dict[str, int],
     return False
 
 
+def _shadows_a_write(writes: list[dict[str, Any]], reg_param: dict[str, int],
+                     param: int | None, offset: int, width: int) -> bool:
+    """True when [offset, offset+width) lies inside a declared write on `param`."""
+    for entry in writes:
+        parsed = parse_addr(entry.get("addr", ""), reg_param)
+        if parsed.form != "direct" or parsed.param != param:
+            continue
+        entry_width = int(entry.get("width") or 0)
+        if parsed.offset <= offset and offset + width <= parsed.offset + entry_width:
+            return True
+    return False
+
+
+def write_pre_state_gaps(plan: dict[str, Any], reg_param: dict[str, int],
+                         evidence: FunctionEvidence | None = None) -> list[str]:
+    """Declared writes whose PRE-state the read set does not cover.
+
+    A generated spec cannot be emitted with any of these outstanding: on a call
+    that takes a branch which does not store, the replay would compare its
+    poisoned arena byte against the console's untouched pre-value and report a
+    divergence that is the spec's fault, not the unit's.
+    """
+    gaps: list[str] = []
+    reads = list(plan.get("reads") or [])
+    unconditional = evidence.unconditional_writes() if evidence else []
+    for entry in plan.get("writes") or []:
+        parsed = parse_addr(entry.get("addr", ""), reg_param)
+        if parsed.form != "direct":
+            continue
+        width = int(entry.get("width") or 0)
+        if _covers(reads, reg_param, parsed.param, parsed.offset, width):
+            continue
+        # A store that runs on EVERY call overwrites whatever was there, so its
+        # pre-state is never compared and never needs seeding.
+        if any(store.param == parsed.param
+               and store.offset <= parsed.offset
+               and parsed.offset + width <= store.offset + (store.width or 1)
+               for store in unconditional):
+            continue
+        gaps.append(f"param_{parsed.param}+{parsed.offset:#x} (w{width})")
+    return gaps
+
+
 def validate_plan(plan: dict[str, Any], evidence: FunctionEvidence,
                   registry_entry: dict[str, Any] | None = None,
                   *, require_citations: bool = True) -> PlanValidation:
@@ -384,6 +427,21 @@ def validate_plan(plan: dict[str, Any], evidence: FunctionEvidence,
 
             # direct parameter access
             want = "write" if side == "write" else "read"
+            # A read entry that exactly shadows a declared write is the
+            # write's PRE-STATE, and it is not optional. The C may store to an
+            # offset only on some branches (`if (...) { *(p+0x170) = 1; }`);
+            # on the branches that do not store, the console's post-state at
+            # that offset is its PRE-state -- which the replay can only know if
+            # the capture recorded it. Without this entry the arena still holds
+            # the poison byte there and every non-storing case reports a false
+            # divergence. Grounded by the write it shadows, not by a load.
+            if side == "read" and _shadows_a_write(
+                    writes, reg_param, parsed.param, parsed.offset, width):
+                result.entries.append(verdict(
+                    "grounded_write_pre",
+                    "pre-state of a declared write (needed for the branches "
+                    "that do not store)"))
+                continue
             if (parsed.param, parsed.offset, want) in param_accesses:
                 result.entries.append(verdict("grounded"))
             elif (parsed.param, parsed.offset, "ptr") in param_accesses:
@@ -835,6 +893,23 @@ def derive_plan_statically(unit: str, fn: str, registry_entry: dict[str, Any],
             "addr": f"{reg}+0x{access.offset:x}" if access.offset else reg,
             "width": access.width or 4,
             "evidence": _normalise(access.text),
+        })
+
+    # Every declared write also needs its PRE-state read, so a branch that does
+    # not store leaves the replay comparing the console's real prior bytes
+    # instead of arena poison.
+    for entry in list(writes):
+        parsed_param = int(entry["id"].split("_")[0][1:])
+        offset = int(entry["addr"].split("+")[-1], 16) if "+" in entry["addr"] else 0
+        key = ("r", parsed_param, offset)
+        if key in seen:
+            continue
+        seen.add(key)
+        reads.append({
+            "id": f"pre{parsed_param}_{offset:x}",
+            "addr": entry["addr"],
+            "width": entry["width"],
+            "evidence": entry["evidence"],
         })
 
     for access in evidence.direct_param_reads():
