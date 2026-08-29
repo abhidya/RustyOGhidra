@@ -538,6 +538,10 @@ def test_gate_on_with_no_pipe_traffic_writes_nothing(tmp_path: Path):
     assert not (workdir / HEADER_FILENAME).exists()
     assert "wgpipe" not in result
     assert (workdir / "u1.c").read_text(encoding="utf-8").startswith('#include "gnt4_shim.h"')
+    # The import allowlist is not widened either: an ON-flagged window with no
+    # GX code links under exactly the OFF conditions.
+    for name in WGPIPE_IMPORTS:
+        assert name not in captured["allowed_extra"]
 
 
 def test_gate_refuses_loudly_when_a_pipe_reference_cannot_be_lowered(tmp_path: Path):

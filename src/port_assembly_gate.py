@@ -2093,12 +2093,14 @@ def _link_and_smoke(
         exports.append(DISPATCH_EXPORT)
         exports.append(ARITY_EXPORT)
         allowed_extra.append(MISS_IMPORT)
-    if wgpipe_lowering:
+    if wgpipe_lowering and result.get("wgpipe"):
         from src.port_wgpipe_lowering import WGPIPE_IMPORTS
 
         # The four FIFO imports are DECLARED host callees, exactly like the
         # dispatch miss handler: without this the import scan would call the
-        # lowering's own output a disallowed import.
+        # lowering's own output a disallowed import. Widened ONLY when this
+        # window actually lowered a store, so an ON-flagged window with no GX
+        # code links under exactly the OFF allowlist.
         allowed_extra.extend(WGPIPE_IMPORTS)
     result["stage"] = "link"
     ok, error_text = link_runner(workdir, c_files, exports, allowed_extra)
