@@ -3479,3 +3479,20 @@ def test_a_header_call_site_is_not_a_missing_declaration():
     assert len(abi._declaration_matches(abi._masked_code(header), _LADDER_SYMBOL)) == 2
     site = abi._header_declaration_site(header, _LADDER_SYMBOL)
     assert site is not None and site[0] == "declaration"
+
+
+def test_a_top_up_parser_fault_becomes_a_refusal_not_an_escape():
+    """The site loop wraps its parser calls; the top-up runs after it."""
+
+    class Exploding(ShapeParser):
+        def parse_declaration(self, source: bytes, symbol: str):
+            raise RuntimeError("adapter died")
+
+    settled = abi._reconcile_present_declaration(
+        Exploding(), Exploding.identity.sha256,
+        ("extern undefined8 " + _LADDER_SYMBOL + "(int);\n").encode(),
+        _LADDER_SYMBOL, "void " + _LADDER_SYMBOL + "(int);",
+        "auto-c0053-013", "auto-c0025-002", True,
+    )
+    assert isinstance(settled, abi.AssemblyAbiRefusal)
+    assert settled.code == "declarator_parser_fault"

@@ -3200,8 +3200,18 @@ def _reconcile_present_declaration(
     kind, start, end = site
     if kind == "definition":
         return header  # a definition is the authority; the owner loop probed it
-    present = parser.parse_declaration(header[start:end], symbol)  # type: ignore[attr-defined]
-    chosen = parser.parse_declaration(prototype_text.encode("utf-8"), symbol)  # type: ignore[attr-defined]
+    try:
+        present = parser.parse_declaration(header[start:end], symbol)  # type: ignore[attr-defined]
+        chosen = parser.parse_declaration(prototype_text.encode("utf-8"), symbol)  # type: ignore[attr-defined]
+    except AssemblyAbiError:
+        raise
+    except Exception as exc:
+        # The site loop wraps its parser calls; this one runs after it, so it
+        # needs the same guard or an adapter fault escapes the planner instead
+        # of becoming a refusal.
+        return AssemblyAbiRefusal(
+            "declarator_parser_fault", "canonicalize", f"parser adapter fault: {exc}"
+        )
     if not _declarator_projection_is_valid(present, symbol) or not _declarator_projection_is_valid(chosen, symbol):
         return AssemblyAbiRefusal(
             "declarator_parser_fault",
@@ -3216,7 +3226,14 @@ def _reconcile_present_declaration(
         # contest the window; rewriting would churn the header for nothing.
         return header
     if not _owner_declaration_is_unifiable(present.abi_tuple, chosen.abi_tuple, result_unused):
-        probe = parser.compatibility(present, chosen)  # type: ignore[attr-defined]
+        try:
+            probe = parser.compatibility(present, chosen)  # type: ignore[attr-defined]
+        except AssemblyAbiError:
+            raise
+        except Exception as exc:
+            return AssemblyAbiRefusal(
+                "declarator_parser_fault", "canonicalize", f"parser adapter fault: {exc}"
+            )
         if not _compatibility_probe_is_valid(probe, present, chosen, parser_identity_sha256):
             return AssemblyAbiRefusal(
                 "declarator_parser_fault",
