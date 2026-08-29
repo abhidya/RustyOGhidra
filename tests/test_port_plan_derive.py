@@ -395,10 +395,12 @@ def test_emitted_spec_names_the_exports_it_does_not_cover():
 def test_prompt_demands_a_citation_and_forbids_param_syntax():
     args = [{"reg": "r3", "name": "param_1"}]
     prompt = build_prompt("FUN_800c42bc", DECREMENT_C, args, "void f(int)", [])
-    assert "evidence" in prompt
-    assert "EXACT, COMPLETE source" in prompt
+    assert "`line` field" in prompt
+    assert "must itself contain" in prompt
     assert "never `param_N`" in prompt
     assert "DECLARE EVERY DIRECT STORE" in prompt
+    # the C must be shown WITH line numbers, or a line citation means nothing
+    assert "  11  " in prompt
 
 
 # ------------------------------------------------- conditional-write pre-state
@@ -485,3 +487,73 @@ def test_static_derivation_refuses_indirect_dispatch():
     plan, why = derive_plan_statically("u", name, {**REGISTRY_ENTRY, "name": name},
                                        evidence)
     assert plan is None and "function-pointer table" in why
+
+
+def test_truncated_reply_never_yields_a_partial_write_set():
+    """Measured on this rig: the model's reply for a larger function stopped
+    mid-`writes` at ~2.3 KB with finish_reason "stop". Salvaging that into a
+    plan would declare SOME of the stores -- the exact under-declaration the
+    whole stage exists to prevent. It must fail, one way or another."""
+    truncated = (
+        '```json\n{\n  "reads": [\n'
+        '    {"id": "a184_pre", "addr": "r3+0x184", "width": 4,\n'
+        '     "evidence": "fVar2 = *(float *)(param_1 + 0x184) - *(float *)(param_1 + 0x44);"},\n'
+        '    {"id": "a44", "addr": "r3+0x44", "width": 4,\n'
+        '     "evidence": "fVar2 = *(float *)(param_1 + 0x184) - *(float *)(param_1 + 0x44);"}\n'
+        '  ],\n  "writes": [\n'
+        '    {"id": "w184", "addr": "r3+0x184", "width": 4,\n'
+        '     "evidence": "*(float *)(param_1 + 0x184) = fVar2;"'
+    )
+    payload, shape = parse_reply(truncated)
+    if payload is None:
+        assert shape                       # refused at the parse boundary
+        return
+    plan = assemble_plan("u", "FUN_800c42bc", REGISTRY_ENTRY, payload)
+    result = validate_plan(plan, _evidence(), REGISTRY_ENTRY)
+    assert result.verdict == "refused"     # or at the coverage boundary
+    assert result.undeclared_writes
+
+
+def test_the_prompts_worked_example_validates_against_its_own_c():
+    """The example teaches the model both the schema AND the line numbering. If
+    its `line` fields point at the wrong lines, every reply learns the wrong
+    convention -- and the first version of this example was off by two."""
+    from src.port_plan_derive import _GOLD_C, _GOLD_JSON
+
+    payload, shape = parse_reply("```json\n" + _GOLD_JSON + "\n```")
+    assert payload is not None, shape
+    name = "FUN_800c42bc"
+    evidence = analyse_function(name, _GOLD_C, ["int param_1"])
+    plan = assemble_plan("u", name, REGISTRY_ENTRY, payload)
+    result = validate_plan(plan, evidence, REGISTRY_ENTRY)
+    assert result.verdict == "validated", result.reasons()
+
+
+def test_line_citation_must_point_at_a_line_naming_that_offset():
+    payload = {
+        "reads": [{"id": "a44", "addr": "r3+0x44", "width": 4, "line": 8}],
+        "writes": [
+            {"id": "w184", "addr": "r3+0x184", "width": 4, "line": 11},
+            {"id": "w60", "addr": "r3+0x60", "width": 4, "line": 12},
+        ],
+    }
+    # line 8 is `fVar3 = FLOAT_80438744;` -- it does not mention 0x44
+    from src.port_plan_derive import _GOLD_C
+
+    name = "FUN_800c42bc"
+    evidence = analyse_function(name, _GOLD_C, ["int param_1"])
+    plan = assemble_plan("u", name, REGISTRY_ENTRY, payload)
+    result = validate_plan(plan, evidence, REGISTRY_ENTRY)
+    assert any(e.status == "citation_missing" for e in result.entries)
+
+
+def test_line_citation_out_of_range_is_refused():
+    payload = {"reads": [{"id": "a44", "addr": "r3+0x44", "width": 4, "line": 999}],
+               "writes": []}
+    from src.port_plan_derive import _GOLD_C
+
+    name = "FUN_800c42bc"
+    evidence = analyse_function(name, _GOLD_C, ["int param_1"])
+    plan = assemble_plan("u", name, REGISTRY_ENTRY, payload)
+    result = validate_plan(plan, evidence, REGISTRY_ENTRY)
+    assert any(e.status == "citation_missing" for e in result.entries)

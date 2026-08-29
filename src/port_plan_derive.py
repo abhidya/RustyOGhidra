@@ -14,10 +14,14 @@ module asks it -- and then refuses to believe it.
 
 THE TRUST MODEL (three layers, all fail-closed)
 -----------------------------------------------
-1. CITATION. The prompt forces one `evidence` field per declared entry: the
-   exact source line the entry comes from. An entry whose citation is not a
-   verbatim line of the function is rejected before anything else looks at it.
-   Unjustifiable entries are the failure mode this is designed against.
+1. CITATION. The prompt shows the C with numbered lines and forces one `line`
+   field per declared entry. The cited line must exist AND must itself name the
+   offset or address the entry claims, so a citation cannot be satisfied by
+   pointing anywhere plausible. (A verbatim `evidence` line is still accepted,
+   and is what the first version asked for -- but reply length turned out to be
+   the binding constraint on this rig, and a line number costs a couple of
+   tokens where a copied source line costs sixty.) Unjustifiable entries are
+   the failure mode this is designed against.
 
 2. STATIC GROUNDING (`port_c_evidence`). Every address expression is parsed and
    checked against an index built from the same C by a model-free syntactic
@@ -265,12 +269,57 @@ def _normalise(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def _citation_ok(citation: str, evidence: FunctionEvidence) -> bool:
-    want = _normalise(citation)
+def _citation_ok(entry: dict[str, Any], evidence: FunctionEvidence,
+                 parsed: "ParsedAddr | None" = None) -> bool:
+    """Is this entry's citation real?
+
+    Two accepted forms, and the cheap one is also the stricter one:
+
+    ``line``  a 1-based line number into the C block the prompt showed. The
+              cited line must EXIST and must itself mention what the entry
+              claims -- the offset (hex or decimal) or the ROM address. A number
+              costs a couple of tokens where a copied source line costs ~60, and
+              on this rig reply length is the binding constraint: the model's
+              plan for a 44-line function stopped mid-``writes`` at 2.3 KB.
+
+    ``evidence``  the source line copied verbatim, checked by containment. Kept
+              because it needs no line numbering and reads well in the stored
+              plan.
+    """
+    number = entry.get("line")
+    if isinstance(number, str) and number.strip().lstrip("Ll").isdigit():
+        number = int(number.strip().lstrip("Ll"))
+    if isinstance(number, int):
+        if not (1 <= number <= len(evidence.lines)):
+            return False
+        text = evidence.lines[number - 1]
+        if parsed is None:
+            return bool(text.strip())
+        return _line_mentions(text, parsed)
+
+    want = _normalise(entry.get("evidence", ""))
     if not want:
         return False
-    haystack = _normalise(evidence.body)
-    return want in haystack
+    return want in _normalise(evidence.body)
+
+
+def _line_mentions(text: str, parsed: "ParsedAddr") -> bool:
+    """Does this source line actually name what the entry claims?"""
+    if parsed.form in ("absolute", "absolute_strided") and parsed.base_addr is not None:
+        tail = f"{parsed.base_addr:08x}"
+        return tail.lower() in text.lower() or _has_number(text, parsed.base_addr)
+    if parsed.offset == 0:
+        return "param_" in text or "*" in text
+    return _has_number(text, parsed.offset)
+
+
+def _has_number(text: str, value: int) -> bool:
+    """The value written as Ghidra writes it: hex, decimal, or negative-MEM1."""
+    forms = {f"0x{value:x}", f"0x{value:X}", str(value)}
+    if value >= _MEM1_LO:
+        forms.add(f"-0x{((1 << 32) - value):x}")
+    lowered = text.lower()
+    return any(form.lower() in lowered for form in forms)
 
 
 def _covers(entries: list[dict[str, Any]], reg_param: dict[str, int],
@@ -380,16 +429,20 @@ def validate_plan(plan: dict[str, Any], evidence: FunctionEvidence,
                 result.entries.append(verdict("malformed", f"width {width!r} is not capturable"))
                 continue
 
-            if require_citations and not _citation_ok(entry.get("evidence", ""), evidence):
-                result.entries.append(verdict(
-                    "citation_missing",
-                    f"cited line {_normalise(entry.get('evidence'))[:90]!r} is not a "
-                    f"line of {evidence.name}'s C"))
-                continue
-
+            # The address is parsed BEFORE the citation is judged, because a
+            # line-number citation is checked against what the entry claims:
+            # the cited line has to mention that offset or address itself.
             parsed = parse_addr(entry.get("addr", ""), reg_param)
             if parsed.error:
                 result.entries.append(verdict("malformed", parsed.error))
+                continue
+
+            if require_citations and not _citation_ok(entry, evidence, parsed):
+                cited = entry.get("line", _normalise(entry.get("evidence")))
+                result.entries.append(verdict(
+                    "citation_missing",
+                    f"citation {str(cited)[:90]!r} does not point at a line of "
+                    f"{evidence.name}'s C that mentions {entry.get('addr')!r}"))
                 continue
 
             # every inner load must itself be a real load in the C
@@ -525,20 +578,14 @@ _GOLD_C = """void FUN_800c42bc(int param_1)
 
 _GOLD_JSON = """{
   "reads": [
-    {"id": "a184_pre", "addr": "r3+0x184", "width": 4,
-     "evidence": "fVar2 = *(float *)(param_1 + 0x184) - *(float *)(param_1 + 0x44);"},
-    {"id": "a44", "addr": "r3+0x44", "width": 4,
-     "evidence": "fVar2 = *(float *)(param_1 + 0x184) - *(float *)(param_1 + 0x44);"},
-    {"id": "f_8744", "addr": "0x80438744", "width": 4,
-     "evidence": "fVar3 = FLOAT_80438744;"},
-    {"id": "f_875c", "addr": "0x8043875c", "width": 4,
-     "evidence": "fVar1 = fVar2 / FLOAT_8043875c;"}
+    {"id": "a184_pre", "addr": "r3+0x184", "width": 4, "line": 9},
+    {"id": "a44", "addr": "r3+0x44", "width": 4, "line": 9},
+    {"id": "f_8744", "addr": "0x80438744", "width": 4, "line": 8},
+    {"id": "f_875c", "addr": "0x8043875c", "width": 4, "line": 10}
   ],
   "writes": [
-    {"id": "w184", "addr": "r3+0x184", "width": 4,
-     "evidence": "*(float *)(param_1 + 0x184) = fVar2;"},
-    {"id": "w60", "addr": "r3+0x60", "width": 4,
-     "evidence": "*(float *)(param_1 + 0x60) = fVar1;"}
+    {"id": "w184", "addr": "r3+0x184", "width": 4, "line": 11},
+    {"id": "w60", "addr": "r3+0x60", "width": 4, "line": 12}
   ],
   "uncapturable_writes": [],
   "callee_owned": ["zz_00c42a8_ is an external ROM callee; anything it stores is not this function's write set"],
@@ -577,9 +624,21 @@ RULES = """RULES (each one exists because breaking it produced a wrong capture):
 9. STORES THROUGH A LOCAL POINTER ARE NOT CAPTURABLE. If the base is an
    allocator's return value or a stack buffer rather than an argument register,
    list it as text in `uncapturable_writes` -- never as a `writes` entry.
-10. EVERY entry needs an `evidence` field holding the EXACT, COMPLETE source
-    line it comes from, copied character for character from the C above. An
-    entry whose evidence line is not in the C is discarded."""
+10. EVERY entry needs a `line` field: the NUMBER of the source line it comes
+    from, as numbered in the C below. The line you name must itself contain
+    that offset or that address, or the entry is discarded. Give the number
+    only -- never copy the line text.
+11. BE COMPLETE, AND BE BRIEF. Emit every entry and nothing else: no prose, no
+    quoted source, no commentary between entries. A reply that runs out of room
+    before the `writes` array is closed is thrown away in full, so spend the
+    space on entries."""
+
+
+def _numbered(text: str) -> str:
+    """The C as the prompt shows it: one 1-based number per line, so an entry
+    can cite a line by NUMBER instead of copying it."""
+    return "\n".join(f"{index:4d}  {line}"
+                     for index, line in enumerate(text.splitlines(), 1))
 
 
 def build_prompt(fn: str, body: str, args: list[dict[str, str]],
@@ -591,13 +650,14 @@ def build_prompt(fn: str, body: str, args: list[dict[str, str]],
         f"{RULES}\n\n"
         f"SCHEMA -- reply with exactly this JSON shape:\n"
         f"```json\n{_GOLD_JSON}\n```\n\n"
-        f"That example is the correct answer for this function:\n"
-        f"```c\n{_GOLD_C}\n```\n\n"
+        f"That example is the correct answer for this function (the `line` "
+        f"numbers above refer to these numbers):\n"
+        f"```c\n{_numbered(_GOLD_C)}\n```\n\n"
         f"=== NOW DO THIS FUNCTION ===\n\n"
         f"Prototype: {prototype}\n"
         f"Argument registers (use THESE, not param_N):\n{reg_lines}\n"
         f"Arguments the capture tool cannot sample (ignore them):\n{skipped}\n\n"
-        f"```c\n{body}\n```\n\n"
+        f"```c\n{_numbered(body)}\n```\n\n"
         f"Derive the typed read set and write set for {fn}. Reply with ONE json "
         f"code block in the schema above and no other text."
     )
@@ -668,6 +728,8 @@ def assemble_plan(unit: str, fn: str, registry_entry: dict[str, Any],
             # a machine-derived plan reviewable at a glance
             if entry.get("evidence"):
                 item["evidence"] = _normalise(entry["evidence"])
+            if entry.get("line") is not None:
+                item["line"] = entry["line"]
             out.append(item)
         return out
 
