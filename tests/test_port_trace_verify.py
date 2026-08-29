@@ -20,6 +20,7 @@ import pytest
 
 from src.port_trace_verify import (
     GENERATED_BY,
+    SCENARIOS_RELPATH,
     VerifySkip,
     build_sidecar_entry,
     eligible_for_oracle_green,
@@ -28,6 +29,7 @@ from src.port_trace_verify import (
     plan_args,
     plan_path,
     plan_ret,
+    family_scenario_index,
     refresh_plans,
     select_scenario,
     summarize_result,
@@ -275,6 +277,45 @@ def test_scenario_heuristic_routes_title_chunk_and_defaults_battle():
     assert select_scenario("auto-c0013-004") == "title-attract"
     assert select_scenario("auto-c0001-007") == "battle-2v2-circle"
     assert select_scenario("damage-core") == "battle-2v2-circle"
+
+
+def _scenario(repo, name, live_families):
+    directory = repo / SCENARIOS_RELPATH
+    directory.mkdir(parents=True, exist_ok=True)
+    doc = {"scenario_schema": 1, "name": name, "save_state": None,
+           "inject": None, "game_state": name, "dtm": None}
+    if live_families is not None:
+        doc["live_families"] = live_families
+    (directory / f"{name}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_family_scenario_index_reads_measured_live_families(tmp_path):
+    _scenario(tmp_path, "battle-roster-0x801a10e8", ["0x801A10E8"])
+    _scenario(tmp_path, "unmeasured", None)
+    _scenario(tmp_path, "measured-empty", [])
+    index = family_scenario_index(tmp_path)
+    # canonicalized, and only scenarios that actually declare a family
+    assert index == {"0x801a10e8": "battle-roster-0x801a10e8"}
+
+
+def test_select_scenario_routes_to_the_family_that_made_it_live(tmp_path):
+    _scenario(tmp_path, "battle-roster-0x801a10e8", ["0x801a10e8"])
+    assert select_scenario(
+        "auto-c0050-000", repo_root=tmp_path, families={"0x801a10e8"}
+    ) == "battle-roster-0x801a10e8"
+
+
+def test_select_scenario_fails_open_when_no_scenario_covers_the_family(tmp_path):
+    _scenario(tmp_path, "battle-roster-0x801a10e8", ["0x801a10e8"])
+    # a family nobody has covered still falls back to the v1 heuristic, so the
+    # gate skips it visibly instead of the router inventing a state
+    assert select_scenario(
+        "auto-c0035-000", repo_root=tmp_path, families={"0x801301f8"}
+    ) == "battle-2v2-circle"
+    # and a caller that passes nothing behaves exactly as before
+    assert select_scenario("auto-c0050-000") == "battle-2v2-circle"
+    assert select_scenario("auto-c0050-000", repo_root=tmp_path,
+                           families=frozenset()) == "battle-2v2-circle"
 
 
 # ------------------------------------------------------- fail-closed tier gate
