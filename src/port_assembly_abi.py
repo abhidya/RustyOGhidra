@@ -3048,24 +3048,209 @@ def _on_directive_line(data: bytes, offset: int) -> bool:
     return data[line_start:offset].lstrip().startswith(bytes([35]))
 
 
+def _masked_code(data: bytes) -> bytes:
+    """`data` with every non-code byte (comment/literal) blanked to a space.
+
+    Offsets are preserved, so a match found in the result indexes the original
+    bytes directly.
+    """
+    mask = _code_mask(data)
+    return bytes(byte if mask[index] else 32 for index, byte in enumerate(data))
+
+
+def _declaration_matches(masked: bytes, symbol: str) -> list[re.Match[bytes]]:
+    """Every code-visible `symbol (` occurrence that is not a directive line.
+
+    This is THE module's definition of "this header declares `symbol`".
+    `_symbols_declared_more_than_once` counts these, and the header top-up in
+    `plan_canonicalization` now asks the same question before appending, so
+    the top-up can no longer manufacture the duplicate that function refuses
+    on: a header carrying the symbol in a different FORMAT used to fail a byte
+    SUBSTRING test, get a redundant second declaration appended, and turn a
+    decidable situation into `canonical_header_ambiguous`.
+
+    `masked` must come from `_masked_code`.
+    """
+    pattern = re.escape(symbol.encode("ascii")) + rb"\s*\("
+    return [
+        match
+        for match in re.finditer(pattern, masked)
+        if not (match.start() and masked[match.start() - 1] in _IDENTIFIER_BYTE)
+        and not _on_directive_line(masked, match.start())
+    ]
+
+
 def _symbols_declared_more_than_once(
     header: bytes, selected: Mapping[str, OwnerBinding]
 ) -> list[str]:
     """Canonicalized symbols with more than one declaration in this header."""
-    mask = _code_mask(header)
-    masked = bytes(byte if mask[index] else 32 for index, byte in enumerate(header))
-    repeated: list[str] = []
-    for symbol in sorted(selected):
-        pattern = re.escape(symbol.encode("ascii")) + rb"\s*\("
-        sites = [
-            match
-            for match in re.finditer(pattern, masked)
-            if not (match.start() and masked[match.start() - 1] in _IDENTIFIER_BYTE)
-            and not _on_directive_line(masked, match.start())
-        ]
-        if len(sites) > 1:
-            repeated.append(symbol)
-    return repeated
+    masked = _masked_code(header)
+    return [
+        symbol
+        for symbol in sorted(selected)
+        if len(_declaration_matches(masked, symbol)) > 1
+    ]
+
+
+def _header_declaration_site(header: bytes, symbol: str) -> tuple[str, int, int] | None:
+    """The header's own file-scope declarator span for `symbol`, or None.
+
+    Exactly the machinery `plan_canonicalization` scans the bundle with
+    (`_symbol_tokens` + `_site_for_token`), pointed at a DERIVED header after
+    the replacements have been applied -- so the span it returns can be
+    rewritten in place. None when the occurrence is not a classifiable
+    file-scope declarator (a call inside a static inline body, a
+    macro-mangled line); the top-up then leaves the header untouched rather
+    than guessing at a rewrite.
+    """
+    for token, start, end, depth in _symbol_tokens(header):
+        if token != symbol:
+            continue
+        discovered = _site_for_token(header, symbol, start, end, depth)
+        if discovered is not None:
+            return discovered
+    return None
+
+
+def _owner_declaration_is_unifiable(
+    present: AbiTuple, chosen: AbiTuple, result_unused: bool
+) -> bool:
+    """True when rewriting a header's PRESENT declaration of an owner symbol
+    to the bundle's CHOSEN prototype cannot change any call site's meaning.
+
+    The owner-path twin of `_sdk_variant_is_unifiable`, fail-closed in the
+    same places: the parameter lists must lower to the identical wasm
+    signature (`_parameters_are_abi_equivalent` refuses arity, variadic,
+    unknown spellings and genuine class changes), and a return divergence is
+    only safe when nothing in the bundle consumes the result.
+
+    Deliberately WITHOUT that function's `variant void -> canon value` free
+    pass. There, "the variant declares void" proves the one unit carrying it
+    cannot consume the result. Here `result_unused` is measured across the
+    WHOLE bundle, and the void/value fork this exists for is precisely the
+    case where a DIFFERENT unit consumes what the verified owner defines as
+    void (auto-c0025-002 assigning `zz_0089100_`, whose registry record
+    returns void, while auto-c0053-013 carries the owner's void prototype).
+    Silently picking either spelling there would declare one of the two units
+    wrong without evidence, so the fork falls through to the Clang probe and
+    refuses DECIDABLY as `owner_variant_abi_incompatible`.
+    """
+    if not _parameters_are_abi_equivalent(chosen, present):
+        return False
+    chosen_return = _base_spelling(" ".join(chosen.return_type.split()))
+    present_return = _base_spelling(" ".join(present.return_type.split()))
+    if chosen_return == present_return:
+        return True
+    chosen_void = chosen_return in {"void", "code"}
+    present_void = present_return in {"void", "code"}
+    if chosen_void and present_void:
+        return True
+    if not result_unused:
+        return False
+    if chosen_void or present_void:
+        return True
+    chosen_class = _wasm_value_class(chosen_return)
+    return chosen_class is not None and chosen_class == _wasm_value_class(present_return)
+
+
+def _reconcile_present_declaration(
+    parser: object,
+    parser_identity_sha256: str,
+    header: bytes,
+    symbol: str,
+    prototype_text: str,
+    unit: str,
+    origin_unit: str,
+    result_unused: bool,
+) -> bytes | AssemblyAbiRefusal:
+    """Settle a header that ALREADY declares `symbol`, but not verbatim.
+
+    Called only from the header top-up, and only when `_declaration_matches`
+    says the symbol is present while the chosen prototype's bytes are not.
+    Appending here is never right -- it is what produced the undecidable
+    `canonical_header_ambiguous`. Two sub-cases, both deliberate:
+
+    (a) the present declaration is type-COMPATIBLE and differs only in
+        spelling, parameter names or whitespace: leave the header exactly as
+        it is. The declaration site was already canonicalized by the owner
+        loop (or came in agreeing), so there is nothing to do and no evidence
+        to record.
+
+    (b) the present declaration is type-INCOMPATIBLE with the prototype the
+        bundle chose for this symbol: unify in place when
+        `_owner_declaration_is_unifiable` can prove no call site changes
+        meaning, otherwise run the same Clang owner/variant pair validation
+        the registry path runs and refuse `owner_variant_abi_incompatible`
+        naming the symbol and BOTH units. That refusal is decidable and
+        attributable; the append it replaces was neither.
+
+    No `CompatibilityEvidence` or `DiscardedVariant` is recorded: those
+    collections have already been sorted and key-checked by the time the
+    top-up runs, and this pair is a header/header disagreement rather than an
+    owner-registry binding against a source variant -- the same reason the
+    SDK canonicalization path keeps its probes out of `compatibility_checks`.
+    The refusal itself carries the probe's `source_sha256`.
+    """
+    site = _header_declaration_site(header, symbol)
+    if site is None:
+        # Present, but not as a declarator this module can classify. Nothing
+        # to rewrite and nothing to contest -- and critically, still no
+        # append, so the header keeps exactly one occurrence.
+        return header
+    kind, start, end = site
+    if kind == "definition":
+        return header  # a definition is the authority; the owner loop probed it
+    try:
+        present = parser.parse_declaration(header[start:end], symbol)  # type: ignore[attr-defined]
+        chosen = parser.parse_declaration(prototype_text.encode("utf-8"), symbol)  # type: ignore[attr-defined]
+    except AssemblyAbiError:
+        raise
+    except Exception as exc:
+        # The site loop wraps its parser calls; this one runs after it, so it
+        # needs the same guard or an adapter fault escapes the planner instead
+        # of becoming a refusal.
+        return AssemblyAbiRefusal(
+            "declarator_parser_fault", "canonicalize", f"parser adapter fault: {exc}"
+        )
+    if not _declarator_projection_is_valid(present, symbol) or not _declarator_projection_is_valid(chosen, symbol):
+        return AssemblyAbiRefusal(
+            "declarator_parser_fault",
+            "canonicalize",
+            f"parser returned malformed projection for {symbol}",
+        )
+    if present.canonical_prototype == chosen.canonical_prototype:
+        return header  # (a) identical type, different format
+    if not _probe_would_contest(chosen.abi_tuple, present.abi_tuple):
+        # Differs only where C itself says compatible (a top-level qualifier).
+        # The owner loop uses the same test to decide a probe would not
+        # contest the window; rewriting would churn the header for nothing.
+        return header
+    if not _owner_declaration_is_unifiable(present.abi_tuple, chosen.abi_tuple, result_unused):
+        try:
+            probe = parser.compatibility(present, chosen)  # type: ignore[attr-defined]
+        except AssemblyAbiError:
+            raise
+        except Exception as exc:
+            return AssemblyAbiRefusal(
+                "declarator_parser_fault", "canonicalize", f"parser adapter fault: {exc}"
+            )
+        if not _compatibility_probe_is_valid(probe, present, chosen, parser_identity_sha256):
+            return AssemblyAbiRefusal(
+                "declarator_parser_fault",
+                "canonicalize",
+                f"parser returned malformed compatibility probe for {symbol}",
+            )
+        if not probe.compatible:
+            return AssemblyAbiRefusal(
+                "owner_variant_abi_incompatible",
+                "canonicalize",
+                f"{symbol} is declared {present.canonical_prototype} in {unit}"
+                f" but {chosen.canonical_prototype} in {origin_unit};"
+                " the two declarations cannot be unified",
+                probe.source_sha256,
+                symbol=symbol,
+            )
+    return header[:start] + prototype_text.encode("utf-8") + header[end:]
 
 
 def _apply_replacements(data: bytes, replacements: Sequence[tuple[int, int, bytes]]) -> bytes:
@@ -3222,6 +3407,15 @@ def plan_canonicalization(
     # declaration site and then appending the owner's would leave two
     # contradictory declarations of one symbol in the same header.
     chosen_prototype: dict[str, str] = {}
+    # Which unit's declaration site established `chosen_prototype[symbol]`.
+    # Only used to ATTRIBUTE a top-up refusal: "declared X in A but Y in B" is
+    # actionable, "declared twice" is not.
+    chosen_origin: dict[str, str] = {}
+    unit_by_ordinal = {item.ordinal: item.unit for item in bundle.translation_units}
+    # Bundle-wide "no call consumes this symbol's result", memoised. The owner
+    # loop recomputed it per SITE; the header top-up needs the same answer, and
+    # the scan is linear in every source in the bundle.
+    result_unused_by_symbol: dict[str, bool] = {}
     # A unit.c carries both the auto-generated prototype and the verbatim
     # definition for the same symbol, so one owner/variant pair is compared
     # twice in one file. That is the same fact recorded twice, not ambiguity --
@@ -3262,10 +3456,13 @@ def plan_canonicalization(
                     "declarator_parser_fault", "canonicalize", f"parser returned malformed projection for {site.symbol}"
                 )
             placeholder = _is_unprototyped_placeholder(variant)
-            result_unused = all(
-                _every_call_discards_the_result(item.source, site.symbol)
-                for item in bundle.translation_units
-            )
+            result_unused = result_unused_by_symbol.get(site.symbol)
+            if result_unused is None:
+                result_unused = all(
+                    _every_call_discards_the_result(item.source, site.symbol)
+                    for item in bundle.translation_units
+                )
+                result_unused_by_symbol[site.symbol] = result_unused
             owner_defined_here = any(
                 item.unit == owner.unit for item in bundle.translation_units
             )
@@ -3313,6 +3510,7 @@ def plan_canonicalization(
                 # declaration variants are exactly this shape, so probing them
                 # fails closed on 84% of windows instead of resolving them.
                 chosen_prototype[site.symbol] = substitute
+                chosen_origin[site.symbol] = unit_by_ordinal.get(site.ordinal, site.relpath)
                 if site.kind == "declaration":
                     discard_key = (site.symbol, site.relpath, variant.canonical_prototype_sha256)
                     if discard_key not in seen_discarded:
@@ -3481,16 +3679,51 @@ def plan_canonicalization(
             header = _apply_replacements(item.header, replacements.get((item.ordinal, "header"), ()))
             source = _apply_replacements(item.source, replacements.get((item.ordinal, "source"), ()))
             macro_defined = _macro_defined_symbols(header)
+            # `_code_mask` is a per-byte scan, so mask once per unit and keep
+            # it in step with the header instead of re-masking per symbol.
+            masked = _masked_code(header)
             for symbol in sorted(selected):
                 if symbol in macro_defined:
                     continue
-                prototype = chosen_prototype.get(
+                prototype_text = chosen_prototype.get(
                     symbol, selected[symbol].normalized_prototype
-                ).encode("utf-8")
-                if prototype not in header:
+                )
+                prototype = prototype_text.encode("utf-8")
+                # SYMBOL-AWARE, not a byte substring: a header that declares
+                # the symbol in another format still declares it, and
+                # appending a second declaration is exactly what turned a
+                # decidable disagreement into `canonical_header_ambiguous`.
+                if not _declaration_matches(masked, symbol):
                     if header and not header.endswith(b"\n"):
                         header += b"\n"
+                        masked += b"\n"
                     header += prototype + b"\n"
+                    # The appended prototype is a normalized declaration: no
+                    # comments, no literals, so it masks to itself.
+                    masked += prototype + b"\n"
+                    continue
+                if prototype in header:
+                    continue  # already carried verbatim
+                if symbol not in result_unused_by_symbol:
+                    result_unused_by_symbol[symbol] = all(
+                        _every_call_discards_the_result(entry.source, symbol)
+                        for entry in bundle.translation_units
+                    )
+                settled = _reconcile_present_declaration(
+                    parser,
+                    owners.parser_identity.sha256,
+                    header,
+                    symbol,
+                    prototype_text,
+                    item.unit,
+                    chosen_origin.get(symbol, selected[symbol].unit),
+                    result_unused_by_symbol[symbol],
+                )
+                if isinstance(settled, AssemblyAbiRefusal):
+                    return settled
+                if settled is not header:
+                    header = settled
+                    masked = _masked_code(header)
             duplicated = _symbols_declared_more_than_once(header, selected)
             if duplicated:
                 # Two prototypes for one symbol will not compile, and a stubbed

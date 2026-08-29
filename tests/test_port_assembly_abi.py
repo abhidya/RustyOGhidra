@@ -3180,3 +3180,319 @@ def test_plan_refuses_malformed_sdk_canon(tmp_path: Path, mapping):
     refusal = abi.plan_canonicalization(_bundle(), snapshot, sdk_canon=mapping)
     assert isinstance(refusal, abi.AssemblyAbiRefusal)
     assert refusal.code == "sdk_canon_invalid"
+
+
+# --- symbol-aware header top-up (composition-ladder rung-1 regression) --------
+#
+# The canonicalized header top-up used to ask "is this prototype already here?"
+# with a byte SUBSTRING test.  A header that already declared the symbol in a
+# different FORMAT, or with a caller-side type divergence, failed that test,
+# got a redundant SECOND declaration appended, and then
+# `_symbols_declared_more_than_once` refused the whole plan as
+# `canonical_header_ambiguous` -- an undecidable refusal manufactured by the
+# top-up itself.  Composition-ladder rung 1 (N=10) died on exactly this:
+# "auto-c0053-013 declares zz_0089100_ more than once after canonicalization",
+# where the owner registry types zz_0089100_ `void` and auto-c0025-002 declares
+# AND consumes an `undefined8` return.
+
+
+class ShapeParser(FakeParser):
+    """A FakeParser that actually reads the return type and parameter list.
+
+    The base FakeParser hard-codes `void f(int)` for almost every fragment,
+    which cannot express a return-type fork.  This one lifts the spelling out
+    of the declarator text, and contests exactly what Clang contests for these
+    shapes: a differing base return type or parameter list.
+    """
+
+    @staticmethod
+    def _projection(fragment: bytes, symbol: str) -> abi.DeclaratorProjection:
+        text = " ".join(fragment.decode("utf-8").split())
+        match = re.search(rf"([A-Za-z_][\w \*]*?)\b{re.escape(symbol)}\s*\(", text)
+        return_type = "void"
+        if match:
+            words = [w for w in match.group(1).split() if w != "extern"]
+            if words:
+                return_type = " ".join(words)
+        params: tuple[str, ...] = ()
+        opening = text.find("(", match.end() - 1 if match else 0)
+        index = opening
+        if opening >= 0:
+            depth = 0
+            while index < len(text):
+                if text[index] == "(":
+                    depth += 1
+                elif text[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            inner = text[opening + 1 : index].strip()
+            if inner and inner != "void":
+                params = tuple(
+                    " ".join(part.split()[:-1]) if len(part.split()) > 1 else part.strip()
+                    for part in inner.split(",")
+                )
+        kind = "unspecified" if not params else None
+        canonical = "%s %s(%s);" % (return_type, symbol, ",".join(params) if params else "void")
+        return abi.DeclaratorProjection.synthetic(
+            symbol, canonical, return_type, params, prototype_kind=kind
+        )
+
+    def compatibility(
+        self,
+        left: abi.DeclaratorProjection,
+        right: abi.DeclaratorProjection,
+    ) -> abi.CompatibilityProbe:
+        incompatible = (
+            left.abi_tuple.return_type != right.abi_tuple.return_type
+            or left.abi_tuple.parameter_types != right.abi_tuple.parameter_types
+        )
+        source = abi.build_compatibility_source(left.canonical_prototype, right.canonical_prototype)
+        return abi.CompatibilityProbe(
+            compatible=not incompatible,
+            source=source,
+            source_sha256=hashlib.sha256(source).hexdigest(),
+            parser_identity_sha256=self.identity.sha256,
+        )
+
+
+_LADDER_SYMBOL = "zz_00262b4_"  # owner: void zz_00262b4_(int), unit auto-c0003-004
+
+
+def _shape_snapshot(root: Path) -> abi.OwnerSnapshot:
+    registry, parser = _write_product(root, parser=ShapeParser())
+    return abi.load_owner_snapshot(root, registry, parser)
+
+
+def _shape_bundle(objects: list[dict]) -> abi.AssemblyBundle:
+    items = []
+    for row in objects:
+        source = row["source"].encode()
+        header = row["header"].encode()
+        items.append(
+            abi.BundleTranslationUnit(
+                ordinal=row["ordinal"],
+                unit=row["unit"],
+                role=row["role"],
+                source_relpath=row["unit"] + "/unit.c",
+                source=source,
+                source_sha256=hashlib.sha256(source).hexdigest(),
+                header_relpath=row["unit"] + "/gnt4_shim.h",
+                header=header,
+                header_sha256=hashlib.sha256(header).hexdigest(),
+                object_relpath="objects/%04d-%s.o" % (row["ordinal"], row["unit"]),
+                compile_argv=("emcc", "-std=gnu11", "-c", row["unit"] + "/unit.c"),
+            )
+        )
+    base = abi.ToolWorld.synthetic("public-five-object-world")
+    tool_world = replace(
+        base,
+        identities=tuple(
+            abi.ToolIdentity(
+                identity.role,
+                FakeParser.identity.executable_path,
+                FakeParser.identity.binary_sha256,
+                FakeParser.identity.version_sha256,
+            )
+            if identity.role == "clang"
+            else identity
+            for identity in base.identities
+        ),
+        compile_argv=tuple(item.compile_argv for item in items),
+        inspect_argv=tuple(("llvm-nm", item.object_relpath) for item in items),
+    )
+    return abi.AssemblyBundle(
+        unit="auto-c0053-013",
+        attempt=1,
+        behavior_tier="compile_only",
+        translation_units=tuple(items),
+        tool_world=tool_world,
+    )
+
+
+def _derived_header_of(plan, unit: str) -> bytes:
+    return next(item.derived_header for item in plan.translation_units if item.unit == unit)
+
+
+# (1) The zz_0007cac_ shape: `extern void zz_0007cac_(double param_1, int
+# param_2);` against the owner's `void zz_0007cac_(double param_1,int
+# param_2);`.  Same type, different parameter spacing -- a pure false positive
+# for the byte-substring test.
+def test_format_different_declaration_is_already_declared():
+    header = b"extern void zz_0007cac_(double param_1, int param_2);\n"
+    prototype = b"void zz_0007cac_(double param_1,int param_2);"
+    # the defect: the bytes are absent, so the old test appended a second one
+    assert prototype not in header
+    # the fix: the module's own declaration parser sees it is already declared
+    assert abi._declaration_matches(abi._masked_code(header), "zz_0007cac_")
+    # and reconciling it is a no-op -- same type, so nothing to rewrite
+    settled = abi._reconcile_present_declaration(
+        ShapeParser(),
+        ShapeParser.identity.sha256,
+        header,
+        "zz_0007cac_",
+        prototype.decode(),
+        "auto-c0020-000",
+        "auto-c0000-008",
+        True,
+    )
+    assert settled == header
+    assert abi._symbols_declared_more_than_once(settled, {"zz_0007cac_": _Sym("zz_0007cac_")}) == []
+
+
+# (2) The renamed-symbol shape: the same disagreement on a symbol that carries
+# no encoded address at all.
+def test_renamed_symbol_declaration_is_already_declared():
+    symbol = "apply_actor_param_tier_delta_127"
+    header = ("extern void " + symbol + " ( int  actor , uint tier ) ;\n").encode()
+    prototype = "void " + symbol + "(int actor,uint tier);"
+    assert prototype.encode() not in header
+    assert abi._declaration_matches(abi._masked_code(header), symbol)
+    settled = abi._reconcile_present_declaration(
+        ShapeParser(), ShapeParser.identity.sha256, header, symbol, prototype,
+        "auto-c0030-014", "auto-c0030-000", True,
+    )
+    assert settled == header
+
+
+# (3) A symbol that really is absent must still be topped up.
+def test_absent_symbol_is_still_appended(tmp_path: Path):
+    snapshot = _shape_snapshot(tmp_path.resolve())
+    plan = abi.plan_canonicalization(
+        _shape_bundle(
+            [
+                {
+                    "ordinal": 0,
+                    "unit": "auto-c0000-000",
+                    "role": "window",
+                    "source": "int w(void){ " + _LADDER_SYMBOL + "(1); return 0; }\n",
+                    "header": "/* no declaration here at all */\n",
+                },
+                {
+                    "ordinal": 1,
+                    "unit": "auto-c0053-013",
+                    "role": "candidate",
+                    "source": (
+                        "void " + _LADDER_SYMBOL + "(int);\n"
+                        "/* ==== VERBATIM: synthetic.c 1-2 ==== */\n"
+                        "int candidate(void){ " + _LADDER_SYMBOL + "(1); return 7; }\n"
+                    ),
+                    "header": "extern void " + _LADDER_SYMBOL + "(int);\n",
+                },
+            ]
+        ),
+        snapshot,
+    )
+    assert isinstance(plan, abi.CanonicalizationPlan), getattr(plan, "detail", plan)
+    topped = _derived_header_of(plan, "auto-c0000-000")
+    assert ("void " + _LADDER_SYMBOL + "(int);").encode() in topped
+    assert abi._symbols_declared_more_than_once(topped, {_LADDER_SYMBOL: _Sym(_LADDER_SYMBOL)}) == []
+
+
+# (4) The live rung-1 shape.  One unit declares AND consumes a value return for
+# a symbol the verified owner types `void`; another carries the owner
+# prototype.  The append used to make this `canonical_header_ambiguous`, which
+# names neither the disagreement nor the units responsible.  It must refuse
+# DECIDABLY instead.
+def test_void_value_caller_fork_refuses_decidably_not_ambiguously(tmp_path: Path):
+    snapshot = _shape_snapshot(tmp_path.resolve())
+    refusal = abi.plan_canonicalization(
+        _shape_bundle(
+            [
+                {
+                    "ordinal": 0,
+                    "unit": "auto-c0025-002",
+                    "role": "window",
+                    "source": "int w(void){ int v = (int)" + _LADDER_SYMBOL + "(1); return v; }\n",
+                    "header": "extern undefined8 " + _LADDER_SYMBOL + "(int);\n",
+                },
+                {
+                    "ordinal": 1,
+                    "unit": "auto-c0053-013",
+                    "role": "candidate",
+                    "source": (
+                        "/* ==== VERBATIM: synthetic.c 1-2 ==== */\n"
+                        "int candidate(void){ " + _LADDER_SYMBOL + "(1); return 7; }\n"
+                    ),
+                    "header": "extern void " + _LADDER_SYMBOL + "(int);\n",
+                },
+            ]
+        ),
+        snapshot,
+    )
+    assert isinstance(refusal, abi.AssemblyAbiRefusal), refusal
+    assert refusal.code != "canonical_header_ambiguous"
+    assert refusal.code == "owner_variant_abi_incompatible"
+    assert refusal.symbol == _LADDER_SYMBOL
+    # decidable means ATTRIBUTED: the symbol and BOTH units are named.
+    assert _LADDER_SYMBOL in refusal.detail
+    assert "auto-c0053-013" in refusal.detail and "auto-c0025-002" in refusal.detail
+
+
+# (5) The same divergence with every call in a discard position unifies in
+# place instead: nothing reads the result, so the rewrite cannot change what
+# any call site means.
+def test_discard_position_divergent_caller_is_unified_in_place():
+    header = ("extern undefined8 " + _LADDER_SYMBOL + "(int);\n").encode()
+    prototype = "void " + _LADDER_SYMBOL + "(int);"
+    settled = abi._reconcile_present_declaration(
+        ShapeParser(), ShapeParser.identity.sha256, header, _LADDER_SYMBOL, prototype,
+        "auto-c0053-013", "auto-c0025-002", True,
+    )
+    assert isinstance(settled, bytes)
+    assert settled == prototype.encode() + b"\n"
+    assert abi._symbols_declared_more_than_once(settled, {_LADDER_SYMBOL: _Sym(_LADDER_SYMBOL)}) == []
+
+
+def _abi_tuple(ret, params):
+    return abi.AbiTuple(ret, tuple(params), "prototype", False)
+
+
+@pytest.mark.parametrize(
+    ("why", "present", "chosen", "result_unused", "expected"),
+    [
+        ("identical returns", _abi_tuple("void", ["int"]), _abi_tuple("void", ["uint"]), False, True),
+        ("void against code", _abi_tuple("void", ["int"]), _abi_tuple("code", ["int"]), False, True),
+        # the rung-1 fork: a void owner under a CONSUMING call site
+        ("void/value, consumed", _abi_tuple("void", ["int"]), _abi_tuple("int", ["int"]), False, False),
+        ("value/void, consumed", _abi_tuple("int", ["int"]), _abi_tuple("void", ["int"]), False, False),
+        ("void/value, discarded", _abi_tuple("void", ["int"]), _abi_tuple("int", ["int"]), True, True),
+        ("same class, discarded", _abi_tuple("uint", ["int"]), _abi_tuple("int", ["int"]), True, True),
+        ("class change", _abi_tuple("undefined8", ["int"]), _abi_tuple("int", ["int"]), True, False),
+        ("arity", _abi_tuple("void", ["int"]), _abi_tuple("void", ["int", "int"]), True, False),
+        ("pointee differs", _abi_tuple("void", ["const int *"]), _abi_tuple("void", ["float *"]), True, False),
+    ],
+)
+def test_owner_declaration_unifiability_matrix(why, present, chosen, result_unused, expected):
+    assert abi._owner_declaration_is_unifiable(present, chosen, result_unused) is expected, why
+
+
+# A call inside a header-local inline body is an occurrence, not a declaration.
+# Appending for it guaranteed the duplicate refusal; the top-up must leave it
+# alone rather than manufacture one.
+def test_a_header_call_site_is_not_a_missing_declaration():
+    header = (
+        "extern void " + _LADDER_SYMBOL + " ( int ) ;\n"
+        "static inline void wrap(int a){ " + _LADDER_SYMBOL + "(a); }\n"
+    ).encode()
+    assert len(abi._declaration_matches(abi._masked_code(header), _LADDER_SYMBOL)) == 2
+    site = abi._header_declaration_site(header, _LADDER_SYMBOL)
+    assert site is not None and site[0] == "declaration"
+
+
+def test_a_top_up_parser_fault_becomes_a_refusal_not_an_escape():
+    """The site loop wraps its parser calls; the top-up runs after it."""
+
+    class Exploding(ShapeParser):
+        def parse_declaration(self, source: bytes, symbol: str):
+            raise RuntimeError("adapter died")
+
+    settled = abi._reconcile_present_declaration(
+        Exploding(), Exploding.identity.sha256,
+        ("extern undefined8 " + _LADDER_SYMBOL + "(int);\n").encode(),
+        _LADDER_SYMBOL, "void " + _LADDER_SYMBOL + "(int);",
+        "auto-c0053-013", "auto-c0025-002", True,
+    )
+    assert isinstance(settled, abi.AssemblyAbiRefusal)
+    assert settled.code == "declarator_parser_fault"
