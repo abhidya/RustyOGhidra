@@ -628,7 +628,13 @@ RULES = """RULES (each one exists because breaking it produced a wrong capture):
     from, as numbered in the C below. The line you name must itself contain
     that offset or that address, or the entry is discarded. Give the number
     only -- never copy the line text.
-11. BE COMPLETE, AND BE BRIEF. Emit every entry and nothing else: no prose, no
+11. A CONDITIONAL STORE ALSO NEEDS A READ OF THE SAME BYTES. If the C stores to
+    `param_1 + X` only on some branches -- inside an `if`, or after an early
+    `return` -- add a read entry at that same address and width as well as the
+    write. On a call that takes a branch which does not store, the console's
+    value at X is whatever was already there, and the replay can only know it if
+    the capture recorded it. A store that runs on EVERY call needs no such read.
+12. BE COMPLETE, AND BE BRIEF. Emit every entry and nothing else: no prose, no
     quoted source, no commentary between entries. A reply that runs out of room
     before the `writes` array is closed is thrown away in full, so spend the
     space on entries."""

@@ -557,3 +557,13 @@ def test_line_citation_out_of_range_is_refused():
     plan = assemble_plan("u", name, REGISTRY_ENTRY, payload)
     result = validate_plan(plan, evidence, REGISTRY_ENTRY)
     assert any(e.status == "citation_missing" for e in result.entries)
+
+
+def test_prompt_teaches_the_conditional_write_pre_state_rule():
+    """Measured gap: without this rule the model produced a correct plan for
+    zz_0014b3c_ that still could not be specced, because four of its writes are
+    conditional and it declared no reads to seed them."""
+    args = [{"reg": "r3", "name": "param_1"}]
+    prompt = build_prompt("zz_0014b3c_", DECREMENT_C, args, "void f(int)", [])
+    assert "CONDITIONAL STORE ALSO NEEDS A READ" in prompt
+    assert "runs on EVERY call needs no such read" in prompt

@@ -614,10 +614,17 @@ def _emit_runner(fn: str, plan: dict[str, Any], evidence: FunctionEvidence,
 
     # compare declared writes
     add("    const fields = [];")
+    emitted_addrs: set[tuple[int | None, int]] = set()
     for entry in plan.get("writes") or []:
         parsed = parse_addr(entry.get("addr", ""), reg_param)
         width = int(entry.get("width") or 0)
         if parsed.form == "direct" and parsed.param in regions.roots:
+            # A model can declare the same address twice under two ids. Two
+            # comparisons of one address can disagree with each other, which
+            # would fail the case for a reason that is the plan's fault.
+            if (parsed.param, parsed.offset) in emitted_addrs:
+                continue
+            emitted_addrs.add((parsed.param, parsed.offset))
             name, _base = regions.roots[parsed.param]
             elem = _element_width(evidence, parsed.param, parsed.offset, width)
             is_float = str(_is_float(evidence, parsed.param, parsed.offset)).lower()
