@@ -774,6 +774,125 @@ class PlanDeriver:
         return out
 
 
+# --------------------------------------------------- model-free derivation
+
+# An indexed ROM table (`*(float *)(&DAT_8030316c + iVar3)`): the row the
+# console read depends on a runtime index, so the plan needs a strided address
+# expression AND the index's provenance. That is derivation, not extraction --
+# the static path refuses it and leaves the function to the model.
+_INDEXED_GLOBAL = re.compile(
+    r"[&(]\s*_?[A-Z]+_(?:8|9)[0-9a-fA-F]{7}\s*\)?\s*(?:\+\s*[A-Za-z_]|\[)"
+)
+
+
+def derive_plan_statically(unit: str, fn: str, registry_entry: dict[str, Any],
+                           evidence: FunctionEvidence
+                           ) -> tuple[dict[str, Any] | None, str]:
+    """A capture plan built from the static index alone -- no model.
+
+    Worth having for one reason the corpus survey makes plain: the exports whose
+    SPEC can be generated (no callees at all) are exactly the exports whose plan
+    the static pass already determines completely -- every access is a direct,
+    typed, parameter-relative load or store with the cast width right there in
+    the source. Asking a model to restate that adds a hallucination surface and
+    no information.
+
+    Returns (plan, "") or (None, reason). The refusals are the cases where real
+    derivation is needed: an indexed ROM table, a pointer chase whose object
+    layout has to be reasoned about, or a store through a non-argument base.
+    """
+    if real_callee_names(evidence):
+        return None, "function calls out; widths of callee-passed buffers need derivation"
+    if evidence.indirect_calls:
+        return None, "dispatches through a ROM function-pointer table (the replay traps)"
+    if _INDEXED_GLOBAL.search(evidence.body):
+        return None, "reads a runtime-indexed ROM table (needs a strided address expression)"
+    if evidence.has_local_base_writes():
+        return None, "stores through a non-argument base the capture cannot address"
+
+    args, skipped = plan_args(registry_entry.get("params") or [])
+    param_reg = {}
+    for arg in args:
+        match = re.match(r"param_(\d+)", str(arg.get("name") or ""))
+        if match:
+            param_reg.setdefault(int(match.group(1)), arg["reg"])
+
+    reads: list[dict[str, Any]] = []
+    writes: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    unconditional = evidence.unconditional_writes()
+
+    for access in evidence.direct_param_writes():
+        reg = param_reg.get(access.param)
+        if reg is None:
+            return None, f"param_{access.param} is not in an argument register"
+        key = ("w", access.param, access.offset)
+        if key in seen:
+            continue
+        seen.add(key)
+        writes.append({
+            "id": f"w{access.param}_{access.offset:x}",
+            "addr": f"{reg}+0x{access.offset:x}" if access.offset else reg,
+            "width": access.width or 4,
+            "evidence": _normalise(access.text),
+        })
+
+    for access in evidence.direct_param_reads():
+        reg = param_reg.get(access.param)
+        if reg is None:
+            return None, f"param_{access.param} is not in an argument register"
+        width = access.width or 4
+        if any(store.param == access.param and store.line < access.line
+               and store.offset <= access.offset
+               and access.offset + width <= store.offset + (store.width or 1)
+               for store in unconditional):
+            continue  # supplied by the function's own earlier unconditional store
+        key = ("r", access.param, access.offset)
+        if key in seen:
+            continue
+        seen.add(key)
+        reads.append({
+            "id": f"r{access.param}_{access.offset:x}",
+            "addr": f"{reg}+0x{access.offset:x}" if access.offset else reg,
+            "width": width,
+            "evidence": _normalise(access.text),
+        })
+
+    for access in evidence.accesses:
+        if access.kind != "absolute" or access.direction != "read":
+            continue
+        key = ("a", access.addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not access.width:
+            return None, f"ROM constant {access.addr:#x} has no width in the C"
+        reads.append({
+            "id": f"c_{access.addr:08x}",
+            "addr": f"0x{access.addr:08x}",
+            "width": access.width,
+            "evidence": _normalise(access.text),
+        })
+
+    if not writes:
+        return None, "no capturable store: a spec built on this would compare nothing"
+
+    payload = {
+        "reads": reads, "writes": writes,
+        "note": (f"Read/write sets extracted STATICALLY from the verbatim C by "
+                 f"src/port_c_evidence.py -- no model involved. Every entry is a "
+                 f"direct, typed, argument-relative access with its cast width "
+                 f"taken from the source line cited in each entry."),
+    }
+    return assemble_plan(unit, fn, registry_entry, payload), ""
+
+
+def real_callee_names(evidence: FunctionEvidence) -> set[str]:
+    from src.port_spec_emit import real_callees
+
+    return real_callees(evidence)
+
+
 def plan_output_path(repo_root: Path, unit: str, fn: str) -> Path:
     return Path(repo_root) / PLANS_RELPATH / f"{unit}.{fn}.json"
 

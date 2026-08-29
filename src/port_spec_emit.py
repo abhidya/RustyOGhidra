@@ -155,6 +155,10 @@ def classify_export(fn: str, evidence: FunctionEvidence, plan: dict[str, Any],
     sdk = sorted(c for c in callees if c.startswith("gnt4_"))
     unknown_sdk = [c for c in sdk if c not in SDK_SHIMS]
 
+    if evidence.indirect_calls:
+        reasons.append(
+            "dispatches through a ROM function-pointer table: staged wasm has no "
+            "address->function mapping, so the replay traps on every call")
     if rom:
         reasons.append(
             f"calls external ROM callee(s) {rom}: the callee may itself store into "

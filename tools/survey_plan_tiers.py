@@ -59,6 +59,8 @@ def tier_of(evidence, entry: dict) -> tuple[str, str]:
 
     if not writes and not local_writes:
         return "no_write_set", "function stores nothing a capture could compare"
+    if evidence.indirect_calls:
+        return "human", "dispatches through a ROM function-pointer table (replay traps)"
     if local_writes and not writes:
         return "human", "stores only through a non-argument base (allocator/stack)"
     if rom:

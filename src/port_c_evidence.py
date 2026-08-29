@@ -104,6 +104,12 @@ _PARAM_OFFSET = re.compile(r"\bparam_(\d+)\s*\+\s*(0x[0-9a-fA-F]+|\d+)")
 _PARAM_BARE = re.compile(r"\bparam_(\d+)\b")
 _HEX_LITERAL = re.compile(r"\b0x[0-9a-fA-F]+\b")
 _CALL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+# A call made through a code POINTER rather than a named symbol:
+# `(*(code *)(&PTR_FUN_8032e3b8)[idx])()`. There is no callee identifier, so a
+# name-based scan reports a callee-free function -- while the staged wasm traps
+# on the indirect call every time (staging units carry no address->wasm-table
+# mapping; gnt4_shim.h). Counted so tiering can refuse it.
+_INDIRECT_CALL = re.compile(r"\(\s*\*\s*\(\s*code\s*\*+\s*\)")
 
 # Identifiers that are never memory bases in decompiler output.
 _KEYWORDS = {
@@ -171,6 +177,7 @@ class FunctionEvidence:
     hex_literals: set[int] = field(default_factory=set)
     params: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
+    indirect_calls: int = 0
 
     # ---- queries used by the validator -------------------------------------
 
@@ -423,6 +430,14 @@ def analyse_function(name: str, body: str, params: Iterable[str] = ()) -> Functi
         evidence.globals_named.add(int(match.group(1), 16))
     for match in _HEX_LITERAL.finditer(source):
         evidence.hex_literals.add(int(match.group(0), 16))
+    # `(*(code *)(&PTR_FUN_8032e3b8)[idx])()` -- a dispatch through a ROM
+    # function-pointer table. It has no callee IDENTIFIER, so a name-based scan
+    # sees a callee-free function and calls it mechanical; the staged wasm
+    # actually traps on the indirect call every time, because staging units
+    # carry no address->wasm-table mapping (gnt4_shim.h). Counted separately so
+    # tiering can refuse it.
+    evidence.indirect_calls = len(_INDIRECT_CALL.findall(source))
+
     for match in _CALL.finditer(source):
         callee = match.group(1)
         if callee not in _KEYWORDS and callee != name:
