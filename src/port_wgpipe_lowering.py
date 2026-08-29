@@ -561,6 +561,42 @@ def _with_header_include(text: str, source_relpath: str) -> str:
     return include + text
 
 
+def header_problems(unit: str, header_relpath: str, text: str) -> list[WgpipeProblem]:
+    """Refuse a derived HEADER that performs a pipe store.
+
+    The rewriter only rewrites the derived .c sources the gate links. A pipe
+    store hidden in a header -- inside a `static inline` helper, or a
+    function-like macro body -- would be macro-expanded into every including
+    translation unit where the rewriter never looks, and would survive as an
+    out-of-bounds store. That is the one fail-open this lowering could have,
+    so it is closed by refusing rather than by rewriting: rewriting a header
+    would change a declaration shared by units the window did not lower.
+
+    A header that merely DEFINES the symbol (`#define DAT_cc008000 ...`,
+    `extern undefined4 DAT_cc008000;`) is not a store and passes -- after the
+    sources are lowered nothing dereferences it, so it is dead, not dangerous.
+    """
+    mask = mask_code(text)
+    problems: list[WgpipeProblem] = []
+    for match in _STORE.finditer(mask):
+        start = match.start("name")
+        if not _statement_start(mask, start):
+            continue
+        line = _line_of(text, start)
+        problems.append(
+            WgpipeProblem(
+                unit,
+                "wgpipe_header_store",
+                f"{header_relpath}:{line}: `{match.group(0).strip()}` performs a "
+                "write-gather store from a HEADER; the lowering rewrites derived "
+                "sources only, so this would expand into every including "
+                "translation unit as an out-of-bounds store",
+                line,
+            )
+        )
+    return problems
+
+
 def lower_window(sources: Iterable[tuple[str, str, str]]) -> WgpipeLowering:
     """Lower a whole window.
 

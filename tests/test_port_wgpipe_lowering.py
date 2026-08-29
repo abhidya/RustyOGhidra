@@ -36,6 +36,7 @@ from src.port_wgpipe_lowering import (
     WGPIPE_ABI_VERSION,
     WGPIPE_IMPORTS,
     header_include_path,
+    header_problems,
     lower_source,
     lower_window,
     lowering_evidence,
@@ -266,6 +267,49 @@ def test_one_bad_store_refuses_the_whole_source_even_beside_good_ones():
     out = lower_source("u", "u.c", source)
     assert out.text is None
     assert [p.code for p in out.problems] == ["wgpipe_unlowerable_site"]
+
+
+def test_a_header_that_declares_the_pipe_symbol_is_not_a_store():
+    """After the sources are lowered nothing dereferences the declaration, so
+    it is dead, not dangerous."""
+    header = (
+        "#define DAT_cc008000 (*(unsigned int *)(unsigned int)0xcc008000u)\n"
+        "extern unsigned int DAT_cc008004;\n"
+    )
+    assert header_problems("u", "u/gnt4_shim.h", header) == []
+
+
+def test_a_header_that_performs_a_pipe_store_refuses():
+    """The one fail-open the source rewriter could have: a store inside a
+    header expands into every including translation unit, where the rewriter
+    never looks. Closed by refusing, not by rewriting a shared declaration."""
+    header = "static inline void push(unsigned int v) { DAT_cc008000 = v; }\n"
+    found = header_problems("u", "u/gnt4_shim.h", header)
+    assert [f.code for f in found] == ["wgpipe_header_store"]
+    assert "u/gnt4_shim.h:1" in found[0].detail
+
+
+def test_gate_refuses_a_window_whose_derived_header_stores_to_the_pipe(tmp_path: Path):
+    from src.port_assembly_gate import CLASS_WGPIPE_LOWERING_FAILED, run_assembly_gate
+
+    shim = (
+        "#ifndef GNT4_SHIM_H\n#define GNT4_SHIM_H\n"
+        "static void gf_push(unsigned int v) { DAT_cc008000 = v; }\n"
+        "#endif\n"
+    )
+    units = [
+        _write_gate_unit(tmp_path / "staging/u1", "u1", "int a(int x){return x;}\n", ["a"], shim=shim),
+        _write_gate_unit(tmp_path / "staging/u2", "u2", "int b(int x){return x;}\n", ["b"], shim=shim),
+    ]
+    workdir = tmp_path / "assembly"
+    captured: dict[str, Any] = {}
+    result = run_assembly_gate(
+        units, workdir, _capture_runner(captured), wgpipe_lowering=True
+    )
+    assert result["passed"] is False
+    assert captured == {}
+    assert result["conflicts"][0]["class"] == CLASS_WGPIPE_LOWERING_FAILED
+    assert "wgpipe_header_store" in result["conflicts"][0]["detail"]
 
 
 # ------------------------------------------------- the whole export, measured

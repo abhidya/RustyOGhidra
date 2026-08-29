@@ -1940,6 +1940,9 @@ def _emit_wgpipe_lowering(
     from src.port_wgpipe_lowering import (
         HEADER_FILENAME,
         HEADER_TEXT,
+        WgpipeProblem,
+        WgpipeUnit,
+        header_problems,
         lower_window,
         lowering_evidence,
     )
@@ -1968,6 +1971,39 @@ def _emit_wgpipe_lowering(
         sources.append((unit_by_source[c_file], c_file, text))
 
     plan = lower_window(sources)
+    # Headers are DETECTED, never rewritten: a pipe store in a header expands
+    # into every including translation unit, where the source rewriter never
+    # looks, so it would survive as an out-of-bounds store. Gate-emitted
+    # headers are skipped -- this one is written below, and the dispatch
+    # companion's frame header is its own artifact.
+    gate_headers = {HEADER_FILENAME, "gf_dispatch_frame.h"}
+    for header in sorted(workdir.rglob("*.h")):
+        if header.name in gate_headers:
+            continue
+        relpath = header.relative_to(workdir).as_posix()
+        try:
+            header_text = header.read_text(encoding="utf-8-sig")
+        except OSError as error:
+            plan.units.append(
+                WgpipeUnit(
+                    unit=relpath,
+                    source_relpath=relpath,
+                    problems=[
+                        WgpipeProblem(
+                            relpath,
+                            "wgpipe_header_unreadable",
+                            f"cannot read derived header {relpath}: {error}",
+                            0,
+                        )
+                    ],
+                )
+            )
+            continue
+        found = header_problems(relpath, relpath, header_text)
+        if found:
+            plan.units.append(
+                WgpipeUnit(unit=relpath, source_relpath=relpath, problems=found)
+            )
     if plan.problems:
         result["conflicts"] = [
             _conflict_record(
