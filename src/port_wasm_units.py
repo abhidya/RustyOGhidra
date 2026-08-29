@@ -3296,6 +3296,15 @@ class WasmUnitDriver:
             dispatch_companion=(
                 os.getenv("OGHIDRA_PORT_DISPATCH_COMPANION", "") == "1"
             ),
+            # Write-gather-pipe lowering (src/port_wgpipe_lowering.py): the
+            # ROM's `DAT_cc008000 = ...` vertex stores become calls to the
+            # browser host's `__gf_gx_wgpipe_*` FIFO imports instead of
+            # out-of-bounds stores that trap. Env-gated for the same reason
+            # as the companion: the live gate stays byte-identical until the
+            # owner deliberately turns it on.
+            wgpipe_lowering=(
+                os.getenv("OGHIDRA_PORT_WGPIPE_LOWERING", "") == "1"
+            ),
         )
         if not verify_canonical_state_snapshot(snapshot):
             result["passed"] = False

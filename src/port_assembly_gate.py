@@ -358,6 +358,12 @@ CLASS_INSTANTIATION_FAILURE = "instantiation_failure"
 # silently without its dispatch table (design V4 H3: misses are DEFINED
 # behavior; an absent table is not).
 CLASS_DISPATCH_COMPANION_FAILED = "dispatch_companion_failed"
+# Write-gather-pipe lowering (src/port_wgpipe_lowering.py): a derived source
+# references the GameCube write-gather pipe (0xCC008000, the ROM's real vertex
+# submission path) in a shape the lowering cannot turn into a host import.
+# Always a loud refusal -- passing the store through leaves a literal
+# out-of-bounds access in the module, which is a runtime TRAP.
+CLASS_WGPIPE_LOWERING_FAILED = "wgpipe_lowering_failed"
 
 # Statements that look like `name (...) {` but are control flow, not
 # function definitions.
@@ -1474,6 +1480,7 @@ def run_assembly_gate(
     selection_evidence: dict[str, Any] | None = None,
     canonicalization: "CanonicalizationRequest | None" = None,
     dispatch_companion: bool = False,
+    wgpipe_lowering: bool = False,
 ) -> dict[str, Any]:
     """Run one N-unit assembly-gate pass. Pure orchestration: emcc and node
     arrive as injected runners.
@@ -1487,6 +1494,12 @@ def run_assembly_gate(
     __gf_dispatch and declaring the __gf_dispatch_miss host import. Default
     False keeps the live gate byte-identical until the driver deliberately
     opts in (the same introduction discipline as CanonicalizationRequest).
+
+    ``wgpipe_lowering`` opts the window into write-gather-pipe lowering
+    (src/port_wgpipe_lowering.py): the gate rewrites its own DERIVED sources
+    so that the ROM's `DAT_cc008000 = ...` vertex stores become calls to the
+    host's `__gf_gx_wgpipe_*` FIFO imports instead of out-of-bounds stores
+    that trap. Default False, same discipline.
     """
     names = [unit.name for unit in units]
     result: dict[str, Any] = {
@@ -1588,6 +1601,7 @@ def run_assembly_gate(
             smoke_runner,
             candidate,
             dispatch_companion=dispatch_companion,
+            wgpipe_lowering=wgpipe_lowering,
         )
 
     headers = [
@@ -1637,6 +1651,7 @@ def run_assembly_gate(
         smoke_runner,
         candidate,
         dispatch_companion=dispatch_companion,
+        wgpipe_lowering=wgpipe_lowering,
     )
 
 
@@ -1900,6 +1915,95 @@ def _emit_dispatch_companion(
     return True
 
 
+def _emit_wgpipe_lowering(
+    result: dict[str, Any],
+    units: list[UnitArtifact],
+    names: list[str],
+    workdir: Path,
+    c_files: list[str],
+) -> bool:
+    """Lower every write-gather-pipe store in this window's derived sources.
+
+    The ROM submits vertices by storing them to the memory-mapped pipe at
+    0xCC008000 rather than by calling a function (1143 such stores in the
+    export; docs/gx-hle-host.md section 3). The composed module's linear
+    memory ends long before that address, so the store traps. This rewrites
+    the GATE-OWNED derived sources -- the verbatim unit.c is never touched --
+    into calls to the host's `__gf_gx_wgpipe_*` FIFO imports, and writes the
+    header that declares them.
+
+    Any pipe reference the lowering cannot confidently turn into a call
+    populates ``result`` as a loud `wgpipe_lowering_failed` refusal and
+    returns False. Never a silent pass-through: a surviving literal store is
+    an out-of-bounds trap at draw time, which is worse than a refused window.
+    """
+    from src.port_wgpipe_lowering import (
+        HEADER_FILENAME,
+        HEADER_TEXT,
+        lower_window,
+        lowering_evidence,
+    )
+
+    result["stage"] = "wgpipe-lowering"
+    unit_by_source: dict[str, str] = {}
+    for c_file in c_files:
+        parts = Path(c_file).parts
+        unit_by_source[c_file] = parts[0] if len(parts) > 1 else Path(c_file).stem
+    sources: list[tuple[str, str, str]] = []
+    for c_file in c_files:
+        try:
+            text = (workdir / c_file).read_text(encoding="utf-8-sig")
+        except OSError as error:
+            result["conflicts"] = [
+                _conflict_record(
+                    None,
+                    CLASS_WGPIPE_LOWERING_FAILED,
+                    names,
+                    {},
+                    f"cannot read written source {c_file}: {error}",
+                )
+            ]
+            result["detail"] = f"wgpipe lowering refused: unreadable {c_file}"
+            return False
+        sources.append((unit_by_source[c_file], c_file, text))
+
+    plan = lower_window(sources)
+    if plan.problems:
+        result["conflicts"] = [
+            _conflict_record(
+                None,
+                CLASS_WGPIPE_LOWERING_FAILED,
+                [problem.unit],
+                {},
+                f"{problem.code}: {problem.detail}"[:600],
+            )
+            for problem in plan.problems
+        ]
+        result["detail"] = (
+            "wgpipe lowering refused: "
+            f"{len(plan.problems)} write-gather reference(s) could not be lowered; "
+            "a pass-through would be an out-of-bounds trap at draw time "
+            "(docs/gx-hle-host.md section 7.1)"
+        )
+        return False
+
+    if plan.store_count == 0:
+        # Nothing in this window touches the pipe. Write nothing, so an
+        # ON-flagged window with no GX code links byte-identically to an
+        # OFF one.
+        return True
+
+    (workdir / HEADER_FILENAME).write_text(HEADER_TEXT, encoding="utf-8", newline="\n")
+    for unit in plan.units:
+        if unit.text is None:
+            continue
+        (workdir / unit.source_relpath).write_text(
+            unit.text, encoding="utf-8", newline="\n"
+        )
+    result["wgpipe"] = lowering_evidence(plan)
+    return True
+
+
 def _link_and_smoke(
     result: dict[str, Any],
     units: list[UnitArtifact],
@@ -1910,6 +2014,7 @@ def _link_and_smoke(
     smoke_runner: Callable[[Path], tuple[bool, str]] | None,
     candidate: UnitArtifact | None,
     dispatch_companion: bool = False,
+    wgpipe_lowering: bool = False,
 ) -> dict[str, Any]:
     """Link, smoke, and re-verify artifact integrity.
 
@@ -1917,6 +2022,13 @@ def _link_and_smoke(
     canonicalization path so both compose under identical settings -- the gate
     must never pass under laxer conditions on one route than the other.
     """
+    if wgpipe_lowering:
+        # Write-gather-pipe lowering runs FIRST, so every later consumer of
+        # the written sources (the dispatch companion derives its signatures
+        # by re-reading them) sees the final text. It rewrites only pipe
+        # store statements, so no definition head moves.
+        if not _emit_wgpipe_lowering(result, units, names, workdir, c_files):
+            return result
     if dispatch_companion:
         # G2/H3: emit the address-keyed uniform-ABI dispatch companion as an
         # additional derived translation unit in the SAME link. Additive: the
@@ -1945,10 +2057,35 @@ def _link_and_smoke(
         exports.append(DISPATCH_EXPORT)
         exports.append(ARITY_EXPORT)
         allowed_extra.append(MISS_IMPORT)
+    if wgpipe_lowering:
+        from src.port_wgpipe_lowering import WGPIPE_IMPORTS
+
+        # The four FIFO imports are DECLARED host callees, exactly like the
+        # dispatch miss handler: without this the import scan would call the
+        # lowering's own output a disallowed import.
+        allowed_extra.extend(WGPIPE_IMPORTS)
     result["stage"] = "link"
     ok, error_text = link_runner(workdir, c_files, exports, allowed_extra)
     if not ok:
         conflicts = conflicts_from_link_error(error_text, names)
+        if wgpipe_lowering and "gf_gx_wgpipe" in (error_text or ""):
+            from src.port_wgpipe_lowering import HEADER_FILENAME
+
+            # The lowering header is gate-derived, so a diagnostic that names
+            # it (a failed _Static_assert, a stored expression whose type no
+            # _Generic association accepts) is a lowering failure, not a unit
+            # conflict: file it under the lowering class so it is attributable.
+            conflicts.insert(
+                0,
+                _conflict_record(
+                    None,
+                    CLASS_WGPIPE_LOWERING_FAILED,
+                    names,
+                    {},
+                    f"{HEADER_FILENAME} implicated in link failure: "
+                    + (error_text or "").strip()[-400:],
+                ),
+            )
         if dispatch_companion and "gf_dispatch_companion" in (error_text or ""):
             from src.port_dispatch_companion import COMPANION_FILENAME
 
