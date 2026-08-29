@@ -129,6 +129,14 @@ from src.port_progress import (
     journal_for,
 )
 from src.port_run_controller import find_gotyaforce_root
+from src.port_family_gate import (
+    FAMILY_NOT_LIVE,
+    FamilyIndex,
+    GateDecision,
+    blocked_inventory_summary,
+    decide as decide_family_gate,
+    scenario_live_families,
+)
 from src.port_trace_verify import (
     CAPTURE_TOOL_RELPATH,
     CORPORA_RELPATH,
@@ -6089,6 +6097,86 @@ class WasmUnitDriver:
             self._trace_registry_cache = cached
         return cached
 
+    def _family_index(self) -> FamilyIndex | None:
+        """The borg-family address index (src/port_family_gate.py), loaded
+        once per process. None when the coverage artifact is absent, which
+        DISABLES the gate rather than guessing a family."""
+        cached = getattr(self, "_family_index_cache", "unset")
+        if cached == "unset":
+            cached = FamilyIndex.load(self.repo_root)
+            self._family_index_cache = cached
+        return cached
+
+    def _family_gate(self, candidates: list[str]) -> dict[str, Any]:
+        """Evaluate borg-family liveness for every sweep candidate.
+
+        Returns the report block: which units are blocked (their gating
+        family is not live in the scenario they would be captured in), the
+        per-scenario liveness basis, and the blocked-inventory summary line.
+        Fail-open: a missing family index or an UNKNOWN scenario live set
+        blocks nothing, so the sweep degrades to its pre-gate behaviour.
+        """
+        index = self._family_index()
+        block: dict[str, Any] = {
+            "enabled": True,
+            "blocked": {},
+            "scenarios": {},
+            "summary": blocked_inventory_summary({}),
+            "units_considered": len(candidates),
+        }
+        if index is None:
+            block["enabled"] = False
+            block["disabled_reason"] = (
+                "no family index: research/decomp/data/"
+                "family-state-machine-coverage.json is missing or unusable"
+            )
+            block["summary"] = (
+                "family gate: DISABLED (no family index); "
+                "0 units skipped across 0 absent families"
+            )
+            return block
+        registry_fns = self._trace_registry_fns()
+        liveness_cache: dict[str, Any] = {}
+        blocked: dict[str, GateDecision] = {}
+        not_gated: dict[str, str] = {}
+        for name in candidates:
+            scenario = select_scenario(name)
+            liveness = liveness_cache.get(scenario)
+            if liveness is None:
+                liveness = scenario_live_families(self.repo_root, scenario)
+                liveness_cache[scenario] = liveness
+                block["scenarios"][scenario] = {
+                    "live_families": (
+                        sorted(liveness.families) if liveness.known else None
+                    ),
+                    "known": liveness.known,
+                    "basis": liveness.basis,
+                }
+            provenance = self._staged_provenance(name) or {}
+            exports = provenance.get("exported_functions") or []
+            decision = decide_family_gate(
+                index.unit_families(exports, registry_fns), liveness
+            )
+            if decision.selectable:
+                not_gated[name] = decision.reason
+            else:
+                blocked[name] = decision
+        block["blocked"] = {
+            name: {
+                "reason": FAMILY_NOT_LIVE,
+                "families": list(decision.families),
+                "family_labels": [index.label(f) for f in decision.families],
+                "scenario": decision.scenario,
+            }
+            for name, decision in blocked.items()
+        }
+        block["skip_reasons"] = {
+            name: decision.skip_reason(index) for name, decision in blocked.items()
+        }
+        block["selectable_reasons"] = not_gated
+        block["summary"] = blocked_inventory_summary(blocked, index)
+        return block
+
     def _trace_capture(
         self,
         name: str,
@@ -6429,6 +6517,7 @@ class WasmUnitDriver:
         retry_divergent: bool = False,
         cases: int = 120,
         promote: bool = True,
+        family_gate: bool = True,
         capture_runner: Any | None = None,
         harness_runner: Any | None = None,
     ) -> dict[str, Any]:
@@ -6436,7 +6525,16 @@ class WasmUnitDriver:
         product-priority first. Resilient: a Dolphin/stub crash records the
         attempt and moves on; Dolphin contention stops the sweep (never fight
         another process for the savestate). Operator-run (see
-        src.port_trace_verify docstring for the supervisor decision)."""
+        src.port_trace_verify docstring for the supervisor decision).
+
+        Candidates are gated on BORG-FAMILY LIVENESS first
+        (src/port_family_gate.py): a unit whose gating family is not live in
+        the scenario it would be captured in can only rediscover "the
+        function never fires", at ~15 minutes a unit, so it is skipped with
+        the structured reason ``family_not_live`` and counted in the report's
+        blocked inventory. ``family_gate=False`` (CLI ``--no-family-gate``)
+        restores un-gated selection for when a new savestate or DTM arrives
+        before the scenario's ``live_families`` is updated."""
         if not self.lock.acquire():
             raise RuntimeError(
                 "another wasm-units driver holds wasm-units.lock; "
@@ -6459,6 +6557,34 @@ class WasmUnitDriver:
                     and record.get("tier") == "compile_only"
                 ),
                 key=lambda name: (-self._unit_priority(name), name),
+            )
+            if family_gate:
+                gate = self._family_gate(candidates)
+                for name, reason in (gate.get("skip_reasons") or {}).items():
+                    report["skipped"][name] = reason
+                blocked_names = set(gate.get("blocked") or {})
+                candidates = [
+                    name for name in candidates if name not in blocked_names
+                ]
+            else:
+                gate = {
+                    "enabled": False,
+                    "disabled_reason": "--no-family-gate",
+                    "blocked": {},
+                    "scenarios": {},
+                    "units_considered": len(candidates),
+                    "summary": (
+                        "family gate: DISABLED (--no-family-gate); "
+                        "0 units skipped across 0 absent families"
+                    ),
+                }
+            report["family_gate"] = gate
+            self.events.emit(
+                "wasm_unit_verify_sweep_family_gate",
+                enabled=bool(gate.get("enabled")),
+                blocked=len(gate.get("blocked") or {}),
+                considered=gate.get("units_considered", 0),
+                summary=gate.get("summary", ""),
             )
             for name in candidates:
                 if len(report["attempted"]) >= max_units:
@@ -6523,6 +6649,7 @@ class WasmUnitDriver:
                 "wasm_unit_verify_sweep",
                 attempted=len(report["attempted"]),
                 skipped=len(report["skipped"]),
+                family_blocked=len(report["family_gate"].get("blocked") or {}),
                 stopped=report["stopped"],
             )
             return report
@@ -7258,6 +7385,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     sweep.add_argument("--cases", type=int, default=120, help="cases per export")
     sweep.add_argument(
+        "--no-family-gate", action="store_true",
+        help="do NOT gate candidates on borg-family liveness. By default a "
+        "unit whose gating family is absent from its scenario's declared "
+        "live_families is skipped as family_not_live (it could only "
+        "rediscover that the function never fires). Use this when a new "
+        "savestate/DTM makes families live that the scenario JSON does not "
+        "declare yet.",
+    )
+    sweep.add_argument(
         "--no-promote", action="store_true",
         help="publish sidecar entries on PASS but defer promotion to the "
         "driver's verification lane",
@@ -7353,7 +7489,12 @@ def main(argv: list[str] | None = None) -> int:
             retry_divergent=args.retry_divergent,
             cases=args.cases,
             promote=not args.no_promote,
+            family_gate=not args.no_family_gate,
         )
+        # The blocked inventory is normal sweep output, never behind a debug
+        # flag: it is the only place an operator sees how much of the staging
+        # queue this savestate cannot reach at all.
+        print((result.get("family_gate") or {}).get("summary", ""))
         print(json.dumps(result, indent=2))
         return 0
     if args.command == "d5-migrate":
