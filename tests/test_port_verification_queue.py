@@ -8,6 +8,7 @@ artifact move + registry re-tier + journaled commit), and the failure paths
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -16,6 +17,12 @@ import pytest
 
 from src.port_driver import EXIT_PROGRESSED
 from src.port_knowledge_registry import REGISTRY_RELPATH, empty_registry, save_registry
+from src.port_tiers import (
+    TIER_BOUNDARY_GREEN,
+    TIER_COMPILE_ONLY,
+    TIER_ORACLE_GREEN,
+    TIER_TRANSCRIPT_GREEN,
+)
 from src.port_wasm_units import (
     WasmUnitDriver,
     exports_sha256,
@@ -535,3 +542,509 @@ def test_run_state_counters_split_verified_from_staged(tmp_path, monkeypatch):
     counters = run_state["counters"]
     assert counters["units_verified"] == 1  # unit-b, just promoted
     assert counters["units_staged"] == 0
+
+
+# ------------------------------- per-FUNCTION console evidence (E6, the no-op)
+#
+# `_verification_candidates` returned [] on every driver pass because the only
+# source it could read was the oracle_green sidecar. The two console standards
+# that actually produced results -- transcript_green (16 passing functions) and
+# boundary_green -- were invisible to it. These tests cover the second source,
+# and above all they cover the bar it must NOT drop below.
+
+TRANSCRIPT_WASM = b"\x00asm-evidence"
+TRANSCRIPT_WASM_SHA = (
+    "d6e5f7e4d4d0d6b62b3e9d18a5cbf1cc7f6e9a5b8e0f5b1c6c85a0d3a02b1f47"
+)
+
+
+def _transcript_artifact(
+    unit: str, export: str, wasm_sha: str, over: dict | None = None
+) -> dict:
+    """A minimally-complete transcript_green result artifact, shaped exactly
+    like the committed ones in research/decomp/data/oracle-results."""
+    payload = {
+        "result_schema": 1,
+        "standard": "transcript_green",
+        "unit": unit,
+        "fn": export,
+        "claim": {"established": True, "weaker_than": "oracle_green"},
+        "harness": {
+            "entry": "research/decomp/oracle-harness/run-transcript.mjs",
+            "min_cases": 8,
+        },
+        "wasm": {"path": f"/staging/{unit}/unit.wasm", "sha256": wasm_sha},
+        "capture": {
+            "file": f"research/decomp/oracle-harness/corpora/{unit}.{export}"
+                    ".transcript.jsonl",
+            "cases": 24,
+        },
+        "function": {"export": export},
+        "cases_passed": 24,
+        "calls_matched": 24,
+        "vacuous_cases": [],
+        "divergence": None,
+        "verdict": "pass",
+    }
+    payload.update(over or {})
+    return payload
+
+
+def _staged_with_evidence(
+    tmp_path: Path, exports: list[str], artifacts: dict[str, dict] | None = None
+) -> Path:
+    """A repo whose `unit-b` is a staged compile-only green with `exports`, and
+    whose oracle-results directory holds `artifacts` (keyed by export)."""
+    repo = _write_repo(tmp_path)
+    (repo / "research/decomp/data/oracle-commands.json").unlink()
+    staged = repo / "research/decomp/port-units-staging/unit-b"
+    (staged / "unit.wasm").write_bytes(TRANSCRIPT_WASM)
+    sha = hashlib.sha256(TRANSCRIPT_WASM).hexdigest()
+    (staged / "provenance.json").write_text(
+        json.dumps({
+            "unit": "unit-b",
+            "exported_functions": exports,
+            "verified": False,
+            "tier": "compile_only",
+        }),
+        encoding="utf-8",
+    )
+    results = repo / "research/decomp/data/oracle-results"
+    results.mkdir(parents=True, exist_ok=True)
+    for export, payload in (
+        artifacts
+        if artifacts is not None
+        else {name: _transcript_artifact("unit-b", name, sha) for name in exports}
+    ).items():
+        (results / f"unit-b.{export}.transcript.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    return repo
+
+
+def test_partial_function_evidence_is_not_a_candidate_but_is_reported(tmp_path):
+    """The live shape today: every unit with console evidence has 1-3 of its
+    8 exports verified. It must not promote, and it must not be silent."""
+    sha = hashlib.sha256(TRANSCRIPT_WASM).hexdigest()
+    repo = _staged_with_evidence(
+        tmp_path, ["e0", "e1", "e2"],
+        {"e0": _transcript_artifact("unit-b", "e0", sha)},
+    )
+    driver = _driver(repo)
+
+    assert driver._verification_candidates(_state(repo)) == []
+
+    scanned = [e for e in _events(repo) if e["kind"] == "function_evidence_scanned"]
+    assert len(scanned) == 1
+    assert scanned[0]["covered"] == 1 and scanned[0]["total"] == 3
+    assert scanned[0]["tier"] is None
+    assert sorted(scanned[0]["uncovered"]) == ["e1", "e2"]
+
+
+def test_full_coverage_function_evidence_becomes_a_candidate(tmp_path):
+    repo = _staged_with_evidence(tmp_path, ["e0", "e1"])
+    driver = _driver(repo)
+    assert driver._verification_candidates(_state(repo)) == ["unit-b"]
+
+
+def test_evidence_for_other_wasm_bytes_is_refused(tmp_path):
+    """claim-honesty rule 8: a result artifact records the sha256 of the wasm
+    it replayed. Evidence about other bytes is evidence about another binary,
+    and this binding is STRICTER than the sidecar's export-set hash."""
+    repo = _staged_with_evidence(
+        tmp_path, ["e0"], {"e0": _transcript_artifact("unit-b", "e0", "00" * 32)}
+    )
+    driver = _driver(repo)
+
+    assert driver._verification_candidates(_state(repo)) == []
+    scanned = [e for e in _events(repo) if e["kind"] == "function_evidence_scanned"]
+    assert any("claim-honesty rule 8" in r for r in scanned[0]["refused"])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "needle"),
+    [
+        ({"verdict": "fail"}, "verdict is 'fail'"),
+        ({"divergence": {"case": 0}}, "divergence recorded"),
+        ({"claim": {"established": False}}, "claim.established is not True"),
+        ({"vacuous_cases": [1, 2]}, "vacuous case"),
+        ({"cases_passed": 0}, "cases_passed 0"),
+        ({"cases_passed": 3}, "below min_cases 8"),
+        ({"result_schema": 2}, "result_schema 2 is not 1"),
+        ({"standard": "oracle_green"}, "not a per-function verified tier"),
+        ({"standard": "spine_green"}, "not a per-function verified tier"),
+        ({"rehearsal": True}, "rehearsal-stamped"),
+        ({"harness": {"entry": "run-unit.mjs", "min_cases": 8}},
+         "is not run-transcript.mjs"),
+        ({"unit": "someone-else"}, "artifact names unit"),
+        ({"fn": "not_an_export", "function": {"export": "not_an_export"}},
+         "not in the staged provenance export set"),
+        ({"fn": "e0", "function": {"export": "e_other"}},
+         "does not name exactly one export"),
+        ({"wasm": {"sha256": None}}, "claim-honesty rule 8"),
+    ],
+)
+def test_every_admission_check_is_fail_closed(tmp_path, mutation, needle):
+    """One mutation per check, mirroring the mutant discipline the oracle
+    harnesses already use. A missing or wrong field is a REFUSAL, never a
+    default-pass."""
+    sha = hashlib.sha256(TRANSCRIPT_WASM).hexdigest()
+    repo = _staged_with_evidence(
+        tmp_path, ["e0"],
+        {"e0": _transcript_artifact("unit-b", "e0", sha, mutation)},
+    )
+    driver = _driver(repo)
+
+    assert driver._verification_candidates(_state(repo)) == []
+    scanned = [e for e in _events(repo) if e["kind"] == "function_evidence_scanned"]
+    assert any(needle in reason for reason in scanned[0]["refused"]), scanned[0]
+
+
+def test_a_mixed_unit_never_promotes(tmp_path):
+    """Full coverage, two incomparable standards: MIXED, and mixed is not a
+    tier a unit may be promoted to."""
+    sha = hashlib.sha256(TRANSCRIPT_WASM).hexdigest()
+    boundary = {
+        "result_schema": 1,
+        "standard": "boundary_green",
+        "unit": "unit-b",
+        "harness": {"entry": "research/decomp/oracle-harness/run-spine.mjs"},
+        "wasm": {"sha256": sha},
+        "capture": {"file": "research/decomp/oracle-harness/corpora/b.jsonl"},
+        "spine": {"export": "e1"},
+        "calls_matched": 274,
+        "divergence": None,
+        "verdict": "pass",
+    }
+    repo = _staged_with_evidence(
+        tmp_path, ["e0", "e1"],
+        {"e0": _transcript_artifact("unit-b", "e0", sha)},
+    )
+    (repo / "research/decomp/data/oracle-results/unit-b.e1.boundary.json").write_text(
+        json.dumps(boundary), encoding="utf-8"
+    )
+    driver = _driver(repo)
+
+    assert driver._verification_candidates(_state(repo)) == []
+    scanned = [e for e in _events(repo) if e["kind"] == "function_evidence_scanned"]
+    assert scanned[0]["tier"] == "mixed"
+    assert scanned[0]["covered"] == scanned[0]["total"] == 2
+
+
+def test_promotion_by_function_evidence_records_transcript_green_not_oracle_green(
+    tmp_path,
+):
+    """The whole point: a console-derived pass now moves the ledger -- to the
+    tier it actually earned, and to no stronger one."""
+    repo = _staged_with_evidence(tmp_path, ["e0", "e1"])
+    driver = _driver(repo)
+    state = _state(repo)
+
+    result = driver._reverify_unit_inner("unit-b", state)
+
+    assert result["promoted"] is True
+    assert state["units"]["unit-b"]["tier"] == TIER_TRANSCRIPT_GREEN
+    provenance = json.loads(
+        (repo / "research/decomp/port-units/unit-b/provenance.json").read_text()
+    )
+    assert provenance["tier"] == TIER_TRANSCRIPT_GREEN
+    assert provenance["previous_tier"] == TIER_COMPILE_ONLY
+    promoted = [e for e in _events(repo) if e["kind"] == "verdict_promoted"]
+    assert promoted and promoted[0]["tier"] == TIER_TRANSCRIPT_GREEN
+
+    # the spec it published is durable, reviewable, and one replay per export
+    sidecar = json.loads(
+        (repo / "research/decomp/data/oracle-commands.json").read_text()
+    )
+    entry = sidecar["units"]["unit-b"]
+    assert entry["tier"] == TIER_TRANSCRIPT_GREEN
+    assert [step["export"] for step in entry["oracle"]["steps"]] == ["e0", "e1"]
+    for step in entry["oracle"]["steps"]:
+        assert "run-transcript.mjs" in step["command"]
+        assert "--min-cases" in step["command"]
+        assert "TRANSCRIPT_GREEN" in step["success_patterns"][0]
+
+
+# ------------------------------------------- sidecar discipline for the steps
+
+
+def _steps_entry(exports: list[str], **over) -> dict:
+    steps = [
+        {
+            "export": name,
+            "command": ["node", "run-transcript.mjs", "--capture", f"{name}.jsonl"],
+            "cwd": "research/decomp/oracle-harness",
+            "env": {"ORACLE_WASM": "{wasm}"},
+            "success_patterns": ["(?m)^.*VERDICT: TRANSCRIPT_GREEN$"],
+        }
+        for name in exports
+    ]
+    entry = {
+        "exports_sha256": exports_sha256(exports),
+        "tier": TIER_TRANSCRIPT_GREEN,
+        "oracle": {"steps": steps},
+    }
+    entry.update(over)
+    return entry
+
+
+def test_a_steps_entry_must_cover_every_export():
+    problems = validate_oracle_entry(
+        "unit-b", _steps_entry(["e0"]), exports=["e0", "e1"]
+    )
+    assert any("no replay step for ['e1']" in p for p in problems)
+
+
+def test_a_steps_entry_must_pin_its_own_standards_total_line():
+    entry = _steps_entry(["e0"])
+    entry["oracle"]["steps"][0]["success_patterns"] = [
+        "(?m)^ORACLE TOTAL functions=1/1 cases=10 UNEXPLAINED: 0 VERDICT: PASS$"
+    ]
+    problems = validate_oracle_entry("unit-b", entry, exports=["e0"])
+    assert any("TRANSCRIPT_GREEN" in p for p in problems)
+
+
+def test_a_per_function_tier_may_not_use_the_single_command_form():
+    entry = _entry(["zz_b_"])
+    entry["tier"] = TIER_TRANSCRIPT_GREEN
+    problems = validate_oracle_entry("unit-b", entry, exports=["zz_b_"])
+    assert any("requires oracle.steps" in p for p in problems)
+
+
+def test_an_unknown_tier_on_a_sidecar_entry_is_refused():
+    """The promotion gate stays an ALLOWLIST. A sidecar entry declaring a tier
+    outside VERIFIED_TIERS cannot promote anything, whatever it replays."""
+    for tier in ("compile_only", "green", "transcript-green", None, 7):
+        entry = _steps_entry(["e0"], tier=tier)
+        problems = validate_oracle_entry("unit-b", entry, exports=["e0"])
+        assert any("is not a verified tier" in p for p in problems), tier
+
+
+def test_an_entry_without_a_tier_is_still_an_oracle_green_entry():
+    """Bit-identical behaviour for every entry written before the field
+    existed -- and defaulting to the STRONGEST standard is the one default
+    that cannot silently weaken a claim."""
+    assert validate_oracle_entry("unit-b", _entry(["zz_b_"]), exports=["zz_b_"]) == []
+
+
+def test_run_oracle_dispatches_to_steps_and_ANDs_them(tmp_path, monkeypatch):
+    """Every step must pass. One red step reds the unit, and the summary names
+    which -- conjunction, never disjunction."""
+    repo = _write_repo(tmp_path)
+    driver = _driver(repo, oracle_runner=None)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        good = "TRANSCRIPT TOTAL cases=24/24 calls=24/24 rets=0 " \
+               "DIVERGENCE: none VERDICT: TRANSCRIPT_GREEN"
+        bad = "TRANSCRIPT DIVERGENCE: case 3"
+        ok = "e1.jsonl" not in " ".join(command)
+        return subprocess.CompletedProcess(
+            args=command, returncode=0 if ok else 1,
+            stdout=good if ok else bad, stderr="",
+        )
+
+    monkeypatch.setattr("src.port_wasm_units.subprocess.run", fake_run)
+    monkeypatch.setattr("src.port_wasm_units.resolve_node_exe", lambda: "node")
+
+    passed, summary, log = driver._run_oracle(
+        {"name": "unit-b", "oracle": _steps_entry(["e0"])["oracle"]},
+        repo / "unit.wasm",
+    )
+    assert passed is True and len(calls) == 1
+    assert "TRANSCRIPT_GREEN" in log
+
+    passed, summary, log = driver._run_oracle(
+        {"name": "unit-b", "oracle": _steps_entry(["e0", "e1"])["oracle"]},
+        repo / "unit.wasm",
+    )
+    assert passed is False
+    assert "FAILED at e1" in summary
+    assert len(calls) == 3          # every step is still run, for the log
+
+
+def test_all_three_counters_agree_on_one_state(tmp_path):
+    """The asymmetry that made the defect dangerous: `run-state.json`'s
+    `units_verified` used the correct positive predicate while
+    `port_contract.queue_status` and `port_progress.classify_counts` used
+    "not compile_only", so two files published by the SAME run disagreed --
+    and the looser number is the one in the README banner. They must now be
+    the same predicate, on the same allowlist, over the same records.
+
+    The mixture below is the live ledger's own shape: an oracle_green unit, a
+    staged compile-only unit, and green records with no tier at all
+    (`damage-core` and `knockback-core` carry exactly that).
+    """
+    from src.port_contract import queue_status
+    from src.port_progress import classify_counts
+
+    repo = _write_repo(tmp_path)
+    records = {
+        "u-oracle": {"status": "green", "tier": "oracle_green"},
+        "u-transcript": {"status": "green", "tier": "transcript_green"},
+        "u-boundary": {"status": "green", "tier": "boundary_green"},
+        "u-staged": {"status": "green", "tier": "compile_only"},
+        "u-notier": {"status": "green"},
+        "u-typo": {"status": "green", "tier": "oracle-green"},
+        "u-red": {"status": "red_retryable"},
+    }
+    (repo / RUN_ROOT / "wasm-units-state.json").write_text(
+        json.dumps({"state_schema": 1, "units": records}), encoding="utf-8"
+    )
+    (repo / RUN_ROOT / "wasm-units.json").write_text(
+        json.dumps({"queue_schema": 1,
+                    "units": [{"name": name} for name in records]}),
+        encoding="utf-8",
+    )
+    driver = _driver(repo)
+    driver._write_progress({"units": records}, "running")
+    counters = json.loads(
+        (repo / RUN_ROOT / "run-state.json").read_text()
+    )["counters"]
+    progress = classify_counts(records)
+    contract = queue_status(repo, "wasm_units")["counts"]
+
+    assert counters["units_verified"] == progress["green"] == contract["green"] == 3
+    assert counters["units_staged"] == progress["staged"] == contract["staged"] == 1
+    assert (
+        counters["units_unknown_tier"]
+        == progress["unknown_tier"]
+        == contract["unknown_tier"]
+        == 2
+    )
+    # and the weaker standards are never totalled into the write-verified one
+    assert counters["units_write_verified"] == 1
+    assert counters["units_verified_by_tier"] == {
+        "boundary_green": 1, "oracle_green": 1, "transcript_green": 1,
+    }
+
+
+# ------------------------------ source 3: a committed unit-level <unit>.json
+
+
+def _unit_result(
+    unit: str, exports: list[str], wasm_sha: str, over: dict | None = None
+) -> dict:
+    functions = [
+        {"name": name, "verdict": "pass", "cases": 100, "exact": 100,
+         "rounding_explained": 0, "unexplained": 0}
+        for name in exports
+    ]
+    payload = {
+        "result_schema": 1,
+        "unit": unit,
+        "verdict": "pass",
+        "reference_kind": "dolphin_trace",
+        "wasm": {"sha256": wasm_sha},
+        "export_coverage": {
+            "covered": len(exports), "exported": len(exports), "uncovered": [],
+        },
+        "functions": functions,
+        "coverage": {
+            "offsets_read_unwritten": 0, "sentinel_reads_detected": False,
+            "stray_writes": [], "class_mismatches": [],
+        },
+    }
+    payload.update(over or {})
+    return payload
+
+
+def _with_unit_result(
+    tmp_path: Path, exports: list[str], over: dict | None = None
+) -> Path:
+    repo = _staged_with_evidence(tmp_path, exports, {})
+    sha = hashlib.sha256(TRANSCRIPT_WASM).hexdigest()
+    (repo / "research/decomp/data/oracle-results/unit-b.json").write_text(
+        json.dumps(_unit_result("unit-b", exports, sha, over)), encoding="utf-8"
+    )
+    return repo
+
+
+def test_a_committed_full_coverage_unit_result_is_a_candidate(tmp_path):
+    repo = _with_unit_result(tmp_path, ["e0", "e1"])
+    driver = _driver(repo)
+    assert driver._verification_candidates(_state(repo)) == ["unit-b"]
+    entry, reasons = driver._unit_result_entry("unit-b", ["e0", "e1"])
+    assert reasons == []
+    # the oracle_green form: ONE command, and the ORACLE TOTAL line pinned
+    assert entry["oracle"]["command"][:2] == ["node", "run-unit.mjs"]
+    assert "VERDICT: PASS" in entry["oracle"]["success_patterns"][0]
+    assert entry.get("tier", "oracle_green") == "oracle_green"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "needle"),
+    [
+        ({"verdict": "partial"}, "verdict is 'partial'"),
+        ({"verdict": "fail"}, "verdict is 'fail'"),
+        ({"export_coverage": {"covered": 1, "exported": 2, "uncovered": ["e1"]}},
+         "is not full"),
+        ({"rehearsal": True}, "rehearsal-stamped"),
+        ({"result_schema": 2}, "result_schema 2 is not 1"),
+        ({"unit": "other"}, "artifact names unit"),
+        ({"wasm": {"sha256": "ab" * 32}}, "claim-honesty rule 8"),
+        ({"coverage": {"offsets_read_unwritten": 1,
+                       "sentinel_reads_detected": False,
+                       "stray_writes": [], "class_mismatches": []}},
+         "declared-read offsets unwritten"),
+    ],
+)
+def test_a_unit_result_that_verify_unit_would_refuse_never_promotes(
+    tmp_path, mutation, needle
+):
+    """Source 3 adds a source, not a shortcut: it runs the SAME
+    eligible_for_oracle_green gate verify-unit runs, plus a staged-bytes
+    binding that gate never had."""
+    repo = _with_unit_result(tmp_path, ["e0", "e1"], mutation)
+    driver = _driver(repo)
+    assert driver._verification_candidates(_state(repo)) == []
+    scanned = [e for e in _events(repo) if e["kind"] == "unit_result_scanned"]
+    assert scanned, "the refusal must be reported, not silent"
+    assert any(needle in reason for reason in scanned[0]["refused"]), scanned[0]
+
+
+def test_a_unit_result_promotes_to_oracle_green(tmp_path):
+    repo = _with_unit_result(tmp_path, ["e0", "e1"])
+    driver = _driver(repo)
+    state = _state(repo)
+    result = driver._reverify_unit_inner("unit-b", state)
+    assert result["promoted"] is True
+    assert state["units"]["unit-b"]["tier"] == TIER_ORACLE_GREEN
+
+
+def test_a_transcript_green_promotion_never_promotes_registry_entries(tmp_path):
+    """port_knowledge_registry reserves AUTHORITATIVE injection for
+    oracle_green, and `promote_unit_entries` writes that tier unconditionally.
+    A transcript_green promotion must therefore leave the unit's harvested
+    decisions advisory -- otherwise a callee-boundary claim would be relabelled
+    write-verified inside the artifact that decides what gets injected into
+    every later unit's prompt (claim-honesty rule 3)."""
+    repo = _staged_with_evidence(tmp_path, ["e0", "e1"])
+    registry = empty_registry()
+    registry["entries"]["dat:0x80000000"] = {
+        "kind": "dat_typing",
+        "symbol": "DAT_80000000",
+        "macro": "#define DAT_80000000 (*(unsigned char *)(unsigned int)0x80000000)",
+        "tier": "compile_only",
+        "source_units": ["unit-b"],
+        "conflicts": [],
+    }
+    registry["version"] = 1
+    registry_path = repo / REGISTRY_RELPATH
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    save_registry(registry_path, registry)
+    driver = _driver(repo)
+    state = _state(repo)
+
+    result = driver._reverify_unit_inner("unit-b", state)
+
+    assert result["promoted"] is True
+    assert state["units"]["unit-b"]["tier"] == TIER_TRANSCRIPT_GREEN
+    after = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert after["entries"]["dat:0x80000000"]["tier"] == "compile_only"
+    withheld = [
+        e for e in _events(repo) if e["kind"] == "registry_promotion_withheld"
+    ]
+    assert withheld and withheld[0]["tier"] == TIER_TRANSCRIPT_GREEN
+    assert "reserved for oracle_green" in withheld[0]["reason"]

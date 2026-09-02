@@ -1022,7 +1022,19 @@ class CanonicalStateSnapshot:
     units: dict[str, dict[str, Any]]
 
 
-ELIGIBLE_CANONICAL_TIERS = frozenset({"compile_only", "oracle_green"})
+#: Tiers whose artifacts the assembly gate will link. An ALLOWLIST: a tier that
+#: is not named here cannot enter a composition window, whatever else is true
+#: of it.
+#:
+#: transcript_green and boundary_green were added with the driver's tier
+#: vocabulary (src/port_tiers.py). Not adding them would have been a silent
+#: REGRESSION rather than a conservative choice: the gate already links
+#: compile_only inventory, which carries no behavioural claim at all, so a unit
+#: that earned a console-derived claim and was promoted out of compile_only
+#: would have DROPPED OUT of every window it was previously eligible for.
+ELIGIBLE_CANONICAL_TIERS = frozenset(
+    {"compile_only", "transcript_green", "boundary_green", "oracle_green"}
+)
 LegacyArtifactVerifier = Callable[
     [UnitArtifact, dict[str, Any]],
     tuple[dict[str, Any] | None, str | None],
@@ -1079,7 +1091,7 @@ def canonical_artifact_evidence(
     artifact: UnitArtifact,
     record: dict[str, Any] | None,
     *,
-    required_tier: str | None,
+    required_tier: str | frozenset[str] | set[str] | None,
     state_sha256: str,
     legacy_verifier: LegacyArtifactVerifier | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -1092,8 +1104,16 @@ def canonical_artifact_evidence(
         return None, f"canonical-status:{status or 'missing'}"
     if tier not in ELIGIBLE_CANONICAL_TIERS:
         return None, f"canonical-tier:{tier or 'missing'}"
-    if required_tier is not None and tier != required_tier:
-        return None, f"root-tier-mismatch:{tier}"
+    # ``required_tier`` may name one tier or a SET of them: the promoted root
+    # holds every verified tier, not just oracle_green, and a unit promoted to
+    # transcript_green must not be excluded from a window it qualified for as
+    # compile_only. Membership, never inequality.
+    if required_tier is not None:
+        allowed = (
+            {required_tier} if isinstance(required_tier, str) else set(required_tier)
+        )
+        if tier not in allowed:
+            return None, f"root-tier-mismatch:{tier}"
     if artifact.tier != tier:
         return None, f"artifact-tier-mismatch:{artifact.tier}"
     commit = record.get("commit")
@@ -1389,7 +1409,7 @@ def select_recent_green_units(
     n: int | None,
     *,
     canonical_snapshot: CanonicalStateSnapshot,
-    root_tiers: list[str | None] | None = None,
+    root_tiers: list[str | frozenset[str] | set[str] | None] | None = None,
     legacy_verifier: LegacyArtifactVerifier | None = None,
 ) -> tuple[list[UnitArtifact], dict[str, str]]:
     """The last N green/staged unit artifacts across the given roots, oldest

@@ -30,6 +30,7 @@ from typing import Any
 from src.port_chunk_workflow import atomic_write_json, utc_now
 from src.port_model_config import resolve_port_model_config
 from src.port_run_controller import _pid_alive, find_gotyaforce_root
+from src.port_tiers import count_bucket
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -112,7 +113,7 @@ def queue_status(repo_root: Path, port_mode: str) -> dict[str, Any]:
     state = _read_json(root / "wasm-units-state.json") or {}
     records = state.get("units") if isinstance(state.get("units"), dict) else {}
     counts = {
-        "green": 0, "staged": 0, "retryable": 0, "untouched": 0,
+        "green": 0, "staged": 0, "unknown_tier": 0, "retryable": 0, "untouched": 0,
         "structural_ineligible": 0, "active": 0,
     }
     remaining = 0
@@ -122,7 +123,14 @@ def queue_status(repo_root: Path, port_mode: str) -> dict[str, Any]:
         if status not in settled_statuses:
             remaining += 1
         if status == "green":
-            counts["staged" if (record or {}).get("tier") == "compile_only" else "green"] += 1
+            # FAIL-CLOSED tier classification (src/port_tiers.py). The former
+            # predicate was "tier is not compile_only", which routed None, a
+            # typo and any future tier into `green` -- and the live ledger
+            # already carries two `status=green, tier=None` records, so this
+            # was over-counting, not a latent risk. `unknown_tier` is its own
+            # bucket: an unclassifiable record is never quietly verified and
+            # never quietly inventory.
+            counts[count_bucket((record or {}).get("tier"))] += 1
         elif status == "red_retryable":
             counts["retryable"] += 1
         elif status == "structural_ineligible":

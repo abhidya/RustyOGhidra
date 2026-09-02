@@ -340,6 +340,66 @@ def test_stopped_snapshot_never_presents_configured_model_as_active(journal):
     assert "| **Configured model** | `configured/model` |" in readme
 
 
+def test_an_unknown_tier_does_not_land_in_green():
+    """The fail-open counter regression, in the second of the two files that
+    carried it. `classify_counts` asked "is the tier compile_only?" and routed
+    everything else -- including `None`, which the LIVE ledger carries on two
+    green records -- into `green`, so summary.json and the README banner
+    disagreed with run-state.json's `units_verified`."""
+    counts = classify_counts({
+        "verified": {"status": "green", "tier": "oracle_green"},
+        "staged": {"status": "green", "tier": "compile_only"},
+        "no-tier": {"status": "green"},
+        "typo": {"status": "green", "tier": "oracle-green"},
+        "future": {"status": "green", "tier": "a_tier_from_the_future"},
+    })
+
+    assert counts["green"] == 1
+    assert counts["staged"] == 1
+    assert counts["unknown_tier"] == 3
+    assert counts["green"] + counts["staged"] + counts["unknown_tier"] == 5
+
+
+def test_the_console_tiers_are_verified_by_allowlist():
+    counts = classify_counts({
+        "t": {"status": "green", "tier": "transcript_green"},
+        "b": {"status": "green", "tier": "boundary_green"},
+        "o": {"status": "green", "tier": "oracle_green"},
+    })
+    assert counts["green"] == 3
+    assert counts["unknown_tier"] == 0
+
+
+def test_an_unknown_tier_keeps_the_run_from_reporting_complete():
+    """`remaining` deliberately does NOT subtract `unknown_tier`: a green
+    record the driver cannot classify is not settled inventory it may vouch
+    for. That only ever under-claims, and relaunch scheduling reads STATUS
+    (port_contract.queue_status), not these counts."""
+    only_unknown = classify_counts({"a": {"status": "green", "tier": "?"}})
+    assert ProgressJournal._health(
+        only_unknown, MachineState(), 0, 0, True
+    ) != "complete"
+    known = classify_counts({"a": {"status": "green", "tier": "transcript_green"}})
+    assert ProgressJournal._health(known, MachineState(), 0, 0, True) == "complete"
+
+
+def test_the_readme_never_prints_staged_inventory_without_saying_it_is_unverified():
+    """claim-honesty rule 1: a staged-unit count is queue depth, not an
+    achievement, and the banner is where that gets misread."""
+    units = dict(UNITS)
+    units["mystery"] = {"status": "green", "attempts": 1, "tier": None}
+    line = ProgressJournal._render_readme(
+        None,
+        {"timestamp": "t"},
+        {"health": "idle", "green": 1, "staged": 1, "unknown_tier": 1,
+         "total_units": 7, "retryable": 1, "untouched": 1},
+        [],
+    )
+    assert "1 verified" in line
+    assert "compile_only, UNVERIFIED" in line
+    assert "1 unknown tier" in line
+
+
 def test_health_classifications(journal):
     counts = classify_counts(UNITS)
     assert ProgressJournal._health(counts, MachineState(manual_paused=True), 0, 0, False) == "manual_paused"
