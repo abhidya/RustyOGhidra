@@ -3462,6 +3462,23 @@ class WasmUnitDriver:
             wgpipe_lowering=(
                 os.getenv("OGHIDRA_PORT_WGPIPE_LOWERING", "") == "1"
             ),
+            # Indirect-call lowering (src/port_indirect_lowering.py): the
+            # ROM's `(*(code *)addr)(args)` bctrl sites become a frame build
+            # plus a call to the companion's `__gf_dispatch_at` instead of a
+            # call_indirect on the module's own table keyed by a GameCube
+            # code address. Requires the companion (which defines that
+            # entry). Env-gated for the same reason as the two above: the
+            # live gate stays byte-identical until the owner turns it on.
+            indirect_lowering=(
+                os.getenv("OGHIDRA_PORT_INDIRECT_LOWERING", "") == "1"
+            ),
+            # Trace mode for that entry: two DECLARED observation imports
+            # bracket every lowered dispatch, which is what makes the ROM's
+            # function-pointer dispatch observable at all. Observation only --
+            # it changes what the host is told, never what the module does.
+            dispatch_trace=(
+                os.getenv("OGHIDRA_PORT_DISPATCH_TRACE", "") == "1"
+            ),
         )
         if not verify_canonical_state_snapshot(snapshot):
             result["passed"] = False

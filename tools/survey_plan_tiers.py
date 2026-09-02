@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.port_c_evidence import analyse_function  # noqa: E402
+from src.port_indirect_lowering import lower_source  # noqa: E402
 from src.port_spec_emit import SDK_SHIMS, real_callees  # noqa: E402
 from src.port_trace_verify import ORACLE_REGISTRY_RELPATH  # noqa: E402
 
@@ -119,10 +120,56 @@ def transcript_tier_of(fn_name: str, unit: str, returns_value: bool,
     return True, ""
 
 
+# --------------------------------------------------------------------------
+# dispatch_green: the ROM FUNCTION-POINTER DISPATCH ceiling
+# --------------------------------------------------------------------------
+# The 1602 functions transcript_green refuses for indirect dispatch are refused
+# for ONE reason: emcc lowers their `bctrl` to a call_indirect on the module's
+# own table, which no import shim can observe. src/port_indirect_lowering.py
+# removes that premise by rewriting each site into the gate's own address-keyed
+# dispatch, which the companion's TRACE mode makes observable at two declared
+# imports (research/decomp/oracle-harness/run-dispatch.mjs).
+#
+# So the ceiling question for this standard is exactly: CAN THE LOWERING
+# REWRITE EVERY INDIRECT CALL SITE IN THIS FUNCTION'S IN-UNIT CLOSURE? That is
+# the same predicate the tool itself applies -- the discipline the transcript
+# ceiling above already follows. This survey must never promise a function the
+# tool would then refuse.
+#
+# NOT CHECKED HERE, and stated so the number is read correctly: the capture
+# plan additionally audits the ROM's `bctrl` count against the lowered C's site
+# count for every function in the closure, which needs the DOL and cannot be
+# answered statically. A function counted here can still be refused at plan
+# time by that audit.
+
+def dispatch_tier_of(closure_members: set[str], bodies: dict[str, str]
+                     ) -> tuple[bool, str, int]:
+    """(verifiable_by_dispatch_green, reason_if_not, lowerable_site_count)."""
+    sites = 0
+    for member in sorted(closure_members):
+        body = bodies.get(member)
+        if body is None:
+            continue
+        _text, member_sites, problems, _non_call, _seed = lower_source(
+            "survey", member, body)
+        if problems:
+            codes = sorted({item.code for item in problems})
+            return False, f"indirect call site the lowering refuses ({codes[0]})", 0
+        sites += len(member_sites)
+    if not sites:
+        # The closure branches indirectly per the C evidence but the lowering
+        # found no CALL to rewrite -- every `code *` occurrence is a null test
+        # or a pointer comparison, not a call. Nothing here to observe.
+        return False, "no lowerable indirect call site", 0
+    return True, "", sites
+
+
 def build_closures(functions: list[dict], evidences: dict[str, object]
-                   ) -> tuple[dict[str, set[str]], dict[str, bool]]:
-    """Per function: its transitive out-of-unit callee set, and whether any
-    function in its in-unit closure dispatches indirectly."""
+                   ) -> tuple[dict[str, set[str]], dict[str, bool],
+                              dict[str, set[str]]]:
+    """Per function: its transitive out-of-unit callee set, whether any
+    function in its in-unit closure dispatches indirectly, and the closure
+    members themselves (which the dispatch ceiling needs)."""
     unit_of = {e.get("name"): e.get("unit") for e in functions}
     direct: dict[str, tuple[set[str], set[str], bool]] = {}
     for e in functions:
@@ -138,6 +185,7 @@ def build_closures(functions: list[dict], evidences: dict[str, object]
 
     out_of: dict[str, set[str]] = {}
     ind: dict[str, bool] = {}
+    members: dict[str, set[str]] = {}
     for name in direct:
         seen, stack = set(), [name]
         outs, indirect = set(), False
@@ -150,8 +198,8 @@ def build_closures(functions: list[dict], evidences: dict[str, object]
             outs |= f_out
             indirect = indirect or f_ind
             stack.extend(f_in)
-        out_of[name], ind[name] = outs, indirect
-    return out_of, ind
+        out_of[name], ind[name], members[name] = outs, indirect, seen
+    return out_of, ind, members
 
 
 def main() -> int:
@@ -176,6 +224,7 @@ def main() -> int:
     evidences: dict[str, object] = {}
     entry_by_name: dict[str, dict] = {}
     write_tier_of_fn: dict[str, str] = {}
+    bodies: dict[str, str] = {}
 
     for entry in functions:
         name = entry.get("name")
@@ -191,6 +240,7 @@ def main() -> int:
         per_unit[unit][tier] += 1
         evidences[name] = evidence
         entry_by_name[name] = entry
+        bodies[name] = body
         write_tier_of_fn[name] = tier
         if reason:
             reasons[reason.split("(")[0].strip()] += 1
@@ -199,9 +249,12 @@ def main() -> int:
         plan_shape["<=4" if entries <= 4 else ("5-12" if entries <= 12 else ">12")] += 1
 
     # ---- transcript_green ceiling + the COMBINED ceiling ----
-    closure_out, closure_ind = build_closures(functions, evidences)
+    closure_out, closure_ind, closure_members = build_closures(functions, evidences)
     transcript_ok: dict[str, bool] = {}
     transcript_refusals = Counter()
+    dispatch_ok: dict[str, bool] = {}
+    dispatch_sites: dict[str, int] = {}
+    dispatch_refusals = Counter()
     combined = Counter()
     per_unit_combined: dict[str, Counter] = defaultdict(Counter)
     combined_of_fn: dict[str, str] = {}
@@ -213,6 +266,19 @@ def main() -> int:
         transcript_ok[name] = ok
         if not ok:
             transcript_refusals[why] += 1
+        # dispatch_green applies EXACTLY to the class transcript_green
+        # refuses for indirect dispatch. It is not a stronger or weaker
+        # rung of the same ladder -- it observes a channel the others
+        # cannot see -- so it is consulted only where they have nothing
+        # to say.
+        d_ok, d_why, d_sites = (False, "", 0)
+        if not ok and closure_ind.get(name, False):
+            d_ok, d_why, d_sites = dispatch_tier_of(
+                closure_members.get(name, {name}), bodies)
+            if not d_ok:
+                dispatch_refusals[d_why] += 1
+        dispatch_ok[name] = d_ok
+        dispatch_sites[name] = d_sites
         # The COMBINED tier names the STRONGEST claim a function can reach.
         # oracle_green (a byte-exact write comparison) always outranks
         # transcript_green (call transcript + return value only).
@@ -221,6 +287,8 @@ def main() -> int:
             best = "oracle_green_auto"
         elif ok:
             best = "transcript_green"
+        elif dispatch_ok[name]:
+            best = "dispatch_green"
         else:
             best = "unverifiable"
         combined[best] += 1
@@ -264,6 +332,13 @@ def main() -> int:
     for why, count in transcript_refusals.most_common():
         print(f"  refused {count:6d}  {why}")
 
+    n_dispatch = sum(1 for v in dispatch_ok.values() if v)
+    print("\nDISPATCH_GREEN ceiling (the ROM function-pointer dispatch class; "
+          "ORTHOGONAL to the two above, never totalled with them):")
+    print(f"  verifiable       {n_dispatch:6d}  {100 * n_dispatch / total_fn:5.1f}%")
+    for why, count in dispatch_refusals.most_common():
+        print(f"  refused {count:6d}  {why}")
+
     print("\nCOMBINED CEILING -- the STRONGEST claim each function can reach:")
     for kind, count in combined.most_common():
         print(f"  {kind:18s} {count:6d}  {100 * count / total_fn:5.1f}%")
@@ -302,6 +377,11 @@ def main() -> int:
                 "verifiable": n_transcript,
                 "refusals": dict(transcript_refusals),
             },
+            "dispatch_green": {
+                "verifiable": n_dispatch,
+                "refusals": dict(dispatch_refusals),
+                "lowerable_sites": sum(dispatch_sites.values()),
+            },
             "combined_per_function": dict(combined),
             "combined_per_unit": dict(unit_combined),
         }, indent=2), encoding="utf-8")
@@ -313,6 +393,8 @@ def main() -> int:
                    "transcript": transcript_ok[name],
                    "combined": combined_of_fn[name],
                    "returns_value": bool(entry_by_name[name].get("returns_value")),
+                   "dispatch": dispatch_ok[name],
+                   "dispatch_sites": dispatch_sites[name],
                    "out_of_unit_callees": sorted(closure_out.get(name, set())),
                    "indirect": closure_ind.get(name, False)}
             for name in entry_by_name
