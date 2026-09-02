@@ -41,6 +41,7 @@ from typing import Any, Callable
 
 from src.port_chunk_workflow import atomic_write_json, utc_now
 from src.port_driver import DriverLock
+from src.port_tiers import count_bucket
 
 # Windows: this process may run under pythonw.exe (no console), and every
 # console child then allocates a NEW console window that flashes on the owner's
@@ -193,6 +194,7 @@ def classify_counts(units: dict[str, dict[str, Any]]) -> dict[str, int]:
         "total": len(units),
         "green": 0,
         "staged": 0,
+        "unknown_tier": 0,
         "retryable": 0,
         "untouched": 0,
         "deferred": 0,
@@ -206,10 +208,14 @@ def classify_counts(units: dict[str, dict[str, Any]]) -> dict[str, int]:
         counts["total_attempts"] += int(record.get("attempts") or 0)
         status = record.get("status")
         if status == "green":
-            if record.get("tier") == "compile_only":
-                counts["staged"] += 1
-            else:
-                counts["green"] += 1
+            # FAIL-CLOSED tier classification (src/port_tiers.py), matching
+            # port_contract.queue_status and run-state.json's units_verified.
+            # The former predicate was "tier is not compile_only", which put
+            # None, a typo and any future tier into `green`; the live ledger
+            # already carries two `status=green, tier=None` records, so the
+            # three files disagreed by construction. `unknown_tier` is its own
+            # bucket so an unclassifiable record is visible, not absorbed.
+            counts[count_bucket(record.get("tier"))] += 1
         elif status == "red_retryable":
             counts["retryable"] += 1
         elif status == "structural_ineligible":
@@ -731,6 +737,12 @@ class ProgressJournal:
             return HEALTH_BLOCKED
         if machine.workflow_state == "provider_paused":
             return HEALTH_PROVIDER_PAUSED
+        # `unknown_tier` is deliberately NOT subtracted: a green-status
+        # record the driver cannot classify is not settled inventory it may
+        # vouch for, so its presence keeps the run from reporting COMPLETE.
+        # That only ever under-claims, and it does not touch relaunch
+        # scheduling (port_contract.queue_status derives `eligible` from
+        # STATUS, not from these counts).
         remaining = counts["total"] - counts["green"] - counts["staged"]
         if counts["total"] and remaining <= 0:
             return HEALTH_COMPLETE
@@ -773,7 +785,8 @@ class ProgressJournal:
             f"| **Current stage** | `{current.get('current_stage') or '-'}` (attempt "
             f"{current.get('current_attempt') or 0}) |",
             f"| **Queue progress** | {done}/{total} settled "
-            f"({counts.get('green', 0)} green, {counts.get('staged', 0)} staged) |",
+            f"({counts.get('green', 0)} verified, {counts.get('staged', 0)} staged "
+            f"[compile_only, UNVERIFIED], {counts.get('unknown_tier', 0)} unknown tier) |",
             f"| **Retries outstanding** | {counts.get('retryable', 0)} |",
             f"| **Untouched** | {counts.get('untouched', 0)} |",
             f"| **Last transition** | {current.get('last_transition') or '-'} |",
@@ -989,6 +1002,7 @@ class ProgressJournal:
                     "total": counts["total"],
                     "green": counts["green"],
                     "staged": counts["staged"],
+                    "unknown_tier": counts["unknown_tier"],
                     "retryable": counts["retryable"],
                     "untouched": counts["untouched"],
                     "active": counts["active"],
@@ -1088,6 +1102,11 @@ class ProgressJournal:
             "total_units": counts["total"],
             "green": counts["green"],
             "staged": counts["staged"],
+            # Green-status records whose tier the driver cannot classify.
+            # Published so the disagreement is visible instead of absorbed
+            # into `green`; `green + staged + unknown_tier` is the green-status
+            # total.
+            "unknown_tier": counts["unknown_tier"],
             "retryable": counts["retryable"],
             "untouched": counts["untouched"],
             "deferred": counts["deferred"],

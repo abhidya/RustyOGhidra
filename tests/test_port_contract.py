@@ -68,6 +68,47 @@ def test_completed_queue_reports_no_work(tmp_path):
     assert "settled" in work["reason"]
 
 
+def test_an_unknown_tier_does_not_land_in_green(tmp_path):
+    """The fail-open counter regression. `port_contract.py` classified a green
+    record by asking "is the tier compile_only?" and routed EVERYTHING else --
+    None, a typo, a future standard -- into `green`. It must now be a positive
+    test against the verified-tier allowlist, with an `unknown_tier` bucket of
+    its own so an unclassifiable record is visible rather than absorbed."""
+    _queue(tmp_path, ["v", "s", "none", "typo", "future"])
+    _state(tmp_path, {
+        "v": {"status": "green", "tier": "oracle_green"},
+        "s": {"status": "green", "tier": "compile_only"},
+        "none": {"status": "green"},                        # no tier at all
+        "typo": {"status": "green", "tier": "oracle-green"},
+        "future": {"status": "green", "tier": "some_tier_nobody_taught_us"},
+    })
+
+    counts = queue_status(tmp_path, "wasm_units")["counts"]
+
+    assert counts["green"] == 1            # oracle_green ONLY
+    assert counts["staged"] == 1
+    assert counts["unknown_tier"] == 3     # none + typo + future, visibly
+    # and the three green-status buckets still account for every green record
+    assert counts["green"] + counts["staged"] + counts["unknown_tier"] == 5
+
+
+def test_the_new_console_tiers_are_counted_as_verified(tmp_path):
+    """transcript_green and boundary_green carry a console-derived claim, so a
+    record at either is `green` -- but only because they are on the explicit
+    allowlist, never because they are 'not compile_only'."""
+    _queue(tmp_path, ["t", "b"])
+    _state(tmp_path, {
+        "t": {"status": "green", "tier": "transcript_green"},
+        "b": {"status": "green", "tier": "boundary_green"},
+    })
+
+    counts = queue_status(tmp_path, "wasm_units")["counts"]
+
+    assert counts["green"] == 2
+    assert counts["staged"] == 0
+    assert counts["unknown_tier"] == 0
+
+
 def test_structurally_ineligible_units_count_as_settled(tmp_path):
     _queue(tmp_path, ["a"])
     _state(tmp_path, {"a": {"status": "structural_ineligible"}})
