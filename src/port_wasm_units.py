@@ -89,6 +89,7 @@ from src.port_knowledge_registry import (
     load_registry,
     prelude_prototypes,
     promote_unit_entries,
+    RetierResult,
     record_surviving_deviations,
     read_stable_assembly_ledger_bytes,
     registry_version,
@@ -137,20 +138,36 @@ from src.port_family_gate import (
     decide as decide_family_gate,
     scenario_live_families,
 )
+from src.port_tiers import (
+    TIER_COMPILE_ONLY,
+    TIER_ORACLE_GREEN,
+    VERIFIED_TIERS,
+    UnitRollup,
+    count_bucket,
+    is_verified_tier,
+    is_write_verified_tier,
+    unit_tier_rollup,
+)
 from src.port_trace_verify import (
     CAPTURE_TOOL_RELPATH,
     CORPORA_RELPATH,
     HARNESS_CWD_RELPATH,
     HARNESS_ENTRY,
     RESULTS_RELPATH,
+    TIER_HARNESS_ENTRY,
+    TIER_TOTAL_LINE_TOKEN,
     VerifySkip,
+    build_function_evidence_sidecar_entry,
     build_sidecar_entry,
     dolphin_contended,
+    admit_unit_result,
     eligible_for_oracle_green,
     load_registry_functions,
+    read_unit_result,
     oracle_state_block,
     plan_path,
     refresh_plans,
+    scan_function_evidence,
     select_scenario,
 )
 
@@ -1156,10 +1173,21 @@ ORACLE_SIDECAR_SCHEMA = 1
 # S3/[R1] pattern discipline: the first pattern must be the anchored total
 # line with the (?m) inline flag -- _run_oracle calls re.search with no flags
 # on a multi-line log, so a bare-anchored pattern can never match.
-SIDECAR_TOTAL_LINE = re.compile(
-    r"^\(\?m\)\^ORACLE TOTAL functions=\d+/\d+ cases=\d+ "
-    r"UNEXPLAINED: 0 VERDICT: PASS\$$"
-)
+#: The anchored first pattern each TIER's harness prints only on a clean run.
+#: An entry is validated against the line belonging to the tier it declares --
+#: never against a default -- so a transcript entry cannot smuggle itself in
+#: under the oracle_green rule and vice versa.
+SIDECAR_TIER_TOTAL_LINE = {
+    TIER_ORACLE_GREEN: re.compile(
+        r"^\(\?m\)\^ORACLE TOTAL functions=\d+/\d+ cases=\d+ "
+        r"UNEXPLAINED: 0 VERDICT: PASS\$$"
+    ),
+}
+
+#: The oracle_green rule under its historical name. A per-function standard
+#: pins its own harness's total line instead -- see ``_validate_oracle_steps``
+#: and ``TIER_TOTAL_LINE_TOKEN``.
+SIDECAR_TOTAL_LINE = SIDECAR_TIER_TOTAL_LINE[TIER_ORACLE_GREEN]
 
 
 def exports_sha256(exported_functions: list[str]) -> str:
@@ -1190,9 +1218,26 @@ def validate_oracle_entry(
     sha = entry.get("exports_sha256")
     if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
         problems.append(f"{name}: exports_sha256 missing or not a sha256 hex")
+    # An entry without a `tier` is an oracle_green entry: that is what every
+    # entry written before this field existed is, and defaulting to the
+    # STRONGEST standard is the one default that cannot silently weaken a
+    # claim -- the entry still has to reproduce the ORACLE TOTAL line to pass.
+    tier = entry.get("tier", TIER_ORACLE_GREEN)
+    if not is_verified_tier(tier):
+        return problems + [
+            f"{name}: tier {tier!r} is not a verified tier "
+            f"(allowlist: {sorted(VERIFIED_TIERS)})"
+        ]
     oracle = entry.get("oracle")
     if not isinstance(oracle, dict):
         return problems + [f"{name}: oracle missing"]
+    if "steps" in oracle:
+        return problems + _validate_oracle_steps(name, tier, oracle, exports)
+    if tier != TIER_ORACLE_GREEN:
+        return problems + [
+            f"{name}: tier {tier!r} is a per-function standard and requires "
+            "oracle.steps (one replay per export)"
+        ]
     command = oracle.get("command")
     if not (
         isinstance(command, list)
@@ -1205,7 +1250,7 @@ def validate_oracle_entry(
     patterns = oracle.get("success_patterns")
     if not (isinstance(patterns, list) and patterns):
         return problems + [f"{name}: success_patterns required (I-5)"]
-    if not SIDECAR_TOTAL_LINE.match(patterns[0]):
+    if not SIDECAR_TIER_TOTAL_LINE[TIER_ORACLE_GREEN].match(patterns[0]):
         problems.append(
             f"{name}: first pattern must be the (?m)-anchored total line (S3/[R1])"
         )
@@ -1224,6 +1269,93 @@ def validate_oracle_entry(
         for function in exports:
             if re.escape(function) not in joined and function not in joined:
                 problems.append(f"{name}: no per-function pattern for {function}")
+    return problems
+
+
+def _validate_oracle_steps(
+    name: str, tier: str, oracle: dict[str, Any], exports: list[str] | None
+) -> list[str]:
+    """The S3/I-5 sidecar discipline for a PER-FUNCTION standard.
+
+    Same shape of rule as the single-command form, applied per step, plus two
+    that only a per-function standard needs and that make it no weaker than
+    the oracle_green form:
+
+      * every step's first pattern must be that standard's own anchored total
+        line -- the token run-transcript.mjs / run-spine.mjs print ONLY on a
+        clean run, and which share no string with run-unit.mjs's;
+      * the steps must cover EVERY export exactly once. Full export coverage
+        is what a unit promotion demands (eligible_for_oracle_green enforces
+        it for oracle_green); a spec that could promote a unit on a subset of
+        its exports would be the weakening this whole change exists to avoid.
+    """
+    problems: list[str] = []
+    steps = oracle.get("steps")
+    if not (isinstance(steps, list) and steps):
+        return [f"{name}: oracle.steps must be a non-empty list"]
+    required_token = TIER_TOTAL_LINE_TOKEN[tier]
+    seen: list[str] = []
+    for index, step in enumerate(steps):
+        label = f"{name}: step {index}"
+        if not isinstance(step, dict):
+            problems.append(f"{label} is not an object")
+            continue
+        export = step.get("export")
+        if not (isinstance(export, str) and export):
+            problems.append(f"{label} has no export name")
+        else:
+            seen.append(export)
+        command = step.get("command")
+        if not (
+            isinstance(command, list)
+            and command
+            and all(isinstance(part, str) for part in command)
+        ):
+            problems.append(f"{label}: command must be a non-empty string list")
+        elif command[0] == "node" and TIER_HARNESS_ENTRY[tier] not in command:
+            problems.append(
+                f"{label}: command does not invoke {TIER_HARNESS_ENTRY[tier]}"
+            )
+        if not isinstance(step.get("cwd"), str) or not step.get("cwd"):
+            problems.append(f"{label}: cwd missing")
+        patterns = step.get("success_patterns")
+        if not (isinstance(patterns, list) and patterns):
+            problems.append(f"{label}: success_patterns required (I-5)")
+            continue
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                problems.append(f"{label}: invalid regex {pattern!r}: {error}")
+                continue
+            if ("^" in pattern or "$" in pattern) and not pattern.startswith("(?m)"):
+                problems.append(
+                    f"{label}: anchored pattern without (?m) inline flag: {pattern!r}"
+                )
+        # The first pattern must be the (?m)-anchored line ENDING in this
+        # standard's own verdict token -- the string that harness prints only
+        # on a clean run, and which shares no substring with the others'.
+        if not (
+            patterns[0].startswith("(?m)")
+            and patterns[0].endswith(f"{required_token}$")
+        ):
+            problems.append(
+                f"{label}: first pattern must be (?m)-anchored and end in "
+                f"{required_token!r}, the total line {TIER_HARNESS_ENTRY[tier]} "
+                "prints only on a clean run"
+            )
+    if len(seen) != len(set(seen)):
+        problems.append(f"{name}: duplicate export step(s)")
+    if exports:
+        missing = sorted(set(exports) - set(seen))
+        extra = sorted(set(seen) - set(exports))
+        if missing:
+            problems.append(
+                f"{name}: no replay step for {missing[:5]} "
+                "(full export coverage is required)"
+            )
+        if extra:
+            problems.append(f"{name}: step(s) for non-exports {extra[:5]}")
     return problems
 
 
@@ -1655,12 +1787,17 @@ class WasmUnitDriver:
         greens = sum(1 for record in units.values() if record.get("status") == "green")
         # Section 3 metric split: verified_green vs staged. Progress toward G1
         # is the verified count; staged compile-only greens are inventory.
-        verified = sum(
-            1
+        # Both predicates are POSITIVE allowlist tests (src/port_tiers.py), the
+        # same ones port_contract.queue_status and port_progress.classify_counts
+        # use, so the three files published by one run cannot disagree.
+        buckets = [
+            count_bucket(record.get("tier"))
             for record in units.values()
             if record.get("status") == "green"
-            and record.get("tier") == "oracle_green"
-        )
+        ]
+        verified = buckets.count("green")
+        staged_units = buckets.count("staged")
+        unknown_tier = buckets.count("unknown_tier")
         total = max(len(units), 1)
         payload = {
             "run_schema": 3,
@@ -1681,8 +1818,28 @@ class WasmUnitDriver:
             },
             "counters": {
                 "units_integrated": greens,
+                # units_verified counts EVERY verified tier, which are not one
+                # quantity (claim-honesty rule 3) -- units_verified_by_tier
+                # breaks it out so nothing has to infer the mix, and
+                # units_write_verified is the oracle_green-only subset.
                 "units_verified": verified,
-                "units_staged": greens - verified,
+                "units_verified_by_tier": {
+                    tier: sum(
+                        1
+                        for record in units.values()
+                        if record.get("status") == "green"
+                        and record.get("tier") == tier
+                    )
+                    for tier in sorted(VERIFIED_TIERS)
+                },
+                "units_write_verified": sum(
+                    1
+                    for record in units.values()
+                    if record.get("status") == "green"
+                    and is_write_verified_tier(record.get("tier"))
+                ),
+                "units_staged": staged_units,
+                "units_unknown_tier": unknown_tier,
                 # Task 3 (trace verification): FAILed trace oracles flag the
                 # unit oracle_divergent -- surfaced here so divergence is
                 # visible in progress reporting without any automatic revoke.
@@ -1718,18 +1875,16 @@ class WasmUnitDriver:
         while staged grows -- unverifiable-inventory build-up. The previous
         mark rides the state file so the comparison survives runs."""
         units = state.get("units", {})
-        verified = sum(
-            1
+        # POSITIVE allowlist tests (src/port_tiers.py). The old `staged`
+        # predicate was `tier != "oracle_green"`, which swept unknown tiers
+        # into the inventory side and so hid them from this invariant.
+        buckets = [
+            count_bucket(record.get("tier"))
             for record in units.values()
             if record.get("status") == "green"
-            and record.get("tier") == "oracle_green"
-        )
-        staged = sum(
-            1
-            for record in units.values()
-            if record.get("status") == "green"
-            and record.get("tier") != "oracle_green"
-        )
+        ]
+        verified = buckets.count("green")
+        staged = len(buckets) - verified
         fraction = verified / max(verified + staged, 1)
         previous = state.get("verified_fraction_mark") or {}
         if (
@@ -3198,7 +3353,9 @@ class WasmUnitDriver:
             [self.artifact_root, self.staging_root],
             None,
             canonical_snapshot=snapshot,
-            root_tiers=["oracle_green", "compile_only"],
+            # The promoted root holds every VERIFIED tier (oracle_green plus
+            # the console standards); staging holds compile_only only.
+            root_tiers=[VERIFIED_TIERS, TIER_COMPILE_ONLY],
         )
         selection_evidence = {
             "canonical_state_sha256": snapshot.sha256,
@@ -3449,8 +3606,15 @@ class WasmUnitDriver:
     # ------------------------------------------------------------------ oracle
 
     def _run_oracle(self, unit: dict[str, Any], wasm_path: Path) -> tuple[bool, str, str]:
-        """Run the unit's oracle command. Returns (passed, summary, full_log)."""
+        """Run the unit's oracle command. Returns (passed, summary, full_log).
+
+        A per-function standard (transcript_green / boundary_green) declares
+        ``oracle.steps`` instead of one command: EVERY step must pass, and the
+        logs are concatenated. Conjunction, never disjunction -- one red step
+        reds the unit."""
         oracle = unit["oracle"]
+        if "steps" in oracle:
+            return self._run_oracle_steps(unit, oracle, wasm_path)
         command = list(oracle["command"])
         if command and command[0] == "node":
             command[0] = resolve_node_exe()
@@ -3474,6 +3638,58 @@ class WasmUnitDriver:
             "pass" if passed else f"exit {completed.returncode}"
         )
         return passed, summary, log
+
+    def _run_oracle_steps(
+        self, unit: dict[str, Any], oracle: dict[str, Any], wasm_path: Path
+    ) -> tuple[bool, str, str]:
+        """One replay per export for a per-function standard. Fail-closed: a
+        step that errors, exits non-zero, or fails to print its anchored total
+        line fails the whole unit, and the first failing step's name is in the
+        summary so the log does not have to be read to know which."""
+        passed = True
+        logs: list[str] = []
+        summaries: list[str] = []
+        first_failure: str | None = None
+        for step in oracle["steps"]:
+            export = step.get("export", "?")
+            command = list(step["command"])
+            if command and command[0] == "node":
+                command[0] = resolve_node_exe()
+            env = dict(os.environ)
+            for key, value in (step.get("env") or {}).items():
+                env[key] = str(value).replace("{wasm}", str(wasm_path))
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=str(self.repo_root / step["cwd"]),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=ORACLE_TIMEOUT_SECONDS,
+                    creationflags=NO_WINDOW,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                passed = False
+                first_failure = first_failure or export
+                logs.append(f"--- {export} ---\nSTEP ERROR: {error}")
+                continue
+            log = completed.stdout + (
+                "\n--- stderr ---\n" + completed.stderr if completed.stderr else ""
+            )
+            logs.append(f"--- {export} ---\n{log}")
+            step_ok = completed.returncode == 0
+            for pattern in step.get("success_patterns") or []:
+                if not re.search(pattern, log):
+                    step_ok = False
+            if not step_ok:
+                passed = False
+                first_failure = first_failure or export
+            found = re.findall(r"\d+/\d+", completed.stdout)
+            summaries.append(f"{export}: {found[0] if found else 'no total line'}")
+        summary = ", ".join(summaries[:4]) or "no steps ran"
+        if not passed:
+            summary = f"FAILED at {first_failure}; {summary}"
+        return passed, summary, "\n".join(logs)
 
     # --------------------------------------------------------------------- git
 
@@ -5704,19 +5920,131 @@ class WasmUnitDriver:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return None
 
+    def _function_evidence_entry(
+        self, name: str, exports: list[str]
+    ) -> tuple[dict[str, Any] | None, UnitRollup, list[str]]:
+        """The sidecar entry a unit's PER-FUNCTION console evidence earns, its
+        rollup, and the refusal reasons for the artifacts that were not
+        admitted.
+
+        ``None`` for the entry whenever the rollup does not name a single
+        per-function verified tier: partial coverage, a mixed unit, or an
+        oracle_green rollup (which promotes only through its own sidecar path,
+        not this one). Partial and mixed are returned VISIBLY -- the rollup
+        carries covered/total and the uncovered export list -- rather than
+        being rounded into a pass."""
+        wasm_sha = self._staged_wasm_sha(name)
+        # `_verification_candidates` runs once per driver-loop iteration over
+        # every staged green, so the artifact scan is memoised on the staged
+        # BYTES: a rebuild changes the sha and invalidates the entry. New
+        # artifacts cannot appear underneath the cache during a run --
+        # verify-unit/verify-sweep, the only things that write them, take the
+        # driver lock and so can never overlap a running driver.
+        cache = getattr(self, "_function_evidence_cache", None)
+        if cache is None:
+            cache = self._function_evidence_cache = {}
+        key = (name, wasm_sha, tuple(exports))
+        if key in cache:
+            return cache[key]
+        admitted, refused, payloads = scan_function_evidence(
+            self.repo_root, name, exports, wasm_sha
+        )
+        rollup = unit_tier_rollup(name, exports, admitted)
+
+        def remember(
+            entry: dict[str, Any] | None, reasons: list[str]
+        ) -> tuple[dict[str, Any] | None, UnitRollup, list[str]]:
+            cache[key] = (entry, rollup, reasons)
+            return cache[key]
+
+        if not rollup.promotable or rollup.tier == TIER_ORACLE_GREEN:
+            return remember(None, refused)
+        try:
+            entry = build_function_evidence_sidecar_entry(
+                name, exports, str(rollup.tier), payloads, exports_sha256(exports)
+            )
+        except ValueError as error:
+            return remember(None, refused + [str(error)])
+        problems = validate_oracle_entry(name, entry, exports=exports)
+        if problems:
+            return remember(None, refused + problems)
+        return remember(entry, refused)
+
+    def _unit_result_entry(
+        self, name: str, exports: list[str]
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """The oracle_green sidecar entry a committed ``<unit>.json`` earns.
+
+        This is the SAME gate ``verify-unit`` runs before publishing a sidecar
+        entry (``eligible_for_oracle_green`` -> ``build_sidecar_entry``), read
+        off a committed artifact instead of one just produced in-process, plus
+        the staged-bytes binding that an in-process caller did not need. It
+        adds a source, not a shortcut: nothing here can promote a unit that
+        ``verify-unit --promote`` would have refused."""
+        payload = read_unit_result(self.repo_root, name)
+        if payload is None:
+            return None, []
+        reasons = admit_unit_result(
+            payload, unit=name, wasm_sha256=self._staged_wasm_sha(name)
+        )
+        if reasons:
+            return None, reasons
+        try:
+            entry = build_sidecar_entry(
+                name, exports, payload, exports_sha256(exports)
+            )
+        except ValueError as error:
+            return None, [str(error)]
+        problems = validate_oracle_entry(name, entry, exports=exports)
+        if problems:
+            return None, problems
+        return entry, []
+
+    def _report_evidence_once(
+        self, name: str, rollup: UnitRollup, refused: list[str]
+    ) -> None:
+        """Make the evidence state legible whether or not it promotes. A unit
+        with 3 of 8 exports verified is the normal case today and it must show
+        up as 3 of 8, never as silence and never as a pass."""
+        if rollup.covered or refused:
+            self._sidecar_report_once(
+                name,
+                "function_evidence_scanned",
+                tier=rollup.tier,
+                covered=rollup.covered,
+                total=rollup.total,
+                uncovered=list(rollup.uncovered)[:8],
+                per_export=dict(sorted(rollup.per_export.items())),
+                refused=refused[:5],
+                reasons=list(rollup.reasons)[:5],
+            )
+
     def _verification_candidates(self, state: dict[str, Any]) -> list[str]:
-        """Staged compile-only greens whose sidecar oracle spec binds to the
-        STAGED artifact's provenance export set (oracle plan section 3.4: the
-        wasm being verified is the one the provenance describes, never the
-        current queue's export set). A candidate that already failed under
-        the SAME spec is not re-run -- an oracle re-run with identical inputs
-        is the section 0.1 forbidden retry."""
+        """Staged compile-only greens that have admissible verification
+        evidence bound to the STAGED artifact. Two sources, both fail-closed:
+
+        1. the oracle-commands.json sidecar, whose spec must bind to the staged
+           provenance export set (oracle plan section 3.4: the wasm being
+           verified is the one the provenance describes, never the current
+           queue's export set); and
+        2. PER-FUNCTION console evidence in research/decomp/data/oracle-results
+           -- ``<unit>.<export>.transcript.json`` and ``*.boundary.json`` --
+           which only becomes a candidate when EVERY export of the unit has an
+           admitted result at one standard, bound by wasm sha256 to the staged
+           bytes. This source was invisible to the driver, which is why passing
+           console results moved the ledger by zero.
+
+        A candidate that already failed under the SAME spec is not re-run --
+        an oracle re-run with identical inputs is the section 0.1 forbidden
+        retry -- and that applies to both sources, keyed on the same
+        ``oracle_entry_sha``."""
         sidecar = self._oracle_sidecar()
-        if not sidecar:
-            return []
         candidates: list[str] = []
         for name, record in state.get("units", {}).items():
-            if record.get("status") != "green" or record.get("tier") != "compile_only":
+            if (
+                record.get("status") != "green"
+                or record.get("tier") != TIER_COMPILE_ONLY
+            ):
                 continue
             entry = sidecar.get(name)
             if not entry:
@@ -5748,6 +6076,42 @@ class WasmUnitDriver:
                 and previous.get("spec_sha256") == oracle_entry_sha(entry)
             ):
                 continue  # same spec already decided; nothing new to learn
+            candidates.append(name)
+        # Source 2: per-function console evidence, for units the sidecar does
+        # not already speak for.
+        for name, record in state.get("units", {}).items():
+            if (
+                record.get("status") != "green"
+                or record.get("tier") != TIER_COMPILE_ONLY
+            ):
+                continue
+            if sidecar.get(name) or name in candidates:
+                continue
+            if not (self.staging_root / name / "unit.wasm").is_file():
+                continue
+            provenance = self._staged_provenance(name)
+            if not provenance:
+                continue
+            exports = provenance.get("exported_functions") or []
+            entry, rollup, refused = self._function_evidence_entry(name, exports)
+            self._report_evidence_once(name, rollup, refused)
+            if entry is None:
+                # Source 3: a committed unit-level `<unit>.json` run-unit.mjs
+                # verdict. Same fail-closed gate verify-unit applies, plus the
+                # staged-bytes binding.
+                entry, unit_reasons = self._unit_result_entry(name, exports)
+                if unit_reasons:
+                    self._sidecar_report_once(
+                        name, "unit_result_scanned", refused=unit_reasons[:5]
+                    )
+                if entry is None:
+                    continue
+            previous = record.get("verify") or {}
+            if (
+                previous.get("status") in ("oracle_red", "pass")
+                and previous.get("spec_sha256") == oracle_entry_sha(entry)
+            ):
+                continue
             candidates.append(name)
         return sorted(candidates)
 
@@ -5795,7 +6159,23 @@ class WasmUnitDriver:
         exports = provenance.get("exported_functions") or []
         entry = self._oracle_sidecar().get(name)
         if not entry:
-            raise ValueError(f"{name}: no oracle-commands.json sidecar entry")
+            # No sidecar spec: the unit may still have earned one from its
+            # per-function console evidence. Publishing it here (rather than
+            # at selection time) keeps candidacy read-only and leaves a
+            # durable, reviewable spec behind exactly as the oracle_green
+            # path does.
+            built, rollup, refused = self._function_evidence_entry(name, exports)
+            if built is None:
+                built, unit_reasons = self._unit_result_entry(name, exports)
+                refused = refused + unit_reasons
+            if built is None:
+                raise ValueError(
+                    f"{name}: no oracle-commands.json sidecar entry and no "
+                    f"admissible committed evidence ({rollup.summary()}"
+                    + (f"; refused: {refused[:2]}" if refused else "")
+                    + ")"
+                )
+            entry = self._publish_sidecar_entry(name, built, exports)
         problems = validate_oracle_entry(name, entry, exports=exports)
         if problems:
             raise ValueError(f"{name}: invalid sidecar entry: {problems[:3]}")
@@ -5808,6 +6188,11 @@ class WasmUnitDriver:
                 "provenance export set (section 3.4 binding rule)"
             )
         spec_sha = oracle_entry_sha(entry)
+        # The tier this entry promotes to, from its own allowlisted declaration.
+        # An entry with no `tier` is an oracle_green entry (the pre-existing
+        # shape), and validate_oracle_entry has already refused anything that
+        # is not in VERIFIED_TIERS.
+        promote_tier = entry.get("tier", TIER_ORACLE_GREEN)
         wasm_path = staged_dir / "unit.wasm"
         self._heartbeat(f"wasm_units:{name}:reverify")
         self.events.emit("wasm_unit_reverify_started", unit=name)
@@ -5883,19 +6268,34 @@ class WasmUnitDriver:
         )
         provenance.update(
             verified=True,
-            tier="oracle_green",
-            previous_tier="compile_only",
+            tier=promote_tier,
+            previous_tier=TIER_COMPILE_ONLY,
             reverified_at=utc_now(),
             reverify={
                 "run_id": self.run_id,
                 "spec_sha256": spec_sha,
                 "exports_sha256": entry["exports_sha256"],
             },
-            oracle={
-                "command": oracle["command"],
-                "cwd": oracle["cwd"],
-                "summary": summary,
-            },
+            oracle=(
+                {
+                    # A per-function standard replays once per export; the
+                    # provenance records every command that had to pass, not
+                    # a representative one.
+                    "steps": [
+                        {"export": step.get("export"),
+                         "command": step["command"],
+                         "cwd": step["cwd"]}
+                        for step in oracle["steps"]
+                    ],
+                    "summary": summary,
+                }
+                if "steps" in oracle
+                else {
+                    "command": oracle["command"],
+                    "cwd": oracle["cwd"],
+                    "summary": summary,
+                }
+            ),
         )
         atomic_write_json(promoted_dir / "provenance.json", provenance)
         registry_rel = None
@@ -5905,7 +6305,30 @@ class WasmUnitDriver:
             # is undone by its passing re-run (spec-typo scenario) -- with a
             # restored trail record, never a silent reappearance.
             restore = restore_unit_entries(registry, name)
-            retier = promote_unit_entries(registry, name)
+            # Registry promotion is reserved for the WRITE-VERIFIED tier.
+            # port_knowledge_registry's own contract (module docstring):
+            # authoritative injection "is reserved for the ``oracle_green``
+            # tier alone", and promote_unit_entries writes TIER_ORACLE_GREEN
+            # unconditionally. Calling it for a transcript_green or
+            # boundary_green promotion would relabel that unit's harvested
+            # decisions as write-verified -- a weaker standard totalled into
+            # the stronger one (claim-honesty rule 3), inside the artifact
+            # that decides what gets injected into every later unit's prompt.
+            # So the unit's entries stay advisory compile_only, and the event
+            # says why rather than leaving the absence to be noticed.
+            if is_write_verified_tier(promote_tier):
+                retier = promote_unit_entries(registry, name)
+            else:
+                retier = RetierResult(version=registry_version(registry))
+                self.events.emit(
+                    "registry_promotion_withheld",
+                    unit=name,
+                    tier=promote_tier,
+                    reason=(
+                        "authoritative registry injection is reserved for "
+                        "oracle_green; entries stay advisory compile_only"
+                    ),
+                )
             if restore.changed or retier.changed:
                 self._save_registry(registry)
                 registry_rel = REGISTRY_RELPATH
@@ -5939,7 +6362,7 @@ class WasmUnitDriver:
         # so the unit simply remains a verification candidate (F2) and the
         # next pass retries idempotently.
         sha, pushed, push_detail = self._commit_paths(
-            f"port: {name} wasm unit promoted (oracle {summary})",
+            f"port: {name} wasm unit promoted ({promote_tier}: {summary})",
             [
                 f"research/decomp/port-units/{name}",
                 *([registry_rel] if registry_rel else []),
@@ -5972,17 +6395,17 @@ class WasmUnitDriver:
                 result=RESULT_GREEN,
                 stage="reverify",
                 attempt=record.get("attempts", 0),
-                detail=f"staged unit promoted, oracle green: {summary}",
+                detail=f"staged unit promoted to {promote_tier}: {summary}",
                 product_commit=sha,
                 product_pushed=pushed,
                 oracle_summary=summary,
                 model=self._model_config.model,
-                tier="oracle_green",
+                tier=promote_tier,
             ),
         )
         record.update(
             status="green",
-            tier="oracle_green",
+            tier=promote_tier,
             oracle_summary=summary,
             commit=sha,
             pushed=pushed,
@@ -6002,7 +6425,8 @@ class WasmUnitDriver:
             oracle_summary=summary,
             commit=sha,
             pushed=pushed,
-            previous_tier="compile_only",
+            tier=promote_tier,
+            previous_tier=TIER_COMPILE_ONLY,
         )
         self._flag_unverified_inventory(state)
         # Only now, with the promotion durable (commit + journal + state), is
@@ -6053,7 +6477,7 @@ class WasmUnitDriver:
         for name, record in state.get("units", {}).items():
             if (
                 record.get("status") == "green"
-                and record.get("tier") == "oracle_green"
+                and is_verified_tier(record.get("tier"))
                 and (record.get("verify") or {}).get("status") == "pass"
                 and (self.staging_root / name).exists()
                 and (self.artifact_root / name / "provenance.json").is_file()
@@ -6322,6 +6746,13 @@ class WasmUnitDriver:
         driver's existing verification lane). Only callable for a
         full-coverage PASS; the entry must satisfy validate_oracle_entry."""
         entry = build_sidecar_entry(name, exports, payload, exports_sha256(exports))
+        return self._publish_sidecar_entry(name, entry, exports)
+
+    def _publish_sidecar_entry(
+        self, name: str, entry: dict[str, Any], exports: list[str]
+    ) -> dict[str, Any]:
+        """Write one validated entry into oracle-commands.json. The entry must
+        satisfy validate_oracle_entry for the tier it declares."""
         problems = validate_oracle_entry(name, entry, exports=exports)
         if problems:
             raise ValueError(f"{name}: generated sidecar entry invalid: {problems[:3]}")
@@ -6339,7 +6770,11 @@ class WasmUnitDriver:
         sidecar.setdefault("units", {})[name] = entry
         atomic_write_json(self.oracle_sidecar_path, sidecar)
         self._oracle_sidecar_cache = None  # mtime moved; force re-read
-        self.events.emit("oracle_sidecar_published", unit=name)
+        self.events.emit(
+            "oracle_sidecar_published",
+            unit=name,
+            tier=entry.get("tier", TIER_ORACLE_GREEN),
+        )
         return entry
 
     def _verify_unit_inner(

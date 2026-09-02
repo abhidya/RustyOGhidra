@@ -63,6 +63,14 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.port_tiers import (
+    TIER_BOUNDARY_GREEN,
+    TIER_ORACLE_GREEN,
+    TIER_TRANSCRIPT_GREEN,
+    ExportResult,
+    is_verified_tier,
+)
+
 # ---------------------------------------------------------------- repo layout
 
 CAPTURE_TOOL_RELPATH = "research/tools/dolphin-trace/capture_oracle.py"
@@ -72,6 +80,34 @@ CORPORA_RELPATH = "research/decomp/oracle-harness/corpora"
 HARNESS_CWD_RELPATH = "research/decomp/oracle-harness"
 HARNESS_ENTRY = "run-unit.mjs"
 RESULTS_RELPATH = "research/decomp/data/oracle-results"
+
+# Which harness produces evidence for which standard. HARNESS_ENTRY above is
+# kept as the oracle_green name so existing callers are unchanged; this map is
+# what any tier-aware code must use instead of hardcoding it.
+TIER_HARNESS_ENTRY = {
+    TIER_ORACLE_GREEN: "run-unit.mjs",
+    TIER_TRANSCRIPT_GREEN: "run-transcript.mjs",
+    TIER_BOUNDARY_GREEN: "run-spine.mjs",
+}
+
+# The per-standard evidence-file namespace. docs/verification-status.md section
+# 1 trap 2: each standard lives in its OWN filename namespace and its verdict
+# token shares no string with the others -- so a scan can never mistake one
+# standard's artifact for another's.
+TIER_RESULT_SUFFIX = {
+    TIER_ORACLE_GREEN: ".json",
+    TIER_TRANSCRIPT_GREEN: ".transcript.json",
+    TIER_BOUNDARY_GREEN: ".boundary.json",
+}
+
+# The anchored total line each harness prints ONLY on a clean run, and which a
+# replay must reproduce. These are the patterns a per-function sidecar step
+# pins, exactly as the ORACLE TOTAL line is pinned for oracle_green.
+TIER_TOTAL_LINE_TOKEN = {
+    TIER_ORACLE_GREEN: "VERDICT: PASS",
+    TIER_TRANSCRIPT_GREEN: "VERDICT: TRANSCRIPT_GREEN",
+    TIER_BOUNDARY_GREEN: "VERDICT: BOUNDARY_GREEN",
+}
 ORACLE_REGISTRY_RELPATH = "research/decomp/data/oracle-registry.json"
 CAPTURE_PID_RELPATH = "user-data/dolphin-oracle/capture-dolphin.pid"
 CAPTURE_STUB_PORT = 55555
@@ -425,6 +461,303 @@ def build_sidecar_entry(
             "env": {"ORACLE_WASM": "{wasm}"},
             "success_patterns": patterns,
         },
+    }
+
+
+# ------------------------------------- per-FUNCTION console evidence (E6)
+#
+# transcript_green and boundary_green are deliberately per-FUNCTION standards
+# (docs/verification-status.md section 1 trap 2). Their artifacts already exist
+# in RESULTS_RELPATH; until now nothing in the driver could read them, so 16
+# passing console-derived function results moved the ledger by zero.
+#
+# Everything below ADMITS evidence; it never produces it and it never relaxes
+# a check. The admission bar is deliberately HIGHER than the oracle_green
+# sidecar's on the one axis where it can be: the sidecar binds a spec to a
+# unit's EXPORT SET (exports_sha256), whereas a per-function artifact records
+# the sha256 of the exact wasm it replayed, so this binds to the staged BYTES.
+
+
+def _artifact_export(payload: dict[str, Any], tier: str) -> str | None:
+    """The single export a per-function artifact speaks about, read from the
+    field that standard uses. Nothing is inferred from the filename."""
+    if tier == TIER_TRANSCRIPT_GREEN:
+        fn = payload.get("fn")
+        declared = (payload.get("function") or {}).get("export")
+        if isinstance(fn, str) and fn and (declared is None or declared == fn):
+            return fn
+        return None
+    if tier == TIER_BOUNDARY_GREEN:
+        export = (payload.get("spine") or {}).get("export")
+        return export if isinstance(export, str) and export else None
+    return None
+
+
+def admit_function_result(
+    payload: Any,
+    *,
+    unit: str,
+    exports: Iterable[str],
+    wasm_sha256: str | None,
+) -> tuple[ExportResult | None, list[str]]:
+    """FAIL-CLOSED admission of ONE per-function console-evidence artifact.
+
+    Returns ``(ExportResult, [])`` only when every check POSITIVELY passes; a
+    missing field is a refusal, never a default-pass -- the same posture as
+    ``eligible_for_oracle_green``, which this mirrors check for check.
+
+    Refused, with the reason recorded rather than the artifact quietly
+    admitted at a weaker bar:
+
+    * an artifact whose ``standard`` is not a known verified tier;
+    * ``result_schema`` other than 1 (an unknown schema is unreadable, not
+      assumed compatible);
+    * a harness ``entry`` that is not the one that standard is defined by;
+    * ``verdict`` other than ``"pass"``, or ``claim.established`` not
+      literally ``True`` where the standard publishes a claim block;
+    * any recorded ``divergence``;
+    * a ``rehearsal`` stamp (never a verification verdict, as for oracle_green);
+    * ANY vacuous case -- the standard's own non-vacuity guard, re-checked here
+      so a hand-edited artifact cannot bypass it;
+    * zero passing cases, or fewer than the harness's own ``min_cases``;
+    * a ``wasm.sha256`` that is not the sha256 of the artifact under
+      consideration (evidence about other bytes is evidence about another
+      binary -- claim-honesty rule 8, relinking invalidates a verdict);
+    * an export the unit's provenance does not declare.
+    """
+    reasons: list[str] = []
+    if not isinstance(payload, dict):
+        return None, [f"{unit}: result artifact missing or not an object"]
+
+    standard = payload.get("standard")
+    if not is_verified_tier(standard) or standard == TIER_ORACLE_GREEN:
+        return None, [
+            f"{unit}: standard {standard!r} is not a per-function verified tier"
+        ]
+    if payload.get("result_schema") != 1:
+        reasons.append(
+            f"{unit}: result_schema {payload.get('result_schema')!r} is not 1"
+        )
+    if "rehearsal" in payload:
+        reasons.append(f"{unit}: rehearsal-stamped artifact is never a verdict")
+
+    harness = payload.get("harness")
+    expected_entry = TIER_HARNESS_ENTRY[standard]
+    if not isinstance(harness, dict):
+        reasons.append(f"{unit}: harness block missing")
+    elif not str(harness.get("entry") or "").endswith(expected_entry):
+        reasons.append(
+            f"{unit}: harness entry {harness.get('entry')!r} is not {expected_entry}"
+        )
+
+    if payload.get("verdict") != "pass":
+        reasons.append(f"{unit}: verdict is {payload.get('verdict')!r}, not 'pass'")
+    if payload.get("divergence") is not None:
+        reasons.append(f"{unit}: divergence recorded")
+
+    claim = payload.get("claim")
+    if isinstance(claim, dict) and claim.get("established") is not True:
+        reasons.append(f"{unit}: claim.established is not True")
+
+    if payload.get("vacuous_cases"):
+        reasons.append(
+            f"{unit}: {len(payload['vacuous_cases'])} vacuous case(s)"
+        )
+
+    # Non-vacuity, re-checked rather than trusted: at least one case passed and
+    # the run met the harness's own floor.
+    passed_cases = payload.get("cases_passed")
+    if standard == TIER_TRANSCRIPT_GREEN:
+        if not (isinstance(passed_cases, int) and passed_cases >= 1):
+            reasons.append(f"{unit}: cases_passed {passed_cases!r} is not >= 1")
+        floor = harness.get("min_cases") if isinstance(harness, dict) else None
+        if (
+            isinstance(floor, int)
+            and isinstance(passed_cases, int)
+            and passed_cases < floor
+        ):
+            reasons.append(
+                f"{unit}: cases_passed {passed_cases} below min_cases {floor}"
+            )
+    elif standard == TIER_BOUNDARY_GREEN:
+        matched = payload.get("calls_matched")
+        if not (isinstance(matched, int) and matched >= 1):
+            reasons.append(f"{unit}: calls_matched {matched!r} is not >= 1")
+
+    if payload.get("unit") != unit:
+        reasons.append(f"{unit}: artifact names unit {payload.get('unit')!r}")
+
+    recorded_sha = (payload.get("wasm") or {}).get("sha256")
+    if not (isinstance(wasm_sha256, str) and wasm_sha256):
+        reasons.append(f"{unit}: no staged wasm to bind the artifact to")
+    elif recorded_sha != wasm_sha256:
+        reasons.append(
+            f"{unit}: artifact replayed wasm {str(recorded_sha)[:12]}..., "
+            f"staged artifact is {wasm_sha256[:12]}... (claim-honesty rule 8)"
+        )
+
+    export = _artifact_export(payload, standard)
+    if export is None:
+        reasons.append(f"{unit}: artifact does not name exactly one export")
+    elif export not in set(exports):
+        reasons.append(
+            f"{unit}: artifact names export {export!r}, not in the staged "
+            "provenance export set"
+        )
+
+    if reasons:
+        return None, reasons
+    return (
+        ExportResult(
+            export=str(export),
+            tier=str(standard),
+            artifact=(
+                f"{RESULTS_RELPATH}/{unit}.{export}{TIER_RESULT_SUFFIX[standard]}"
+            ),
+        ),
+        [],
+    )
+
+
+def admit_unit_result(
+    payload: Any, *, unit: str, wasm_sha256: str | None
+) -> list[str]:
+    """FAIL-CLOSED admission of a UNIT-level ``<unit>.json`` (run-unit.mjs)
+    result as promotion evidence. Empty list means admissible.
+
+    ``eligible_for_oracle_green`` is the standard's own gate and is applied
+    unchanged. Three bindings are added on top, all of them STRICTER:
+
+    * the artifact must name this unit (it is found by filename, and a
+      filename is not evidence);
+    * ``result_schema`` must be 1; and
+    * ``wasm.sha256`` must be the sha256 of the staged bytes about to be
+      promoted. ``eligible_for_oracle_green`` never checked this, because the
+      only caller had just produced the artifact itself; a scan of committed
+      artifacts has no such guarantee, and claim-honesty rule 8 says a
+      verdict does not carry across a change of bytes.
+    """
+    if not isinstance(payload, dict):
+        return [f"{unit}: result artifact missing or not an object"]
+    ok, reasons = eligible_for_oracle_green(payload)
+    reasons = list(reasons)
+    if payload.get("unit") != unit:
+        reasons.append(f"{unit}: artifact names unit {payload.get('unit')!r}")
+    if payload.get("result_schema") != 1:
+        reasons.append(
+            f"{unit}: result_schema {payload.get('result_schema')!r} is not 1"
+        )
+    recorded = (payload.get("wasm") or {}).get("sha256")
+    if not (isinstance(wasm_sha256, str) and wasm_sha256):
+        reasons.append(f"{unit}: no staged wasm to bind the artifact to")
+    elif recorded != wasm_sha256:
+        reasons.append(
+            f"{unit}: artifact replayed wasm {str(recorded)[:12]}..., staged "
+            f"artifact is {wasm_sha256[:12]}... (claim-honesty rule 8)"
+        )
+    return reasons
+
+
+def read_unit_result(repo_root: Path, unit: str) -> dict[str, Any] | None:
+    """The committed ``<unit>.json`` run-unit.mjs artifact, or None."""
+    path = Path(repo_root) / RESULTS_RELPATH / f"{unit}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def scan_function_evidence(
+    repo_root: Path,
+    unit: str,
+    exports: Iterable[str],
+    wasm_sha256: str | None,
+) -> tuple[list[ExportResult], list[str], dict[str, dict[str, Any]]]:
+    """Every admissible per-function artifact for ``unit``, the refusal reasons
+    for the ones that did not make it, and the admitted payloads keyed by
+    export (the sidecar builder needs their capture bindings). Reads only."""
+    results_dir = Path(repo_root) / RESULTS_RELPATH
+    admitted: list[ExportResult] = []
+    refused: list[str] = []
+    payloads: dict[str, dict[str, Any]] = {}
+    if not results_dir.is_dir():
+        return admitted, refused, payloads
+    export_list = list(exports)
+    for suffix in (
+        TIER_RESULT_SUFFIX[TIER_TRANSCRIPT_GREEN],
+        TIER_RESULT_SUFFIX[TIER_BOUNDARY_GREEN],
+    ):
+        for path in sorted(results_dir.glob(f"{unit}.*{suffix}")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError) as error:
+                refused.append(f"{path.name}: unreadable ({error})")
+                continue
+            result, reasons = admit_function_result(
+                payload, unit=unit, exports=export_list, wasm_sha256=wasm_sha256
+            )
+            if result is None:
+                refused.append(f"{path.name}: {'; '.join(reasons[:3])}")
+            else:
+                admitted.append(result)
+                payloads[result.export] = payload
+    return admitted, refused, payloads
+
+
+def build_function_evidence_sidecar_entry(
+    unit: str,
+    exports: list[str],
+    tier: str,
+    payloads: dict[str, dict[str, Any]],
+    exports_sha256: str,
+) -> dict[str, Any]:
+    """A sidecar entry for a unit whose evidence is PER-FUNCTION.
+
+    Same contract as ``build_sidecar_entry``, generalised to a standard whose
+    harness runs one export at a time: the entry carries one REPLAY STEP per
+    export, and promotion re-runs every one of them against the staged wasm and
+    matches each harness's own anchored total line. This is not a weaker
+    handoff -- it is the same handoff, N times, and it refuses to exist unless
+    EVERY export of the unit has an admitted artifact (the full-export-coverage
+    rule ``eligible_for_oracle_green`` enforces for oracle_green).
+    """
+    if not is_verified_tier(tier) or tier == TIER_ORACLE_GREEN:
+        raise ValueError(f"{unit}: {tier!r} is not a per-function evidence tier")
+    missing = [name for name in exports if name not in payloads]
+    if not exports or missing:
+        raise ValueError(
+            f"{unit}: per-function evidence covers {len(payloads)}/{len(exports)} "
+            f"exports; missing {missing[:5]} (full coverage required)"
+        )
+    entry_name = TIER_HARNESS_ENTRY[tier]
+    token = TIER_TOTAL_LINE_TOKEN[tier]
+    steps: list[dict[str, Any]] = []
+    for export in exports:
+        payload = payloads[export]
+        capture_file = (payload.get("capture") or {}).get("file")
+        if not isinstance(capture_file, str) or not capture_file:
+            raise ValueError(f"{unit}.{export}: artifact records no capture file")
+        harness = payload.get("harness") or {}
+        command = ["node", entry_name, "--capture", capture_file.replace("\\", "/")]
+        floor = harness.get("min_cases")
+        if isinstance(floor, int) and floor >= 1:
+            command += ["--min-cases", str(floor)]
+        steps.append(
+            {
+                "export": export,
+                "command": command,
+                "cwd": HARNESS_CWD_RELPATH,
+                "env": {"ORACLE_WASM": "{wasm}"},
+                # The token carries no regex metacharacters, so it goes in
+                # verbatim: a pattern that has to be un-escaped to be read is
+                # a pattern nobody reviews.
+                "success_patterns": [f"(?m)^.*{token}$"],
+            }
+        )
+    return {
+        "exports_sha256": exports_sha256,
+        "tier": tier,
+        "oracle": {"steps": steps},
     }
 
 
