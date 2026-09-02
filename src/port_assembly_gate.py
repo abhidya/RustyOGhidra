@@ -364,6 +364,14 @@ CLASS_DISPATCH_COMPANION_FAILED = "dispatch_companion_failed"
 # Always a loud refusal -- passing the store through leaves a literal
 # out-of-bounds access in the module, which is a runtime TRAP.
 CLASS_WGPIPE_LOWERING_FAILED = "wgpipe_lowering_failed"
+# Indirect-call lowering (src/port_indirect_lowering.py): a derived source
+# still holds a `(*(code *)...)(...)` ROM call site the lowering could not
+# confidently rewrite into `__gf_dispatch_at`. Always a loud refusal -- a
+# surviving cast compiles to a `call_indirect` on the MODULE'S OWN table
+# indexed by a GameCube code address (0x80xxxxxx), which is not a wasm table
+# index: it calls the wrong function or traps, and it is invisible to every
+# import shim. A refused window is strictly better than that.
+CLASS_INDIRECT_LOWERING_FAILED = "indirect_lowering_failed"
 
 # Statements that look like `name (...) {` but are control flow, not
 # function definitions.
@@ -1481,6 +1489,8 @@ def run_assembly_gate(
     canonicalization: "CanonicalizationRequest | None" = None,
     dispatch_companion: bool = False,
     wgpipe_lowering: bool = False,
+    indirect_lowering: bool = False,
+    dispatch_trace: bool = False,
 ) -> dict[str, Any]:
     """Run one N-unit assembly-gate pass. Pure orchestration: emcc and node
     arrive as injected runners.
@@ -1500,6 +1510,17 @@ def run_assembly_gate(
     so that the ROM's `DAT_cc008000 = ...` vertex stores become calls to the
     host's `__gf_gx_wgpipe_*` FIFO imports instead of out-of-bounds stores
     that trap. Default False, same discipline.
+
+    ``indirect_lowering`` opts the window into indirect-call lowering
+    (src/port_indirect_lowering.py): the gate rewrites its own DERIVED
+    sources so that the ROM's `(*(code *)addr)(args)` `bctrl` sites become a
+    frame build plus a call to the companion's `__gf_dispatch_at` instead of
+    a `call_indirect` on the module's own table. It REQUIRES
+    ``dispatch_companion`` -- the companion is what defines
+    `__gf_dispatch_at` -- and refuses loudly when asked for without it.
+    ``dispatch_trace`` additionally puts the companion in trace mode, so the
+    two observation imports bracket every lowered dispatch. Both default
+    False, same discipline.
     """
     names = [unit.name for unit in units]
     result: dict[str, Any] = {
@@ -1602,6 +1623,8 @@ def run_assembly_gate(
             candidate,
             dispatch_companion=dispatch_companion,
             wgpipe_lowering=wgpipe_lowering,
+            indirect_lowering=indirect_lowering,
+            dispatch_trace=dispatch_trace,
         )
 
     headers = [
@@ -1652,6 +1675,8 @@ def run_assembly_gate(
         candidate,
         dispatch_companion=dispatch_companion,
         wgpipe_lowering=wgpipe_lowering,
+        indirect_lowering=indirect_lowering,
+        dispatch_trace=dispatch_trace,
     )
 
 
@@ -1825,6 +1850,8 @@ def _emit_dispatch_companion(
     names: list[str],
     workdir: Path,
     c_files: list[str],
+    dispatch_at: bool = False,
+    trace: bool = False,
 ) -> bool:
     """Derive + write the G2/H3 dispatch companion for this window.
 
@@ -1835,6 +1862,12 @@ def _emit_dispatch_companion(
     ``result`` as a loud `dispatch_companion_failed` refusal and returns
     False -- a defined function is never silently skipped (it would become a
     wrong-behavior miss, not a defined one).
+
+    ``dispatch_at`` additionally emits `__gf_dispatch_at`, the OUTBOUND entry
+    the indirect-call lowering rewrites the ROM's own `bctrl` sites into;
+    ``trace`` (which implies it) brackets that entry with the two declared
+    observation imports. Both default OFF, so a companion emitted for a
+    window without the lowering is byte-identical to what it always was.
     """
     from src.port_dispatch_companion import (
         COMPANION_FILENAME,
@@ -1903,7 +1936,9 @@ def _emit_dispatch_companion(
             "table must cover every defined function (design V4 H3)"
         )
         return False
-    companion_text = emit_companion_source(derived.signatures)
+    companion_text = emit_companion_source(
+        derived.signatures, dispatch_at=dispatch_at, trace=trace
+    )
     (workdir / FRAME_HEADER_FILENAME).write_text(
         FRAME_HEADER_TEXT, encoding="utf-8", newline="\n"
     )
@@ -1911,7 +1946,9 @@ def _emit_dispatch_companion(
         companion_text, encoding="utf-8", newline="\n"
     )
     c_files.append(COMPANION_FILENAME)
-    result["dispatch"] = companion_evidence(derived.signatures, companion_text)
+    result["dispatch"] = companion_evidence(
+        derived.signatures, companion_text, dispatch_at=dispatch_at, trace=trace
+    )
     return True
 
 
@@ -2040,6 +2077,102 @@ def _emit_wgpipe_lowering(
     return True
 
 
+def _emit_indirect_lowering(
+    result: dict[str, Any],
+    units: list[UnitArtifact],
+    names: list[str],
+    workdir: Path,
+    c_files: list[str],
+) -> bool:
+    """Lower every indirect ROM call site in this window's derived sources.
+
+    The decompiled C dispatches through function pointers by writing
+    `(*(code *)addr)(args)` / `(**(code **)addr)(args)` -- 2307 such sites in
+    the export, and `addr` is a GameCube CODE ADDRESS (0x80xxxxxx). emcc
+    lowers each of them to a `call_indirect` on the MODULE'S OWN function
+    table indexed by that address, which is not a wasm table index: it calls
+    an arbitrary wrong function or traps, and no import shim can observe it.
+    This rewrites the GATE-OWNED derived sources -- the verbatim unit.c is
+    never touched -- into a per-call argument frame plus a call to the
+    companion's `__gf_dispatch_at`, and writes the header those macros live
+    in plus the site manifest a capture plan binds to.
+
+    Any cast the lowering cannot confidently turn into a dispatch populates
+    ``result`` as a loud `indirect_lowering_failed` refusal and returns
+    False. Never a silent pass-through: a surviving site is a wrong-function
+    call at run time, which is worse than a refused window.
+    """
+    from src.port_indirect_lowering import (
+        HEADER_FILENAME,
+        HEADER_TEXT,
+        SITES_FILENAME,
+        lower_window,
+        lowering_evidence,
+        sites_manifest,
+    )
+
+    result["stage"] = "indirect-lowering"
+    unit_by_source: dict[str, str] = {}
+    for c_file in c_files:
+        parts = Path(c_file).parts
+        unit_by_source[c_file] = parts[0] if len(parts) > 1 else Path(c_file).stem
+    sources: list[tuple[str, str, str]] = []
+    original: dict[str, str] = {}
+    for c_file in c_files:
+        try:
+            text = (workdir / c_file).read_text(encoding="utf-8-sig")
+        except OSError as error:
+            result["conflicts"] = [
+                _conflict_record(
+                    None,
+                    CLASS_INDIRECT_LOWERING_FAILED,
+                    names,
+                    {},
+                    f"cannot read written source {c_file}: {error}",
+                )
+            ]
+            result["detail"] = f"indirect lowering refused: unreadable {c_file}"
+            return False
+        original[c_file] = text
+        sources.append((unit_by_source[c_file], c_file, text))
+
+    plan = lower_window(sources)
+    if plan.problems:
+        result["conflicts"] = [
+            _conflict_record(
+                None,
+                CLASS_INDIRECT_LOWERING_FAILED,
+                [problem.unit],
+                {},
+                f"{problem.code}: {problem.detail}"[:600],
+            )
+            for problem in plan.problems
+        ]
+        result["detail"] = (
+            "indirect lowering refused: "
+            f"{len(plan.problems)} indirect call site(s) could not be lowered; "
+            "a pass-through is a call_indirect on the module's own table keyed "
+            "by a GameCube code address -- a wrong-function call or a trap"
+        )
+        return False
+
+    for c_file, text in sorted(plan.sources.items()):
+        if text == original.get(c_file):
+            # Unchanged sources are left on disk exactly as the merge or the
+            # canonicalization wrote them, so a window with no indirect call
+            # site keeps byte-identical translation units.
+            continue
+        (workdir / c_file).write_text(text, encoding="utf-8", newline="\n")
+    # The header is a HEADER, not a translation unit: the rewritten sources
+    # `#include` it, so adding it to c_files would compile it standalone.
+    (workdir / HEADER_FILENAME).write_text(HEADER_TEXT, encoding="utf-8", newline="\n")
+    (workdir / SITES_FILENAME).write_text(
+        sites_manifest(plan), encoding="utf-8", newline="\n"
+    )
+    result["indirect_lowering"] = lowering_evidence(plan)
+    return True
+
+
 def _link_and_smoke(
     result: dict[str, Any],
     units: list[UnitArtifact],
@@ -2051,6 +2184,8 @@ def _link_and_smoke(
     candidate: UnitArtifact | None,
     dispatch_companion: bool = False,
     wgpipe_lowering: bool = False,
+    indirect_lowering: bool = False,
+    dispatch_trace: bool = False,
 ) -> dict[str, Any]:
     """Link, smoke, and re-verify artifact integrity.
 
@@ -2058,6 +2193,34 @@ def _link_and_smoke(
     canonicalization path so both compose under identical settings -- the gate
     must never pass under laxer conditions on one route than the other.
     """
+    if dispatch_trace:
+        # Trace is a MODE OF the outbound entry, not a thing of its own.
+        indirect_lowering = True
+    if indirect_lowering and not dispatch_companion:
+        # The lowered C calls `__gf_dispatch_at`, which ONLY the companion
+        # defines. Emitting the lowering without it would produce a window
+        # that cannot link -- or, under -sERROR_ON_UNDEFINED_SYMBOLS=0,
+        # silently link `__gf_dispatch_at` as an undeclared import and route
+        # every ROM call site out of the module. Refuse loudly instead.
+        from src.port_indirect_lowering import DISPATCH_AT
+
+        result["stage"] = "indirect-lowering"
+        result["conflicts"] = [
+            _conflict_record(
+                None,
+                CLASS_INDIRECT_LOWERING_FAILED,
+                names,
+                {},
+                "indirect_lowering requested without dispatch_companion: the "
+                f"lowered call sites call {DISPATCH_AT}, which only the "
+                "dispatch companion defines",
+            )
+        ]
+        result["detail"] = (
+            "indirect lowering refused: it requires dispatch_companion, which "
+            f"is what defines {DISPATCH_AT}"
+        )
+        return result
     if wgpipe_lowering:
         # Write-gather-pipe lowering runs FIRST, so every later consumer of
         # the written sources (the dispatch companion derives its signatures
@@ -2065,12 +2228,30 @@ def _link_and_smoke(
         # store statements, so no definition head moves.
         if not _emit_wgpipe_lowering(result, units, names, workdir, c_files):
             return result
+    if indirect_lowering:
+        # Indirect-call lowering runs AFTER the write-gather-pipe lowering and
+        # BEFORE the dispatch companion, for the same reason wgpipe runs where
+        # it does: every later consumer of the written sources must see the
+        # final text. The companion derives its thunk signatures by RE-READING
+        # these sources, so a site rewritten afterwards would be absent from
+        # the table the rewritten site dispatches through. It rewrites only
+        # call statements, so no definition head moves.
+        if not _emit_indirect_lowering(result, units, names, workdir, c_files):
+            return result
     if dispatch_companion:
         # G2/H3: emit the address-keyed uniform-ABI dispatch companion as an
         # additional derived translation unit in the SAME link. Additive: the
         # existing merge/canonicalize/link semantics are untouched; companion
         # failure is its own loud refusal class.
-        if not _emit_dispatch_companion(result, units, names, workdir, c_files):
+        if not _emit_dispatch_companion(
+            result,
+            units,
+            names,
+            workdir,
+            c_files,
+            dispatch_at=indirect_lowering,
+            trace=dispatch_trace,
+        ):
             return result
     exports = sorted(
         {
@@ -2093,6 +2274,24 @@ def _link_and_smoke(
         exports.append(DISPATCH_EXPORT)
         exports.append(ARITY_EXPORT)
         allowed_extra.append(MISS_IMPORT)
+    if indirect_lowering:
+        from src.port_dispatch_companion import DISPATCH_AT_EXPORT
+
+        # The OUTBOUND entry the lowered call sites call. Exported for the
+        # same reason __gf_dispatch is: a host driving the module (and the
+        # dispatch harness) reaches the table through it.
+        exports.append(DISPATCH_AT_EXPORT)
+    if dispatch_trace:
+        from src.port_dispatch_companion import (
+            TRACE_ENTER_IMPORT,
+            TRACE_EXIT_IMPORT,
+        )
+
+        # DECLARED host callees, exactly like the dispatch miss handler:
+        # without this the import scan would call the companion's own trace
+        # mode a disallowed import.
+        allowed_extra.append(TRACE_ENTER_IMPORT)
+        allowed_extra.append(TRACE_EXIT_IMPORT)
     if wgpipe_lowering and result.get("wgpipe"):
         from src.port_wgpipe_lowering import WGPIPE_IMPORTS
 

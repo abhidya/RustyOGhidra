@@ -54,6 +54,20 @@ MISS_IMPORT = "__gf_dispatch_miss"
 # plumbing; it can never turn a legitimate cross-class call into a failure.
 ARITY_EXPORT = "__gf_dispatch_arity_mismatches"
 
+# ---- the OUTBOUND half (src/port_indirect_lowering.py) --------------------
+# `__gf_dispatch` is what something OUTSIDE the module calls to reach a ROM
+# function by address. `__gf_dispatch_at` is what the ROM'S OWN lowered
+# `bctrl` call sites call: the same table, plus the SITE the call came from.
+# It is emitted ONLY when the indirect-call lowering is requested, so a
+# companion built without the lowering is byte-identical to what it was.
+DISPATCH_AT_EXPORT = "__gf_dispatch_at"
+# Observation imports, emitted only in TRACE mode. They are what makes the
+# 1602 ROM-function-pointer-dispatch functions observable at all: a
+# `call_indirect` hides from an import shim, but a thunk the gate wrote does
+# not have to. See research/decomp/oracle-harness/run-dispatch.mjs.
+TRACE_ENTER_IMPORT = "__gf_dispatch_enter"
+TRACE_EXIT_IMPORT = "__gf_dispatch_exit"
+
 FRAME_ABI_VERSION = 1
 FRAME_MAX_ARGS = 16
 
@@ -636,8 +650,110 @@ def _thunk_definition(signature: ThunkSignature) -> str:
     return "\n".join(lines)
 
 
-def emit_companion_source(signatures: list[ThunkSignature]) -> str:
-    """The companion translation unit. Deterministic for a given window."""
+def _emit_dispatch_at(count: int, trace: bool) -> list[str]:
+    """`__gf_dispatch_at`: the entry the ROM's own lowered call sites use.
+
+    Semantics are EXACTLY `__gf_dispatch`'s -- same table, same miss import,
+    same arity ledger -- with two extra parameters that carry the CALL SITE and
+    the per-argument class array the lowering filled. Without trace they are
+    unused and the call is a straight forward to `__gf_dispatch`, so the
+    lowered module behaves identically to an unobserved one.
+
+    With trace, two declared imports bracket the dispatch. They are the whole
+    point of the standard: `__gf_dispatch_enter` sees the site, the GC address
+    the ROM resolved, the argument frame, the class array, and whether the
+    address was found in this window's table; `__gf_dispatch_exit` sees the
+    return the dispatch produced. A host observing those two imports observes
+    exactly what a `call_indirect` on the module's own table hides.
+
+    NOTE what trace does NOT change: the dispatch itself. The same thunk (or
+    the same miss import) runs, with the same frame, in the same order. Trace
+    adds observation, never behaviour -- so a traced run and an untraced run
+    differ only in what the host is told.
+    """
+    lines: list[str] = [
+        "",
+        "/* Outbound entry for the ROM's own lowered `bctrl` call sites",
+        " * (src/port_indirect_lowering.py). Same table, same miss import, plus",
+        " * the originating SITE and the per-argument class array. */",
+    ]
+    if trace:
+        lines += [
+            f"extern void {TRACE_ENTER_IMPORT}(unsigned int site, unsigned int gc_addr,",
+            "                                 int argptr, int classptr, int resolved);",
+            f"extern void {TRACE_EXIT_IMPORT}(unsigned int site, unsigned int gc_addr,",
+            "                                int argptr, int resolved, int result);",
+        ]
+    if count and trace:
+        lines += [
+            "static int __gf_dispatch_index(unsigned int gc_addr) {",
+            "  unsigned int lo = 0;",
+            f"  unsigned int hi = {count}u;",
+            "  while (lo < hi) {",
+            "    unsigned int mid = lo + (hi - lo) / 2u;",
+            "    unsigned int probe = __gf_dispatch_addrs[mid];",
+            "    if (probe == gc_addr) { return (int)mid; }",
+            "    if (probe < gc_addr) { lo = mid + 1u; } else { hi = mid; }",
+            "  }",
+            "  return -1;",
+            "}",
+        ]
+    lines += [
+        f"int {DISPATCH_AT_EXPORT}(unsigned int site, unsigned int gc_addr, int argptr,",
+        "                        int classptr) {",
+    ]
+    if not trace:
+        lines += [
+            "  (void)site;",
+            "  (void)classptr;",
+            f"  return {DISPATCH_EXPORT}(gc_addr, argptr);",
+            "}",
+        ]
+        return lines
+    if count:
+        lines += [
+            "  int idx = __gf_dispatch_index(gc_addr);",
+            "  int result;",
+            f"  {TRACE_ENTER_IMPORT}(site, gc_addr, argptr, classptr, idx >= 0);",
+            "  if (idx >= 0) {",
+            "    const __gf_dispatch_frame *frame =",
+            "        (const __gf_dispatch_frame *)argptr;",
+            "    if (frame->arg_count != __gf_dispatch_arity[idx]) {",
+            "      __gf_arity_mismatch_count += 1u;",
+            "    }",
+            "    result = __gf_dispatch_thunks[idx](argptr);",
+            "  } else {",
+            f"    result = {MISS_IMPORT}(gc_addr, argptr);",
+            "  }",
+            f"  {TRACE_EXIT_IMPORT}(site, gc_addr, argptr, idx >= 0, result);",
+            "  return result;",
+            "}",
+        ]
+    else:
+        lines += [
+            "  int result;",
+            f"  {TRACE_ENTER_IMPORT}(site, gc_addr, argptr, classptr, 0);",
+            f"  result = {MISS_IMPORT}(gc_addr, argptr);",
+            f"  {TRACE_EXIT_IMPORT}(site, gc_addr, argptr, 0, result);",
+            "  return result;",
+            "}",
+        ]
+    return lines
+
+
+def emit_companion_source(signatures: list[ThunkSignature], *,
+                          dispatch_at: bool = False,
+                          trace: bool = False) -> str:
+    """The companion translation unit. Deterministic for a given window.
+
+    ``dispatch_at`` additionally emits `__gf_dispatch_at`, the outbound entry
+    the indirect-call lowering rewrites ROM call sites into. ``trace`` (which
+    implies it) makes that entry call the two declared observation imports.
+    Both default OFF so a companion emitted without them is byte-identical to
+    what this module has always produced.
+    """
+    if trace:
+        dispatch_at = True
     ordered = sorted(signatures, key=lambda item: (item.gc_address, item.symbol))
     parts = [
         "/* gf_dispatch_companion.c -- address-keyed uniform-ABI dispatch",
@@ -734,14 +850,32 @@ def emit_companion_source(signatures: list[ThunkSignature]) -> str:
             f"  return {MISS_IMPORT}(gc_addr, argptr);",
             "}",
         ]
+    if dispatch_at:
+        parts.extend(_emit_dispatch_at(count, trace))
     return "\n".join(parts) + "\n"
 
 
 def companion_evidence(
-    signatures: list[ThunkSignature], companion_text: str
+    signatures: list[ThunkSignature], companion_text: str, *,
+    dispatch_at: bool = False, trace: bool = False
 ) -> dict[str, Any]:
     """The gate-result evidence block for one emitted companion."""
-    return {
+    if trace:
+        dispatch_at = True
+    extra: dict[str, Any] = {}
+    if dispatch_at:
+        extra["dispatch_at_export"] = DISPATCH_AT_EXPORT
+    if trace:
+        extra["trace_imports"] = [TRACE_ENTER_IMPORT, TRACE_EXIT_IMPORT]
+        # An observed module is NOT a verified module. The observation imports
+        # let a host see what the ROM dispatched to; whether that matches the
+        # console is decided by run-dispatch.mjs against a console capture.
+        extra["trace_claim"] = (
+            "observation only: the trace imports report the site, resolved GC "
+            "target, argument frame and return of every lowered indirect call. "
+            "They make no comparison and establish no tier."
+        )
+    return {**extra, **{
         "frame_abi_version": FRAME_ABI_VERSION,
         "frame_header": FRAME_HEADER_FILENAME,
         "companion": COMPANION_FILENAME,
@@ -753,4 +887,4 @@ def companion_evidence(
         "arity_export": ARITY_EXPORT,
         "functions": len(signatures),
         "table": [item.to_dict() for item in signatures],
-    }
+    }}
