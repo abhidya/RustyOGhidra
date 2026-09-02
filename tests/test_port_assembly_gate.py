@@ -16,6 +16,7 @@ from src.port_assembly_gate import (
     CLASS_LINK_FAILURE,
     CLASS_UNDEFINED8_FORK,
     ASSEMBLY_WASM,
+    ELIGIBLE_CANONICAL_TIERS,
     HeaderChunk,
     load_canonical_state_snapshot,
     conflicts_from_link_error,
@@ -546,6 +547,64 @@ def test_selection_uses_canonical_lifecycle_not_artifact_mtime(tmp_path):
         "revoked": "current-lifecycle-revocation-contradiction",
         "structural": "canonical-status:structural_ineligible",
     }
+
+
+def test_promoting_a_unit_to_a_console_tier_does_not_drop_it_from_the_window():
+    """Adding transcript_green/boundary_green to the gate allowlist is a
+    correction, not a loosening. The gate already links compile_only -- which
+    carries NO behavioural claim -- so a unit that earned a console-derived
+    claim and was promoted out of compile_only would otherwise have become
+    LESS eligible than it was as unverified inventory."""
+    assert {"compile_only", "oracle_green"} <= ELIGIBLE_CANONICAL_TIERS
+    assert "transcript_green" in ELIGIBLE_CANONICAL_TIERS
+    assert "boundary_green" in ELIGIBLE_CANONICAL_TIERS
+    # still an allowlist: nothing else gets in
+    assert ELIGIBLE_CANONICAL_TIERS == {
+        "compile_only", "transcript_green", "boundary_green", "oracle_green",
+    }
+    for rejected in (None, "", "green", "mixed", "oracle-green", "spine_green"):
+        assert rejected not in ELIGIBLE_CANONICAL_TIERS
+
+
+def test_the_promoted_root_accepts_every_verified_tier_not_just_oracle_green(tmp_path):
+    """`root_tiers` may name a SET per root. The promoted root holds every
+    verified tier; requiring equality with `oracle_green` would have excluded
+    a transcript_green-promoted artifact from its own root."""
+    verified = tmp_path / "port-units"
+    _write_artifact(verified, "t-unit", "2026-08-01T00:00:00Z",
+                    tier="transcript_green")
+    snapshot = _canonical_snapshot(tmp_path, {
+        "t-unit": {
+            "status": "green", "tier": "transcript_green",
+            "commit": "abc1234" + "0" * 33, "pushed": True,
+        }
+    })
+
+    picked, excluded = select_recent_green_units(
+        [verified], None, canonical_snapshot=snapshot,
+        root_tiers=[frozenset({"oracle_green", "transcript_green",
+                               "boundary_green"})],
+    )
+
+    assert [unit.name for unit in picked] == ["t-unit"]
+    assert excluded == {}
+
+    # and the set is still a gate: a compile_only artifact in the promoted
+    # root is refused exactly as before.
+    other = tmp_path / "port-units-2"
+    _write_artifact(other, "c-unit", "2026-08-01T00:00:00Z")
+    snapshot2 = _canonical_snapshot(tmp_path, {
+        "c-unit": {
+            "status": "green", "tier": "compile_only",
+            "commit": "abc1235" + "0" * 33, "pushed": True,
+        }
+    })
+    picked2, excluded2 = select_recent_green_units(
+        [other], None, canonical_snapshot=snapshot2,
+        root_tiers=[frozenset({"oracle_green", "transcript_green"})],
+    )
+    assert picked2 == []
+    assert excluded2 == {"c-unit": "root-tier-mismatch:compile_only"}
 
 
 def test_verified_root_shadow_is_fail_closed_before_name_dedup(tmp_path):
